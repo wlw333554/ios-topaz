@@ -56,6 +56,26 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
+# AOSP mkbootimg.py imports gki.generate_gki_certificate at module load even
+# though it is only ever called for boot header v4 with --gki_signing_*. That
+# import fails when the tool is used standalone (outside the AOSP tree), so
+# hand it a stub: our images are never GKI-signed. Set MKBOOTIMG to a full
+# AOSP checkout if you prefer the real module.
+if ! python3 -c 'import gki.generate_gki_certificate' 2>/dev/null; then
+	mkdir -p out/gki-stub/gki
+	: > out/gki-stub/gki/__init__.py
+	{
+		echo 'def generate_gki_certificate(*a, **kw):'
+		echo '    raise SystemExit("GKI signing is only used by boot header v4")'
+	} > out/gki-stub/gki/generate_gki_certificate.py
+	export PYTHONPATH="$PWD/out/gki-stub${PYTHONPATH:+:$PYTHONPATH}"
+fi
+# mkbootimg.py: $MKBOOTIMG, else next to this script, else tools/.
+if [ -z "${MKBOOTIMG:-}" ]; then
+	for c in mkbootimg.py ../tools/mkbootimg.py; do
+		[ -f "$c" ] && MKBOOTIMG="python3 $c" && break
+	done
+fi
 MKBOOTIMG="${MKBOOTIMG:-python3 mkbootimg.py}"
 $MKBOOTIMG --header_version "$HEADER_VERSION" --kernel out/Image --ramdisk out/ramdisk.bin \
 	--os_version 12.0.0 --os_patch_level 2025-01 \
