@@ -143,9 +143,12 @@ fastboot boot shim/out/shim-boot.img
   rejects an EL1 `smc #0`; the script rewrites that one instruction in a
   scratch copy, `shim/` is left untouched.
 - AOSP `mkbootimg.py` imports `gki.generate_gki_certificate` unconditionally
-  but only calls it for header **v4** + `--gki_signing_*`. For our v3 images
-  a two-line stub on `PYTHONPATH` is enough; `local-check-zig.py` creates one
-  automatically.
+  but only calls it for header **v4** + `--gki_signing_*`. Using the tool
+  standalone (outside the AOSP tree) therefore fails at import time;
+  `shim/build.sh` detects that and puts a two-line stub on `PYTHONPATH`
+  (`shim/out/gki-stub`) unless the real module is importable. Set `MKBOOTIMG`
+  to a full AOSP checkout if you want the real thing; `build.sh` otherwise
+  looks for `mkbootimg.py` next to itself, then in `tools/`.
 
 Notes:
 
