@@ -1,0 +1,52 @@
+From c99d8986d9de3cf2a06801bf5545783ae4839242 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 07:23:48 +0300
+Subject: [PATCH] topaz-0093: scanout surfaces from contiguous RAM
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index bacf85e..f10f548 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -76,8 +76,7 @@ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+-/* topaz scanout pool: 6 x 16 MiB at 0xb0000000 (sweet's old low-memory kernel window) */
+-#define SWEET_SCANOUT_BASE      0xb0000000ull
++/* topaz scanout: at most 6 contiguous 16 MiB surfaces */
+ #define SWEET_SCANOUT_SLOT      (16u << 20)
+ #define SWEET_SCANOUT_SLOTS     6
+ static uint32_t sweet_scanout_used;             /* bit per slot, sweet_surface_lock */
+@@ -754,8 +753,23 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	if (ret == kIOReturnSuccess && sweet_scanout_eligible(s)) {
+ 		int slot = sweet_scanout_alloc_slot();
+ 		if (slot >= 0) {
+-			uint64_t pa = SWEET_SCANOUT_BASE + (uint64_t)slot * SWEET_SCANOUT_SLOT;
+-			s->memory = IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut);
++			/*
++			 * Real RAM, physically contiguous and below 4 GiB (the display SMMU is
++			 * bypassed). A raw physical window outside the kernel's RAM maps as
++			 * Device memory, where bzero/memcpy take alignment faults.
++			 */
++			IOBufferMemoryDescriptor *cmem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
++			    s->allocSize, 0x00000000fffff000ull);
++			uint64_t pa = cmem != NULL ? cmem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++			if (cmem != NULL && (pa == 0 || pa + s->allocSize > 0x100000000ull)) {
++				cmem->release();
++				cmem = NULL;
++			}
++			if (cmem != NULL) {
++				OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++			}
++			s->memory = cmem;
+ 			if (s->memory != NULL) {
+ 				s->scanoutPhys = pa;
+ 				s->scanoutSlot = slot;
+-- 
+2.43.0
+

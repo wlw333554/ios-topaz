@@ -1,0 +1,51 @@
+From 39eb6fb003f2af6fdd8612b4b7dd5bb147d09957 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 07:38:13 +0300
+Subject: [PATCH 935/947] topaz private: /dev/redwood-audio = /dev/topaz-audio
+ for HackiOS RedwoodAudio.driver
+
+---
+ bsd/conf/files                |  1 +
+ bsd/dev/topaz_redwood_audio.c | 18 ++++++++++++++++++
+ 2 files changed, 19 insertions(+)
+ create mode 100644 bsd/dev/topaz_redwood_audio.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 3aba5b9..211cdba 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
++bsd/dev/topaz_redwood_audio.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/topaz_redwood_audio.c b/bsd/dev/topaz_redwood_audio.c
+new file mode 100644
+index 0000000..dabccdf
+--- /dev/null
++++ b/bsd/dev/topaz_redwood_audio.c
+@@ -0,0 +1,18 @@
++/*
++ * PRIVATE (darwin-redwood): /dev/redwood-audio, the name HackiOS's RedwoodAudio.driver HAL
++ * plug-in writes to, as a second node of /dev/topaz-audio (iokit/Kernel/arm/TopazAudio.cpp,
++ * same ABI: whole 48 kHz 16-bit stereo frames; ioctl _IOW('r', 1, {below, muted})).
++ */
++#include <sys/param.h>
++#include <sys/conf.h>
++#include <sys/systm.h>
++#include <miscfs/devfs/devfs.h>
++
++void topaz_audio_dev_alias(int major);
++
++void
++topaz_audio_dev_alias(int major)
++{
++	void *node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-audio");
++	printf("TopazAudio: /dev/redwood-audio: %s\n", node != NULL ? "ready" : "devfs failed");
++}
+-- 
+2.43.0
+

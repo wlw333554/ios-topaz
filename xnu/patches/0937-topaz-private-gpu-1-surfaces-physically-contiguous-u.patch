@@ -1,0 +1,66 @@
+From 365fb3592373564fcac338e50b0363eb1e19624d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 12:35:31 +0300
+Subject: [PATCH 937/947] topaz private: gpu=1 surfaces physically contiguous
+ (up to 8 MB) and shared with the GPU up to 36-bit addresses: eagl binds them
+ instead of copying (glBindTexture was 3 ms a frame)
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp   |  4 ++--
+ iokit/Kernel/arm/SweetSurface.cpp | 18 +++++++++++++++---
+ 2 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 4d32071..fa48760 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -639,7 +639,7 @@ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint
+ 		IOByteCount length = 0;
+ 		addr64_t phys = memory->getPhysicalSegment(from, &length, kIOMemoryMapperNone);
+ 
+-		if (phys == 0 || length < size || phys + size > (1ull << 32)) {
++		if (phys == 0 || length < size || phys + size > (1ull << 36)) {        /* pass-through: 36-bit (0111) */
+ 			IOLog("RedwoodGPU: a buffer of %llu bytes the GPU cannot address (%#llx, %llu contiguous)\n", size, phys,
+ 			    (uint64_t) length);
+ 			return NULL;
+@@ -886,7 +886,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		 * allocSize was often someone else's page: garbage in text textures.
+ 		 */
+ 		uint64_t need = s->wrapped ? s->memory->getLength() : s->allocSize;
+-		if (phys == 0 || length < need || phys + need > (1ull << 32) || (s->wrapped && s->wrapDelta != 0)) {
++		if (phys == 0 || length < need || phys + need > (1ull << 36) || (s->wrapped && s->wrapDelta != 0)) {
+ 			static uint32_t told;
+ 			if (told++ < 16) {
+ 				IOLog("RedwoodGPU: surface %u (%ux%u, %u bytes) not shared: phys %#llx, contiguous %llu bytes, "
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 691d0b1..38a6e2a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -977,9 +977,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				uint32_t on = 0;
+ 				gpu_low = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
+ 			}
+-			(void)gpu_low;                  /* the SMMU maps the upper bank: no restriction needed */
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, SWEET_UPAGE);
++			/*
++			 * gpu=1: physically contiguous memory (up to 8 MB), so that the Adreno, whose
++			 * addresses are physical with the SMMU in pass-through, reads the surface where it
++			 * is: eagl binds it as a texture instead of copying it into one at every change
++			 * (glBindTexture was 3 ms of an 8 ms frame). Fall back to ordinary pages.
++			 */
++			if (gpu_low && s->allocSize <= (8u << 20)) {
++				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize,
++				    0x0000000FFFFFC000ull);
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, SWEET_UPAGE);
++			}
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+-- 
+2.43.0
+

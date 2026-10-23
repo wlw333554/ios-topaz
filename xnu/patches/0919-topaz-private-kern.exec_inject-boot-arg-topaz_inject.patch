@@ -1,0 +1,125 @@
+From 7521203179a87f0a61c44b3de314f0c64a9b0274 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 19:39:05 +0300
+Subject: [PATCH 919/947] topaz private: kern.exec_inject / boot-arg
+ topaz_inject (DYLD_INSERT_LIBRARIES for named programs; after darwin-redwood,
+ PRIVATE)
+
+---
+ bsd/kern/kern_exec.c | 89 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 60b894a..e39ea4d 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,10 +5568,85 @@ bad:
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++/*
++ * topaz (after darwin-redwood kern.exec_inject, PRIVATE): the sysctl kern.exec_inject holds
++ * "LIBRARY NAME NAME ..." (groups separated by ";"); a program whose file name is one of the
++ * NAMEs starts with DYLD_INSERT_LIBRARIES=LIBRARY (several libraries joined with ":").
++ * launchd drops DYLD_ variables from job descriptions, so the kernel adds this one. It starts
++ * from the boot-arg topaz_inject (commas instead of spaces).
++ */
++static char exec_inject_conf[512];
++static int exec_inject_loaded;
++SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
++    "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
++
++static bool
++exec_inject_env(struct image_params *imgp, char *env, size_t size)
++{
++	const char *name, *p;
++	size_t namelen, used;
++	bool any = false;
++
++	if (!exec_inject_loaded) {
++		char arg[sizeof(exec_inject_conf)];
++		if (exec_inject_conf[0] == 0 && PE_parse_boot_argn("topaz_inject", arg, sizeof(arg))) {
++			for (char *c = arg; *c != 0; c++) {
++				if (*c == ',') {
++					*c = ' ';
++				}
++			}
++			strlcpy(exec_inject_conf, arg, sizeof(exec_inject_conf));
++		}
++		exec_inject_loaded = 1;
++	}
++	p = exec_inject_conf;
++	if (*p == 0 || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	used = strlcpy(env, "DYLD_INSERT_LIBRARIES=", size);
++	while (*p != 0) {
++		const char *library;
++		size_t liblen;
++		bool matched = false;
++
++		while (*p == ' ' || *p == ';') {
++			p++;
++		}
++		library = p;
++		while (*p != 0 && *p != ' ' && *p != ';') {
++			p++;
++		}
++		liblen = (size_t)(p - library);
++		while (*p == ' ') {
++			const char *word = ++p;
++			while (*p != 0 && *p != ' ' && *p != ';') {
++				p++;
++			}
++			if (!matched && (size_t)(p - word) == namelen && namelen != 0 && liblen != 0 &&
++			    strncmp(word, name, namelen) == 0) {
++				matched = true;
++			}
++		}
++		if (matched && liblen != 0 && used + 1 + liblen < size) {
++			if (any) {
++				env[used++] = ':';
++			}
++			memcpy(env + used, library, liblen);
++			used += liblen;
++			env[used] = 0;
++			any = true;
++		}
++	}
++	return any;
++}
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
++	char inject_env[512];
+ 	int error = 0;
+ 	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
+ 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
+@@ -5741,6 +5816,20 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/* topaz: one more variable for the programs that get our library (see exec_inject_env) */
++	if (exec_inject_env(imgp, inject_env, sizeof(inject_env))) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+-- 
+2.43.0
+

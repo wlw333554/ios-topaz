@@ -1,0 +1,291 @@
+From 573048b6da8f61898960b697248e46c3c2f24365 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 07:37:41 +0300
+Subject: [PATCH] topaz-0146: TopazAudio stream: one AudioReach graph per
+ session, 1 s ring the DSP pulls, /dev/topaz-audio (write frames, never waits;
+ ioctl volume), graph/amp started on data and stopped after 0.5 s of quiet
+
+---
+ iokit/Kernel/arm/TopazAudio.cpp | 248 +++++++++++++++++++++++++++++++-
+ 1 file changed, 246 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 230a404..6bfe1a2 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1636,6 +1636,241 @@ tone_test(unsigned seconds)
+ 	LOG("t=%u.%03u tone: stopped", T);
+ }
+ 
++/* ---------------------------------------------------------------- the stream iOS plays into */
++
++/*
++ * One graph for the session, opened after the codec bring-up: the DSP pulls a 1 s ring of
++ * 48 kHz 16-bit stereo from the pool. /dev/topaz-audio write() puts frames ahead of the DSP's
++ * read index (pos buffer word 1, bytes) and never waits; the audio thread starts the graph,
++ * the SoundWire ports, the amp and the RX2 path when frames come, and stops them 0.5 s after
++ * the last write. ioctl _IOW('r', 1, {below, muted}): the volume, eighths of a dB under the
++ * loudest (boot-arg adsp_vol, dB of the RX2 digital gain).
++ */
++#define RING_BYTES          (48000u * 4)
++#define LEAD_BYTES          (48u * 4 * 40)          /* 40 ms ahead of the DSP */
++#define QUIET_MS            500
++
++static uint8_t *ring;
++static volatile uint32_t *pos_buf;
++static uint64_t ring_pa, pos_pa;
++static bool stream_ready, stream_ran;
++static volatile bool playing;
++static volatile uint32_t write_off;
++static volatile uint64_t last_write;            /* mach_absolute_time() */
++static volatile uint32_t vol_below, vol_muted, vol_gen, vol_applied;
++static uint64_t frames_in, frames_dropped, underruns;
++static IOLock *stream_lock;
++static bool stream_wake_flag;
++
++static bool
++stream_open(void)
++{
++	ring = (uint8_t *)topaz_pool_alloc(RING_BYTES, &ring_pa);
++	pos_buf = (volatile uint32_t *)topaz_pool_alloc(0x1000, &pos_pa);
++	stream_lock = IOLockAlloc();
++	if (ring == NULL || pos_buf == NULL || stream_lock == NULL) {
++		LOG("stream: no memory");
++		return false;
++	}
++	stream_ready = graph_open(ring_pa, RING_BYTES, pos_pa);
++	return stream_ready;
++}
++
++static void
++apply_volume(void)
++{
++	int db = vol_muted ? -84 : vol_db - (int)(vol_below / 8);
++	if (db < -84) {
++		db = -84;
++	}
++	lw(RX_MACRO + 0x514, (uint32_t)db & 0xFF);          /* RX_RX2_RX_VOL_CTL, s8 dB */
++	vol_applied = vol_gen;
++}
++
++static void
++stream_start(void)
++{
++	if (stream_ran) {
++		(void)sg_cmd(APM_GRAPH_PREPARE);
++	}
++	if (!sg_cmd(APM_GRAPH_START)) {
++		LOG("stream: start failed");
++		return;
++	}
++	stream_ran = true;
++	if (!ports_up) {
++		ports_and_pa();
++		ports_up = true;
++	}
++	amp_on(true);
++	apply_volume();
++	lw(RX_MACRO + 0x518, 0x04);
++	lw(RX_MACRO + 0x500, 0x24);                         /* RX2 path on */
++	playing = true;
++	LOG("t=%u.%03u stream: playing", T);
++}
++
++static void
++stream_stop(void)
++{
++	playing = false;
++	lw(RX_MACRO + 0x514, (uint32_t)-84 & 0xFF);         /* mute first, then the amp: no pop */
++	IOSleep(30);
++	amp_on(false);
++	IOSleep(10);
++	lw(RX_MACRO + 0x500, 0x04);
++	(void)sg_cmd(APM_GRAPH_STOP);
++	bzero(ring, RING_BYTES);
++	LOG("t=%u.%03u stream: stopped (%llu frames in, %llu dropped, %llu underruns)", T, frames_in, frames_dropped,
++	    underruns);
++}
++
++/* the audio thread: start / stop / volume, between GLINK polls */
++static void
++stream_poll(void)
++{
++	uint64_t now = mach_absolute_time(), quiet;
++
++	if (!stream_ready) {
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)QUIET_MS * 1000000, &quiet);
++	if (!playing && last_write != 0 && now - last_write < quiet) {
++		stream_start();
++	} else if (playing && now - last_write >= quiet) {
++		stream_stop();
++	}
++	if (playing && vol_applied != vol_gen) {
++		apply_volume();
++	}
++}
++
++/* frames from /dev/topaz-audio: never waits; returns how many were taken */
++extern "C" uint32_t
++topaz_audio_write(const int16_t *frames, uint32_t count)
++{
++	if (!stream_ready || count == 0) {
++		return 0;
++	}
++	IOLockLock(stream_lock);
++	uint32_t bytes = MIN(count * 4, RING_BYTES / 2);
++	uint32_t r = playing ? (pos_buf[1] % RING_BYTES) & ~3u : 0;
++	uint32_t w = write_off;
++	uint32_t ahead = (w + RING_BYTES - r) % RING_BYTES;
++	if (!playing || ahead > RING_BYTES / 2) {           /* not started yet, or the DSP passed us */
++		if (playing) {
++			underruns++;
++		}
++		w = (r + LEAD_BYTES) % RING_BYTES;
++		ahead = LEAD_BYTES;
++	}
++	if (ahead + bytes > RING_BYTES - 4096) {            /* too far ahead: drop the rest */
++		uint32_t room = RING_BYTES - 4096 > ahead ? (RING_BYTES - 4096 - ahead) & ~3u : 0;
++		frames_dropped += (bytes - room) / 4;
++		bytes = room;
++	}
++	uint32_t n1 = MIN(bytes, RING_BYTES - w);
++	memcpy(ring + w, frames, n1);
++	memcpy(ring, (const uint8_t *)frames + n1, bytes - n1);
++	/* silence after the data: when iOS stops writing the DSP must not replay the ring (a click at the end) */
++	uint32_t z = (w + bytes) % RING_BYTES, zl = 2 * LEAD_BYTES, z1 = MIN(zl, RING_BYTES - z);
++	bzero(ring + z, z1);
++	bzero(ring, zl - z1);
++	mb();
++	write_off = (w + bytes) % RING_BYTES;
++	frames_in += bytes / 4;
++	last_write = mach_absolute_time();
++	IOLockUnlock(stream_lock);
++	if (!playing) {
++		thread_wakeup((event_t)&stream_wake_flag);
++	}
++	return count;
++}
++
++extern "C" void
++topaz_audio_volume(uint32_t below, uint32_t muted)
++{
++	vol_below = below;
++	vol_muted = muted;
++	vol_gen++;
++}
++
++/* ---------------------------------------------------------------- /dev/topaz-audio */
++
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/ioccom.h>
++#include <miscfs/devfs/devfs.h>
++
++struct topaz_audio_volume_arg { uint32_t below, muted; };
++#define TOPAZ_AUDIO_SET_VOLUME  _IOW('r', 1, struct topaz_audio_volume_arg)
++
++static int
++ta_open(dev_t, int, int, struct proc *)
++{
++	return 0;
++}
++
++static int
++ta_close(dev_t, int, int, struct proc *)
++{
++	return 0;
++}
++
++static int
++ta_write(dev_t, struct uio *uio, int)
++{
++	int16_t buf[1024 * 2];
++
++	while (uio_resid(uio) >= 4) {
++		user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(buf)) & ~3;
++		int err = uiomove((char *)buf, (int)n, uio);
++		if (err != 0) {
++			return err;
++		}
++		(void)topaz_audio_write(buf, (uint32_t)(n / 4));
++	}
++	return 0;
++}
++
++static int
++ta_ioctl(dev_t, u_long cmd, caddr_t data, int, struct proc *)
++{
++	if (cmd != TOPAZ_AUDIO_SET_VOLUME) {
++		return ENOTTY;
++	}
++	const struct topaz_audio_volume_arg *v = (const struct topaz_audio_volume_arg *)data;
++	topaz_audio_volume(v->below, v->muted);
++	return 0;
++}
++
++static const struct cdevsw ta_cdevsw = {
++	.d_open = ta_open, .d_close = ta_close, .d_read = eno_rdwrt, .d_write = ta_write, .d_ioctl = ta_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++/* a private patch may add a second name for the same device (a strong definition wins) */
++extern "C" __attribute__((weak)) void
++topaz_audio_dev_alias(int major __unused)
++{
++}
++
++static void
++audio_dev_init(void)
++{
++	int major = cdevsw_add(-1, &ta_cdevsw);
++	if (major < 0) {
++		LOG("/dev/topaz-audio: no major");
++		return;
++	}
++	void *node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "topaz-audio");
++	LOG("/dev/topaz-audio: %s", node != NULL ? "ready" : "devfs failed");
++	if (node != NULL) {
++		topaz_audio_dev_alias(major);
++	}
++}
++
+ /* ---------------------------------------------------------------- thread */
+ 
+ static void
+@@ -1686,12 +1921,18 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		bool busy = glink_poll();
+ 		qrtr_poll();
+ 		gpr_poll();
++		stream_poll();
+ 		if (spf_state == 1 && !codec_tried) {
+ 			uint32_t tone = 0;
+ 			codec_tried = true;
+ 			(void)PE_parse_boot_argn("adsp_vol", &vol_db, sizeof(vol_db));
+-			if (codec_bringup() && PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0) {
+-				tone_test(MIN(tone, 10u));
++			if (codec_bringup()) {
++				if (PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0) {
++					tone_test(MIN(tone, 10u));
++				}
++				if (stream_open()) {
++					audio_dev_init();
++				}
+ 			}
+ 		}
+ 		if (*adsp_state & 1) {
+@@ -1707,6 +1948,9 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		if (busy) {
+ 			IODelay(200);
++		} else if (stream_ready && !playing) {
++			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, 20, 1000 * NSEC_PER_USEC);
++			thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
+ 			IOSleep(2);
+ 		}
+-- 
+2.43.0
+

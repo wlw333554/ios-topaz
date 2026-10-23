@@ -1,0 +1,110 @@
+From f970ae4f58b20de67e3d8785825d18a4d9dae533 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 17:00:54 +0300
+Subject: [PATCH 917/947] topaz-0126: GPU pool memory write-combined in user
+ space too (device pager cache mode from the descriptor); kernel below-4G
+ allocations only with gpu_midmem=1
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp  |  6 ++++--
+ iokit/Kernel/arm/TopazAdreno.cpp | 32 ++++++++++++++++++++++++++++++--
+ 2 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 15adff8..ed0c7ea 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -54,6 +54,8 @@ extern "C" {
+ bool redwood_gpu_ready(void);
+ bool redwood_gpu_identity(void);
+ uint64_t topaz_gpu_pool_alloc(uint64_t size, void ** va);
++IOMemoryDescriptor * topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++bool topaz_gpu_midmem(void);
+ bool redwood_gpu_parameter(uint32_t which, uint64_t * value);
+ uint64_t redwood_gpu_address(uint64_t size);
+ void redwood_gpu_address_free(uint64_t address, uint64_t size);
+@@ -776,7 +778,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+ 	if (redwood_gpu_identity()) {
+ 		/* topaz: kernel memory below 4 GiB, contiguous (ADT --midmem gives the kernel such RAM) */
+-		IOBufferMemoryDescriptor * low = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		IOBufferMemoryDescriptor * low = !topaz_gpu_midmem() ? NULL : IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
+ 		    (vm_size_t) size, 0x00000000fffff000ull);
+ 		if (low != NULL) {
+@@ -803,7 +805,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 			return kIOReturnNoMemory;
+ 		}
+ 		bzero(va, (size_t) size);
+-		IOMemoryDescriptor * pm = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++		IOMemoryDescriptor * pm = topaz_gpu_pool_md(pa, size);
+ 		IOLockLock(gGPULock);
+ 		b = pm != NULL ? newBuffer(pm, 0, size, request->flags, &request->handle) : NULL;
+ 		if (b != NULL) {
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index d066c51..4dfdfa4 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -213,6 +213,31 @@ range_alloc(void *table, unsigned *count, uint64_t size)
+ 	return 0;
+ }
+ 
++/*
++ * A descriptor for pool memory. The cache mode goes into the descriptor itself:
++ * for a task other than the kernel, physical memory is mapped through a device
++ * pager whose cache mode is the descriptor's, and the default for RAM the
++ * kernel does not manage is the IO one (Device memory: Mesa's dc zva and
++ * unaligned accesses there were SIGBUS). The kIOMapWriteCombineCache option of
++ * the mapping alone does not change it.
++ */
++extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++IOMemoryDescriptor *
++topaz_gpu_pool_md(uint64_t pa, uint64_t size)
++{
++	return IOMemoryDescriptor::withAddressRange(pa, size,
++	           kIODirectionInOut | (kIOWriteCombineCache << kIOMemoryBufferCacheShift), TASK_NULL);
++}
++
++/* boot-arg gpu_midmem=1: the ADT gives the kernel RAM below 4 GiB (mkadt.py --midmem), GPU memory is the kernel's */
++static uint32_t gpu_midmem;
++extern "C" bool topaz_gpu_midmem(void);
++bool
++topaz_gpu_midmem(void)
++{
++	return gpu_midmem != 0;
++}
++
+ /* Contiguous GPU memory below 4 GiB: physical address, kernel address (write-combined). 0: none left. */
+ extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
+ uint64_t
+@@ -238,8 +263,7 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	unsigned c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
+ 	if (gpu_chunk_va[c] == NULL) {
+ 		/* in the kernel map, not the small IO submap ml_io_map uses (64 MB there failed) */
+-		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(GPU_POOL_BASE + c * GPU_POOL_CHUNK,
+-		    GPU_POOL_CHUNK, kIODirectionInOut);
++		IOMemoryDescriptor *md = topaz_gpu_pool_md(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
+ 		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+ 		if (map != NULL) {
+ 			gpu_chunk_va[c] = (uint8_t *)map->getVirtualAddress();     /* (kept for good, with md) */
+@@ -297,6 +321,9 @@ static bool
+ kbuf_alloc(struct kbuf *b, uint64_t size)
+ {
+ 	size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++	if (!gpu_midmem) {
++		return kbuf_alloc_low(b, size);         /* (without --midmem such allocations come from the lower bank: phystokv panics) */
++	}
+ 	b->md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, size, 0x00000000fffff000ull);
+ 	if (b->md == NULL) {
+@@ -1103,6 +1130,7 @@ topaz_adreno_init(void)
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
++	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
+ 	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 600) {
+ 		core_mhz = 600;
+ 	}
+-- 
+2.43.0
+

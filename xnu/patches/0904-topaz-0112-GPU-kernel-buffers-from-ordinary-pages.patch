@@ -1,0 +1,68 @@
+From 3ee3b4b39fabb107c91e2de03862db132121dae5 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 14:24:32 +0300
+Subject: [PATCH 904/947] topaz-0112: GPU kernel buffers from ordinary pages
+
+---
+ iokit/Kernel/arm/TopazAdreno.cpp | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index ed8667c..b812ebd 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -136,17 +136,29 @@ poll(volatile uint8_t *b, uint32_t o, uint32_t mask, uint32_t want, uint32_t us)
+ 
+ /* ---------------------------------------------------------------- memory below 4 GiB */
+ 
++/*
++ * Ordinary (not contiguous) kernel memory: contiguous allocations come from the
++ * lower DDR bank here, which the kernel cannot map back (phystokv panics). The
++ * SMMU maps every 4 KB page on its own (kbuf_map); b->pa is only meaningful
++ * within one 16 KB page (page tables, the zap metadata).
++ */
++static uint64_t
++kbuf_pa(struct kbuf *b, uint64_t off)
++{
++	return b->md->getPhysicalSegment(off, NULL, kIOMemoryMapperNone);
++}
++
+ static bool
+ kbuf_alloc(struct kbuf *b, uint64_t size)
+ {
+ 	size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+-	b->md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, size, LOW_MASK);
++	b->md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMapWriteCombineCache, size, PAGE_SIZE);
+ 	if (b->md == NULL) {
+ 		return false;
+ 	}
+ 	b->va = (uint8_t *)b->md->getBytesNoCopy();
+-	b->pa = b->md->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	b->pa = kbuf_pa(b, 0);
+ 	b->size = size;
+ 	bzero(b->va, size);
+ 	return true;
+@@ -310,7 +322,8 @@ zap_load(void)
+ 			IOLog("TopazGPU: zap layout unexpected\n");
+ 			goto out;
+ 		}
+-		if (!kbuf_alloc(&meta, mdt_size)) {
++		if (mdt_size > PAGE_SIZE || !kbuf_alloc(&meta, mdt_size)) {
++			IOLog("TopazGPU: zap metadata of %zu bytes does not fit one page\n", mdt_size);
+ 			goto out;
+ 		}
+ 		memcpy(meta.va, mdt, mdt_size);
+@@ -471,7 +484,7 @@ kbuf_map(struct kbuf *b)
+ 	b->iova = kernel_va_next;
+ 	kernel_va_next += b->size + 4096;               /* guard page */
+ 	for (uint64_t off = 0; off < b->size; off += 4096) {
+-		if (!mmu_map(b->iova + off, b->pa + off, false)) {
++		if (!mmu_map(b->iova + off, kbuf_pa(b, off), false)) {
+ 			return false;
+ 		}
+ 	}
+-- 
+2.43.0
+

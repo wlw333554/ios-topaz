@@ -1,0 +1,41 @@
+From 741a9198116f53abc99918e9816f566cf6c1e061 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 10:33:38 +0300
+Subject: [PATCH] topaz-0150: security.mac.amfi sysctl node
+ (developer_mode_status = 1): ExtensionKit read no extension cache without it
+
+---
+ bsd/kern/sweet_amfi.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 348abcb..9b86015 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,23 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <sys/sysctl.h>
++
++/*
++ * AMFI's sysctl node, which the AMFI kext makes on a device: libamfi's
++ * amfi_developer_mode_status() reads security.mac.amfi.developer_mode_status (8 bytes, 1 = on)
++ * and ExtensionKit wants it when it reads the extension cache (/System/Library/xpc/
++ * extensions.plist). Without the node: "Unable to find AMFI", no extension point in
++ * LaunchServices, PlugInKit -10814 everywhere, no wallpapers, widgets or file providers.
++ */
++SYSCTL_DECL(_security_mac);
++SYSCTL_NODE(_security_mac, OID_AUTO, amfi, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "AMFI");
++static uint64_t sweet_amfi_developer_mode = 1;
++static uint64_t sweet_amfi_qa_root_certs = 0;
++SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, developer_mode_status, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sweet_amfi_developer_mode, "developer mode (on: nothing is restricted here)");
++SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, qa_root_certs_allowed, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sweet_amfi_qa_root_certs, "");
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+-- 
+2.43.0
+

@@ -1,0 +1,135 @@
+From fd2781d3b9b16adc80331018caaea02fb4a72221 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 09:50:13 +0300
+Subject: [PATCH 936/947] topaz private: Sandbox container path from
+ CFFIXED_USER_HOME (darwin-redwood minisandbox): extensions run, posters and
+ widgets
+
+---
+ bsd/conf/files                     |   1 +
+ bsd/kern/topaz_sandbox_container.c | 101 +++++++++++++++++++++++++++++
+ 2 files changed, 102 insertions(+)
+ create mode 100644 bsd/kern/topaz_sandbox_container.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 211cdba..c2864ab 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+ bsd/dev/topaz_redwood_audio.c		standard
++bsd/kern/topaz_sandbox_container.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/kern/topaz_sandbox_container.c b/bsd/kern/topaz_sandbox_container.c
+new file mode 100644
+index 0000000..4533ffd
+--- /dev/null
++++ b/bsd/kern/topaz_sandbox_container.c
+@@ -0,0 +1,101 @@
++/*
++ * PRIVATE (darwin-redwood bsd/kern/kern_minimac.c, minisandbox_container_path): Sandbox op 4,
++ * "container path of a process", answered from the CFFIXED_USER_HOME its launcher put into
++ * its environment (RunningBoard for an application, pkd for an extension). PlugInKit does not
++ * run an extension without it ("plugin has invalid sandbox or container"): no poster, no widget.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <mach/vm_param.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++#include <libkern/libkern.h>
++
++extern vm_map_t get_task_map_reference(task_t);
++int sweet_sandbox_container_path(user_addr_t arg);
++
++#define SANDBOX_SYSCALL_CONTAINER_PATH  4
++#define SANDBOX_CONTAINER_VARIABLE      "CFFIXED_USER_HOME="
++
++int
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	struct {
++		int64_t     pid;
++		uint64_t    pidversion;
++		user_addr_t buffer;
++		user_size_t size;
++		uint64_t    check_pidversion;
++	} args;
++	const size_t prefix_len = sizeof(SANDBOX_CONTAINER_VARIABLE) - 1;
++	proc_t p;
++	task_t task;
++	vm_map_t map;
++	vm_map_copy_t copy = NULL;
++	vm_offset_t strings = 0;
++	vm_size_t strings_size;
++	user_addr_t user_stack;
++	size_t argslen, len;
++	const char *s, *end;
++	int error;
++
++	error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	p = proc_find((int)args.pid);
++	if (p == PROC_NULL) {
++		return ESRCH;
++	}
++	if (args.check_pidversion && (uint64_t)proc_pidversion(p) != args.pidversion) {
++		proc_rele(p);
++		return ESRCH;
++	}
++	user_stack = p->user_stack;
++	argslen = p->p_argslen;
++	task = proc_task(p);
++	if (user_stack == 0 || argslen == 0 || task == TASK_NULL) {
++		proc_rele(p);
++		return 0;
++	}
++	/* the same way as sysctl_procargsx(): the task keeps the map alive once the process is let go */
++	task_reference(task);
++	proc_rele(p);
++	map = get_task_map_reference(task);
++	task_deallocate(task);
++	if (map == VM_MAP_NULL) {
++		return 0;
++	}
++	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
++	if (kmem_alloc(kernel_map, &strings, strings_size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		vm_map_deallocate(map);
++		return ENOMEM;
++	}
++	if (vm_map_copyin(map, (vm_map_address_t)(user_stack - strings_size), strings_size, FALSE, &copy) != KERN_SUCCESS) {
++		copy = NULL;
++	}
++	vm_map_deallocate(map);
++	if (copy == NULL || vm_map_copy_overwrite(kernel_map, strings, copy, strings_size, FALSE) != KERN_SUCCESS) {
++		if (copy != NULL) {
++			vm_map_copy_discard(copy);
++		}
++		kmem_free(kernel_map, strings, strings_size);
++		return 0;                       /* the process is on its way out, or has unmapped its own stack */
++	}
++
++	end = (const char *)(strings + strings_size);
++	for (s = end - argslen; s < end; s += len + 1) {
++		len = strnlen(s, end - s);
++		if (len > prefix_len && s + len < end && strncmp(s, SANDBOX_CONTAINER_VARIABLE, prefix_len) == 0) {
++			s += prefix_len;
++			len -= prefix_len;
++			error = len < args.size ? copyout(s, args.buffer, len + 1) : ENAMETOOLONG;
++			break;
++		}
++	}
++	kmem_free(kernel_map, strings, strings_size);
++	return error;
++}
+-- 
+2.43.0
+

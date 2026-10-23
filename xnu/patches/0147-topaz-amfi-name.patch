@@ -1,0 +1,57 @@
+From bb6410638d6669e220eeec76efae65e15ec7dd41 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 08:53:54 +0300
+Subject: [PATCH] topaz-0147: the built-in AMFI policy is named AMFI and
+ answers __mac_syscall (ExtensionKit found no AMFI: no app extensions, no
+ wallpapers)
+
+---
+ bsd/kern/sweet_amfi.c | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..809d906 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,29 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * __mac_syscall("AMFI", ...): libamfi asks AMFI by policy name, e.g.
++ * amfi_interface_query_bootarg_state() in ExtensionFoundation; with no policy of that name it
++ * fails and lsd's ExtensionKit says "Unable to find AMFI", so no app extension is registered
++ * (PlugInKit -10814 for every extension point, PosterBoard has no wallpaper providers).
++ * Every call succeeds and leaves the caller's output alone: no boot-arg flags, nothing special.
++ */
++static int
++sweet_amfi_syscall(struct proc *p __unused, int call, user_addr_t arg __unused)
++{
++	static uint64_t seen;
++	if (call >= 0 && call < 64 && !(seen & (1ULL << call))) {
++		seen |= 1ULL << call;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SWEET AMFI: syscall %d from %s\n", call, name);
++	}
++	return 0;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +381,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",                    /* the name libamfi looks it up by */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
+-- 
+2.43.0
+

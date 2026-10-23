@@ -1,0 +1,100 @@
+From cda9f3a2a17b804c15c2ec73994fca890c9483ee Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 20:06:24 +0300
+Subject: [PATCH 920/947] topaz private: applog / applog_name (daemon
+ stdout/stderr and os_log to the console; after darwin-redwood, PRIVATE)
+
+---
+ bsd/kern/kern_exec.c | 62 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index e39ea4d..645c3fd 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2622,6 +2622,52 @@ done:
+ 	return ret;
+ }
+ 
++/*
++ * topaz (after darwin-redwood applog, PRIVATE). Boot-arg applog=1: standard output and error
++ * that launchd opens on /dev/null go to the console (and so into the kernel log). Programs
++ * whose file names begin with one of applog_name=NAME[,NAME...] also get OS_ACTIVITY_DT_MODE,
++ * which makes os_log write to standard error; applog=2 gives it to every program (slow).
++ */
++static TUNABLE(uint32_t, exec_applog, "applog", 0);
++static TUNABLE_STR(exec_applog_name, 128, "applog_name", "");
++
++static bool
++exec_applog_oslog(struct image_params *imgp)
++{
++	const char *name, *p = exec_applog_name;
++
++	if (exec_applog >= 2) {
++		return true;
++	}
++	if (exec_applog == 0 || *p == 0 || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	while (*p != 0) {
++		const char *word = p;
++		while (*p != 0 && *p != ',') {
++			p++;
++		}
++		if (p != word && (size_t)(p - word) <= imgp->ip_ndp->ni_cnd.cn_namelen &&
++		    strncmp(word, name, (size_t)(p - word)) == 0) {
++			return true;
++		}
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return false;
++}
++
++static const char *
++exec_applog_path(int fd, const char *path)
++{
++	if (exec_applog && (fd == 1 || fd == 2) && strcmp(path, "/dev/null") == 0) {
++		return "/dev/console";
++	}
++	return path;
++}
++
+ /*
+  * exec_handle_file_actions
+  *
+@@ -2691,7 +2737,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 			AUDIT_SUBCALL_ENTER(OPEN, p, uthread);
+ 
+ 			NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
+-			    CAST_USER_ADDR_T(psfa->psfaa_openargs.psfao_path),
++			    CAST_USER_ADDR_T(exec_applog_path(psfa->psfaa_filedes, psfa->psfaa_openargs.psfao_path)),
+ 			    imgp->ip_vfs_context);
+ 
+ 			error = open1(imgp->ip_vfs_context, ndp,
+@@ -5830,6 +5876,20 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/* topaz: os_log on standard error for the programs applog_name names (see exec_applog_path) */
++	if (exec_applog_oslog(imgp)) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T("OS_ACTIVITY_DT_MODE=YES"), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+-- 
+2.43.0
+

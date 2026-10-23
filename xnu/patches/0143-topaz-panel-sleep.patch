@@ -1,0 +1,107 @@
+From 1c28587d5ab0db6143bba066082bbf7e0fd30956 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 02:38:21 +0300
+Subject: [PATCH] topaz-0143: panel off = brightness 0, DCS 0x28 + 0x10 sleep
+ in; on = 0x11, 120 ms, 0x29 (0x28 alone left the AMOLED lit)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 57 +++++++++++++++++++++------
+ 1 file changed, 46 insertions(+), 11 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6f29fba..b8b575f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -439,12 +439,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 * topaz: fade in cached memory and flip whole frames to the MDP.
+ 		 * Fading the uncached boot framebuffer in place crawled down the panel.
+ 		 */
+-		if (fb->fDsi != NULL) {
+-			/* the panel is dark (DCS 0x51 0); keep the last frame */
+-			IOLockUnlock(fb->fLock);
+-			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+-			return;
+-		}
++		/*
++		 * topaz: the DCS commands (0x51 0, 0x28, 0x10) do not reach the panel
++		 * yet (video mode), so fade to black even with DSI: black AMOLED
++		 * pixels are dark, which is what display off looks like.
++		 */
+ 		if (fb->fFadeOrig != NULL) {
+ 			uint32_t step = fb->fFadeStep;
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+@@ -635,7 +634,17 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
+ 	dsi_wr(fDsi, 0x04c, size);
+ 	uint32_t dma = dsi_rd(fDsi, 0x03c);
+-	dsi_wr(fDsi, 0x03c, dma & ~(1u << 26));          /* high speed */
++	/*
++	 * Low-power mode (COMMAND_MODE_DMA_CTRL bit 26), as Linux sends commands
++	 * for panels with MIPI_DSI_MODE_LPM: in high speed the topaz panel took
++	 * none of them (no brightness, no display off). sweetdsi_hs=1: old way.
++	 */
++	static int hs = -1;
++	if (hs < 0) {
++		hs = 0;
++		(void)PE_parse_boot_argn("sweetdsi_hs", &hs, sizeof(hs));
++	}
++	dsi_wr(fDsi, 0x03c, hs ? (dma & ~(1u << 26)) : (dma | (1u << 26)));
+ 	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
+ 	bool done = false;
+ 	for (int i = 0; i < 100 && !done; i++) {
+@@ -644,6 +653,14 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 			IODelay(200);
+ 		}
+ 	}
++	if (!done) {
++		static uint32_t told;
++		if (told++ < 6) {
++			IOLog("SWEET FB: DSI cmd %#x not done on cpu %d: ctrl %#x trig %#x dma %#x int %#x status %#x err %#x buf %#llx\n",
++			    hdr[0], cpu_number(), dsi_rd(fDsi, 0x004), dsi_rd(fDsi, 0x084), dsi_rd(fDsi, 0x03c),
++			    dsi_rd(fDsi, 0x110), dsi_rd(fDsi, 0x008), dsi_rd(fDsi, 0x0c4), (unsigned long long)fDsiBufPhys);
++		}
++	}
+ 	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);
+ 	dsi_wr(fDsi, 0x03c, dma);
+ 	dsi_wr(fDsi, 0x004, ctrl);
+@@ -653,15 +670,33 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	return done;
+ }
+ 
+-/* DCS 0x28 display off / 0x29 display on (short write, no parameter) */
++/*
++ * Panel power as the Linux panel drivers do it: off = brightness 0, DCS 0x28
++ * display off, 0x10 sleep in (0x28 alone left the topaz AMOLED showing the
++ * last frame); on = 0x11 sleep out, 120 ms, 0x29 display on (the caller
++ * then sends the brightness).
++ */
+ void
+ AppleCLCD::setPanelOn(bool on)
+ {
+-	uint8_t hdr[4] = { (uint8_t)(on ? 0x29 : 0x28), 0, 0x05, 0x80 };
++	uint8_t first[4] = { (uint8_t)(on ? 0x11 : 0x28), 0, 0x05, 0x80 };
++	uint8_t second[4] = { (uint8_t)(on ? 0x29 : 0x10), 0, 0x05, 0x80 };
++	bool done = true;
++	if (!on) {
++		setPanelLevel(0);
++	}
++	IOLockLock(fBlLock);
++	done &= dsiSend(first, NULL, 0);
++	IOLockUnlock(fBlLock);
++	IOSleep(on ? 120 : 20);
+ 	IOLockLock(fBlLock);
+-	bool done = dsiSend(hdr, NULL, 0);
++	done &= dsiSend(second, NULL, 0);
+ 	IOLockUnlock(fBlLock);
+-	IOLog("SWEET FB: panel display %s: %s\n", on ? "on" : "off", done ? "done" : "NO DONE");
++	if (!on) {
++		IOSleep(120);
++	}
++	IOLog("SWEET FB: panel %s: %s\n", on ? "sleep out, display on" : "display off, sleep in",
++	    done ? "done" : "NO DONE");
+ }
+ 
+ void
+-- 
+2.43.0
+

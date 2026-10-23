@@ -1,0 +1,45 @@
+From 58017fdf0bfcbacee846551581a51afd30d03aa6 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 09:49:53 +0300
+Subject: [PATCH] topaz-0149: Sandbox op 4 (container path) goes to
+ sweet_sandbox_container_path(), ENOENT unless a private patch answers
+
+---
+ bsd/kern/sweet_amfi.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 809d906..348abcb 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -283,10 +283,18 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * data (container paths, extension tokens) fail with ENOENT. The first
+  * use of each operation number is logged.
+  */
++int sweet_sandbox_container_path(user_addr_t arg);
+ static uint64_t sweet_sandbox_seen;
+ 
++/* a private patch may answer which container a process is in (a strong definition wins) */
++__attribute__((weak)) int
++sweet_sandbox_container_path(__unused user_addr_t arg)
++{
++	return ENOENT;
++}
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -296,6 +304,7 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
+-- 
+2.43.0
+

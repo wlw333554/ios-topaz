@@ -1,0 +1,141 @@
+From f114c9d639a0c81524ca7765c7116631835197e2 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 14:37:03 +0300
+Subject: [PATCH 906/947] topaz-0114: GPU memory cached with explicit cache
+ maintenance
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp  |  6 +++++-
+ iokit/Kernel/arm/TopazAdreno.cpp | 22 +++++++++++++++++-----
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 7a041c0..969a669 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -319,7 +319,11 @@ RedwoodGPUStart(void)
+ 	RedwoodGPU * gpu;
+ 	uint32_t cached = 0;
+ 
+-	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
++	/* topaz: buffers are ordinary cached memory by default (gpu_cached=0 asks for write-combined,
++	 * which IOBMD makes contiguous, from the lower DDR bank the kernel cannot map back) */
++	cached = 1;
++	(void)PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached));
++	gGPUCached = cached != 0;
+ 	gGPULock = IOLockAlloc();
+ 	gpu = OSTypeAlloc(RedwoodGPU);
+ 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index a2b5cd3..e4fc8a2 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -27,6 +27,7 @@
+ extern "C" {
+ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ int topaz_fw_read(const char *path, void **data, size_t *size);
+ void topaz_fw_free(void *data, size_t size);
+ int topaz_root_mounted(void);
+@@ -154,8 +155,8 @@ static bool
+ kbuf_alloc(struct kbuf *b, uint64_t size)
+ {
+ 	size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+-	b->md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-	    kIODirectionInOut | kIOMapWriteCombineCache, size, PAGE_SIZE);
++	/* no cache mode: IOBMD makes such buffers contiguous, from the lower DDR bank */
++	b->md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, size, PAGE_SIZE);
+ 	if (b->md == NULL) {
+ 		return false;
+ 	}
+@@ -163,6 +164,7 @@ kbuf_alloc(struct kbuf *b, uint64_t size)
+ 	b->pa = kbuf_pa(b, 0);
+ 	b->size = size;
+ 	bzero(b->va, size);
++	sweet_dcache_clean((vm_offset_t)b->va, (unsigned)size);
+ 	return true;
+ }
+ 
+@@ -330,6 +332,7 @@ zap_load(void)
+ 		}
+ 		IOLog("TopazGPU: zap: metadata at %#llx\n", meta.pa);
+ 		memcpy(meta.va, mdt, mdt_size);
++		sweet_dcache_clean((vm_offset_t)meta.va, (unsigned)mdt_size);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta.pa, 0, &res);
+@@ -411,6 +414,7 @@ l3_for(uint64_t va, bool create)
+ 			return NULL;
+ 		}
+ 		l1.va[i1] = l2[i1].pa | PTE_VALID | PTE_TABLE;
++		sweet_dcache_clean((vm_offset_t)&l1.va[i1], 8);
+ 	}
+ 	if (l3[i3] == NULL) {
+ 		struct table *t = (struct table *)IOMalloc(sizeof(*t));
+@@ -422,6 +426,7 @@ l3_for(uint64_t va, bool create)
+ 		}
+ 		l3[i3] = t;
+ 		l2[i1].va[i2] = t->pa | PTE_VALID | PTE_TABLE;
++		sweet_dcache_clean((vm_offset_t)&l2[i1].va[i2], 8);
+ 	}
+ 	return l3[i3]->va;
+ }
+@@ -443,6 +448,7 @@ mmu_map(uint64_t va, uint64_t pa, bool ro)
+ 		return false;
+ 	}
+ 	t[(va >> 12) & 511] = pa | PTE_PAGE | (ro ? PTE_AP_RO : 0);
++	sweet_dcache_clean((vm_offset_t)&t[(va >> 12) & 511], 8);
+ 	tables_dirty = true;
+ 	return true;
+ }
+@@ -565,7 +571,7 @@ emit(uint32_t v)
+ static void
+ kick(void)
+ {
+-	__asm__ volatile ("dsb sy" ::: "memory");
++	sweet_dcache_clean((vm_offset_t)ring.va, RB_BYTES);
+ 	gpu_wr(0x807, wptr % RB_DWORDS);                /* CP_RB_WPTR */
+ }
+ 
+@@ -671,6 +677,7 @@ cp_start(void)
+ 		return false;
+ 	}
+ 	memcpy(sqe.va, (const uint8_t *)fw + 4, fw_size - 4);
++	sweet_dcache_clean((vm_offset_t)sqe.va, (unsigned)(fw_size - 4));
+ 	IOLog("TopazGPU: cp: SQE at GPU %#llx, ring %#llx\n", sqe.iova, ring.iova);
+ 	tlb_flush();
+ 	hw_init_regs();
+@@ -779,6 +786,7 @@ redwood_gpu_unmap(uint64_t address, uint64_t size)
+ 		uint64_t *t = l3_for(address + off, false);
+ 		if (t != NULL) {
+ 			t[((address + off) >> 12) & 511] = 0;
++			sweet_dcache_clean((vm_offset_t)&t[((address + off) >> 12) & 511], 8);
+ 		}
+ 	}
+ 	tlb_flush();
+@@ -788,7 +796,7 @@ void
+ redwood_gpu_to_memory(void *start, uint64_t size)
+ {
+ 	if (start != NULL && size != 0) {
+-		sweet_dcache_clean((vm_offset_t)start, (unsigned)size);
++		flush_dcache64((addr64_t)(uintptr_t)start, (unsigned)size, FALSE);    /* clean + invalidate */
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+@@ -796,7 +804,11 @@ redwood_gpu_to_memory(void *start, uint64_t size)
+ bool
+ redwood_gpu_done(uint32_t fence)
+ {
+-	return mem.va != NULL && (int32_t)(*(volatile uint32_t *)mem.va - fence) >= 0;
++	if (mem.va == NULL) {
++		return false;
++	}
++	flush_dcache64((addr64_t)(uintptr_t)mem.va, 64, FALSE);
++	return (int32_t)(*(volatile uint32_t *)mem.va - fence) >= 0;
+ }
+ 
+ uint32_t
+-- 
+2.43.0
+

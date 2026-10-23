@@ -1,0 +1,41 @@
+From 8bcf52e04d7a9fc4bc17a300a58a4ad8d7357e1e Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 13:00:20 +0300
+Subject: [PATCH 938/947] topaz private: only BGRA surfaces with 64-byte
+ aligned rows are shared directly (GPU stopped after sharing text masks); log
+ each shared surface
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index fa48760..64a7d00 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -896,6 +896,22 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 			s->release();
+ 			return kIOReturnUnsupported;    /* (eagl.c then fills a texture from it and reads frames back) */
+ 		}
++		/*
++		 * Besides the GPU pool's screens, only BGRA surfaces with rows 64-byte aligned go to the
++		 * GPU as they are: the first try shared everything contiguous (text masks LA08 with 640-
++		 * and 480-byte rows among them) and the GPU stopped after a minute.
++		 */
++		if (!s->gpuPool && (s->bytesPerElement != 4 || s->planeCount > 1 || (s->bytesPerRow & 63) != 0)) {
++			s->release();
++			return kIOReturnUnsupported;
++		}
++		if (!s->gpuPool) {
++			static uint32_t shared_told;
++			if (shared_told++ < 64) {
++				IOLog("RedwoodGPU: surface %u (%ux%u fmt %#x bpr %u, %u bytes) shared at %#llx\n", s->id, s->width,
++				    s->height, s->pixelFormat, s->bytesPerRow, s->allocSize, (unsigned long long)phys);
++			}
++		}
+ 	}
+ 	size = round_page_64(s->allocSize);
+ 	memory = IOSubMemoryDescriptor::withSubRange(s->memory, 0, size, kIODirectionInOut);
+-- 
+2.43.0
+

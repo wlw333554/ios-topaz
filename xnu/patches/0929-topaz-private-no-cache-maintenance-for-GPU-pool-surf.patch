@@ -1,0 +1,27 @@
+From ada4cc1b7ab145337c4c8115adaf2679656053e8 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 00:37:49 +0300
+Subject: [PATCH 929/947] topaz private: no cache maintenance for GPU-pool
+ surfaces at submission (11 MB dc civac a frame for write-combined memory)
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index d7182d0..edc0555 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -1006,6 +1006,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		if (b == NULL) {
+ 			continue;
+ 		}
++		if (b->surface != NULL && b->surface->gpuPool) {
++			continue;                       /* topaz: GPU pool memory is write-combined: nothing in the cache */
++		}
+ 		if (b->surface != NULL) {
+ 			uint32_t seed = *(volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc);
+ 
+-- 
+2.43.0
+

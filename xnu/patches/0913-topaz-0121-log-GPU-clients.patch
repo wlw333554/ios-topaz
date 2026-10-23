@@ -1,0 +1,40 @@
+From 0442c7c0dfc8b14aaec51f61ef14ce23343d9f16 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 15:55:08 +0300
+Subject: [PATCH 913/947] topaz-0121: log GPU clients
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 3278d07..6f63c48 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -42,6 +42,7 @@
+ #include <mach/mach_time.h>
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
++#include <sys/proc.h>
+ 
+ #include "SweetSurface.h"
+ 
+@@ -460,6 +461,15 @@ RedwoodGPUUserClient::start(IOService * provider)
+ 	if (!redwood_gpu_ready() || !IOUserClient::start(provider)) {
+ 		return false;
+ 	}
++	{
++		/* topaz: who connects (the backboardd loader knocks once before and once after loading GL) */
++		static uint32_t opens;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		if (opens++ < 32) {
++			IOLog("RedwoodGPU: client %s (open %u)\n", name, opens);
++		}
++	}
+ 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
+ 	return fBuffers != NULL;
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,32 @@
+From f6c4694aa8d45e781b0d31aac1525901d87501bf Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 22:26:38 +0300
+Subject: [PATCH 946/947] topaz private: SWEET FPS only with boot-arg
+ sweetfps=1
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8e2bcc2..ba09c67 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -681,6 +681,14 @@ static uint64_t sweet_fps_wait_ns, sweet_fps_after_ns;  /* this second: latch wa
+ static void
+ sweet_fps_count(void)
+ {
++	static int on = -1;                     /* boot-arg sweetfps=1: the SWEET FPS line */
++	if (on < 0) {
++		uint32_t v = 0;
++		on = PE_parse_boot_argn("sweetfps", &v, sizeof(v)) && v != 0;
++	}
++	if (!on) {
++		return;
++	}
+ 	static uint64_t last, window, gap_max;
+ 	static uint32_t frames, late;
+ 	uint64_t now = mach_absolute_time(), ns = 0, gap = 0;
+-- 
+2.43.0
+

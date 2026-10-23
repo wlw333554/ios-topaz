@@ -1,0 +1,63 @@
+From 088293e6e339f8ff266c8d0791a8067077a3d32b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 01:02:39 +0300
+Subject: [PATCH 933/947] topaz private: GPU-pool frames shown at swap, the
+ replaced one let go once the MDP latched (two ticks of hold paced CA to 20
+ fps)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 38 +++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0a8712a..2f6487b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -583,6 +583,44 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			sweet_hold(held[i], true);
+ 		}
+ 	}
++	/*
++	 * topaz GPU: a frame that is one GPU-pool surface (the window server's, drawn by the GPU, scanned
++	 * by the MDP itself) is shown at once rather than at the next tick of our timer, and the frame
++	 * it replaces is let go as soon as the MDP has latched the new address (at the panel's next
++	 * vsync, 8 ms at most). Held two ticks, the two surfaces CoreAnimation draws into paced it
++	 * to 20 frames a second.
++	 */
++	int layer = -1;
++	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
++		if (mask & (1u << i)) {
++			layer = layer < 0 ? (int)i : -2;
++		}
++	}
++	if (layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown) {
++		SweetSurface *dropped[4], *shown[4], *retired[4];
++		IOLockLock(fLock);
++		memcpy(dropped, fPendHold, sizeof(dropped));
++		bzero(fPendHold, sizeof(fPendHold));
++		fDirty = false;                                 /* (anything older not shown at all) */
++		IOLockUnlock(fLock);
++		sweet_hold_set(dropped, false);
++		present(rec);
++		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
++			IODelay(100);                           /* until the MDP has latched it */
++		}
++		IOLockLock(fLock);
++		memcpy(shown, fShowHold, sizeof(shown));
++		memcpy(retired, fRetireHold, sizeof(retired));
++		memcpy(fShowHold, held, sizeof(held));
++		bzero(fRetireHold, sizeof(fRetireHold));
++		IOLockUnlock(fLock);
++		sweet_hold_set(shown, false);
++		sweet_hold_set(retired, false);
++		if ((++sweet_fb_swap_count % 1000) == 0) {
++			IOLog("SWEET FB: %llu swaps (direct)\n", sweet_fb_swap_count);
++		}
++		return;
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+-- 
+2.43.0
+

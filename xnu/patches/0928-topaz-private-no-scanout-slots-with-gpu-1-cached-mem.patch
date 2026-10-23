@@ -1,0 +1,33 @@
+From 70eebfed00240b9bbab3eca01cfa0458f403a497 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 00:20:01 +0300
+Subject: [PATCH 928/947] topaz private: no scanout slots with gpu=1 (cached
+ memory handed to the GPU as it was: garbage text)
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index bc4d248..c8f3255 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -136,6 +136,15 @@ sweet_scanout_eligible(const SweetSurface *s)
+ 	if (sweet_scanout_enabled < 0) {
+ 		int on = 1;
+ 		PE_parse_boot_argn("sweetfb_direct", &on, sizeof(on));
++		/*
++		 * topaz GPU: with gpu=1 the window server's frames come from the GPU pool; the scanout slots
++		 * (cached CPU memory below 4 GiB) would be handed to the GPU as they are, which reads DRAM
++		 * behind the CPU's cache: applications' pixels came out as garbage (text, images).
++		 */
++		uint32_t gpu = 0;
++		if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu != 0) {
++			on = 0;
++		}
+ 		sweet_scanout_enabled = on;
+ 	}
+ 	if (!sweet_scanout_enabled || s->bytesPerElement != 4 || s->planeCount > 1 ||
+-- 
+2.43.0
+

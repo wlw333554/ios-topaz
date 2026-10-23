@@ -1,0 +1,77 @@
+From dd938f464828b9be56490aebce2b7aae02b37744 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 14:50:07 +0300
+Subject: [PATCH 908/947] topaz-0116: GPU kernel buffers from a pool in the
+ middle DDR bank
+
+---
+ iokit/Kernel/arm/TopazAdreno.cpp | 42 +++++++++++++++++++++++++++++++-
+ 1 file changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 43825d3..a0d8b79 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -26,6 +26,7 @@
+ 
+ extern "C" {
+ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ void sweet_dcache_clean(vm_offset_t addr, unsigned length);
+ void sweet_dcache_flush(vm_offset_t addr, unsigned length);   /* osfmk/arm/caches.c: real dc civac */
+ int topaz_fw_read(const char *path, void **data, size_t *size);
+@@ -148,11 +149,50 @@ poll(volatile uint8_t *b, uint32_t o, uint32_t mask, uint32_t want, uint32_t us)
+ static uint64_t
+ kbuf_pa(struct kbuf *b, uint64_t off)
+ {
+-	return b->md->getPhysicalSegment(off, NULL, kIOMemoryMapperNone);
++	return b->md != NULL ? b->md->getPhysicalSegment(off, NULL, kIOMemoryMapperNone) : b->pa + off;
++}
++
++/*
++ * The GPU (its SMMU's walks and its fetches) does not reach DRAM above 4 GiB,
++ * as TopazGpuW found under Windows, and this kernel only manages the upper
++ * bank. The middle bank (0x80000000-0x13fffffff) is RAM nothing here uses (no
++ * reserved regions in the stock DT, not given to the kernel): a pool of it is
++ * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
++ */
++#define GPU_POOL_BASE       0x90000000ull
++#define GPU_POOL_SIZE       0x20000000ull       /* 512 MB */
++static uint64_t gpu_pool_next = GPU_POOL_BASE;
++
++static bool
++kbuf_alloc_low(struct kbuf *b, uint64_t size)
++{
++	size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++	if (gpu_pool_next + size > GPU_POOL_BASE + GPU_POOL_SIZE) {
++		return false;
++	}
++	b->md = NULL;
++	b->pa = gpu_pool_next;
++	b->va = (uint8_t *)ml_io_map_wcomb((vm_offset_t)b->pa, (vm_size_t)size);
++	if (b->va == NULL) {
++		return false;
++	}
++	gpu_pool_next += size;
++	b->size = size;
++	for (uint64_t i = 0; i < size; i += 8) {
++		*(volatile uint64_t *)(b->va + i) = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return true;
+ }
+ 
+ static bool
+ kbuf_alloc(struct kbuf *b, uint64_t size)
++{
++	return kbuf_alloc_low(b, size);
++}
++
++__unused static bool
++kbuf_alloc_high(struct kbuf *b, uint64_t size)
+ {
+ 	size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+ 	/* no cache mode: IOBMD makes such buffers contiguous, from the lower DDR bank */
+-- 
+2.43.0
+

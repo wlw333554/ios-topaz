@@ -1,0 +1,99 @@
+From 001f5dcbbca1953ecd35f962fb42e786555bdc9c Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 21:22:39 +0300
+Subject: [PATCH 941/947] topaz private: boot-arg sweetfb_lock=1: the vsync
+ timer fires at every second panel frame (INTF_1 counter and line) instead of
+ drifting 16.7 ms ticks
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 53 ++++++++++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2f6487b..23164dd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -162,6 +162,13 @@ public:
+ 	volatile uint32_t *fCtl0;
+ 	volatile uint32_t *fIntf1;      /* INTF_1 (DSI0) timing engine: refresh diagnostics */
+ 	uint32_t      fIntfFrames;
++	/* boot-arg sweetfb_lock=1: the vsync timer follows the panel (vsyncNext) */
++	bool          fVLock;
++	uint32_t      fVTotal;        /* lines a panel frame, blanking included */
++	uint32_t      fVLockFrames;   /* INTF frame counter and time at the last measurement */
++	uint64_t      fVLockAt;
++	uint32_t      fPanelUS;       /* a panel frame, measured */
++	uint32_t      vsyncNext(void);
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+@@ -362,6 +369,8 @@ AppleCLCD::start(IOService *provider)
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
++		uint32_t htotal = r[0x008 / 4] >> 16;
++		fVTotal = htotal != 0 ? r[0x00c / 4] / htotal : 0;
+ 		IOLog("SWEET INTF1: te_en %#x config %#x hsync %#x vsync_period %#x hctl %#x active_hctl %#x vstart %#x vend %#x fmt %#x cmd_trig %#x\n",
+ 		    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x00c / 4], r[0x03c / 4], r[0x040 / 4],
+ 		    r[0x01c / 4], r[0x024 / 4], r[0x090 / 4], r[0x084 / 4]);
+@@ -407,6 +416,10 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	uint32_t lock = 0;
++	fVLock = PE_parse_boot_argn("sweetfb_lock", &lock, sizeof(lock)) && lock != 0 && fIntf1 != NULL && fVTotal > 100;
++	fPanelUS = 8333;
++	IOLog("SWEET FB: vsync %s the panel (%u lines a frame)\n", fVLock ? "follows" : "does not follow", fVTotal);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -532,7 +545,45 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		memcpy(fb->fShowHold, taken, sizeof(taken));
+ 		IOLockUnlock(fb->fLock);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(fb->fVLock ? fb->vsyncNext() : SWEET_FB_VSYNC_US);
++}
++
++/*
++ * boot-arg sweetfb_lock=1: when to send the next vsync. The panel runs at its own rate (about
++ * 127 frames a second, INTF_1's counter) and the 16.7 ms timer drifted across it: a frame
++ * CoreAnimation finished could wait up to a panel frame for the MDP to take it, and frames
++ * went out unevenly. Every second panel frame instead, a little after it starts.
++ */
++uint32_t
++AppleCLCD::vsyncNext(void)
++{
++	volatile uint32_t *r = fIntf1 + 0x800 / 4;
++	uint64_t now = mach_absolute_time();
++	uint32_t frames = r[0x0ac / 4];
++	uint32_t line = r[0x0b0 / 4] & 0xffff;
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(now - fVLockAt, &ns);
++	if (fVLockAt != 0 && frames - fVLockFrames >= 60 && ns > 0) {
++		uint32_t us = (uint32_t)(ns / 1000 / (frames - fVLockFrames));
++		if (us >= 5000 && us <= 20000) {
++			fPanelUS = us;
++		}
++		fVLockFrames = frames;
++		fVLockAt = now;
++	} else if (fVLockAt == 0) {
++		fVLockFrames = frames;
++		fVLockAt = now;
++	}
++	if (line >= fVTotal) {
++		line = 0;
++	}
++	uint32_t left = (uint32_t)((uint64_t)(fVTotal - line) * fPanelUS / fVTotal);
++	uint32_t next = left + 300;
++	while (next < 12000) {
++		next += fPanelUS;
++	}
++	return next;
+ }
+ 
+ void
+-- 
+2.43.0
+

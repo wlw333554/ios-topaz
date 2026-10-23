@@ -1,0 +1,39 @@
+From af8858d1aed12a6315e8a53bd4d378a16bcafca9 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 22:58:51 +0300
+Subject: [PATCH 947/947] topaz private: exec inject NAME *app = every program
+ in an .app bundle (ElleKit TweakLoader)
+
+---
+ bsd/kern/kern_exec.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2cb278f..4710f0b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5620,7 +5620,8 @@ bad:
+  * "LIBRARY NAME NAME ..." (groups separated by ";"); a program whose file name is one of the
+  * NAMEs starts with DYLD_INSERT_LIBRARIES=LIBRARY (several libraries joined with ":").
+  * launchd drops DYLD_ variables from job descriptions, so the kernel adds this one. It starts
+- * from the boot-arg topaz_inject (commas instead of spaces).
++ * from the boot-arg topaz_inject (commas instead of spaces). The NAME "*app" matches every program
++ * whose path has an .app bundle in it (ElleKit's TweakLoader for SpringBoard and the applications).
+  */
+ static char exec_inject_conf[512];
+ static int exec_inject_loaded;
+@@ -5675,6 +5676,11 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 			    strncmp(word, name, namelen) == 0) {
+ 				matched = true;
+ 			}
++			/* "*app": every program inside an .app bundle (SpringBoard, the applications) */
++			if (!matched && (size_t)(p - word) == 4 && strncmp(word, "*app", 4) == 0 && liblen != 0 &&
++			    imgp->ip_strings != NULL && strnstr(imgp->ip_strings, ".app/", MAXPATHLEN) != NULL) {
++				matched = true;
++			}
+ 		}
+ 		if (matched && liblen != 0 && used + 1 + liblen < size) {
+ 			if (any) {
+-- 
+2.43.0
+

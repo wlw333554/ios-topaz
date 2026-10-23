@@ -1,0 +1,78 @@
+From c59471734b50f6ef082d21ec462dc3be4ba5f788 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 21:53:01 +0300
+Subject: [PATCH 943/947] topaz private: SWEET FPS also shows present+latch
+ time and tick-to-swap
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2a5c0bb..4c71286 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -53,6 +53,8 @@ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* Red
+  * reads the u64 at +0x18 of the shared state page; held from SwapEnd until
+  * one vsync after the next frame replaced it on the panel.
+  */
++static uint64_t sweet_fps_tick;         /* mach time of the last vsync tick (SWEET FPS) */
++
+ static void
+ sweet_hold(SweetSurface *s, bool on)
+ {
+@@ -437,6 +439,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fps_tick = now;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -627,6 +630,8 @@ static uint64_t sweet_fb_swap_count;
+  * Frames reaching swap(), a line a second while they come: how many, the longest gap between
+  * two, and how many came more than 20 ms after the one before (a vsync missed).
+  */
++static uint64_t sweet_fps_wait_ns, sweet_fps_after_ns;  /* this second: latch waits, tick-to-swap */
++
+ static void
+ sweet_fps_count(void)
+ {
+@@ -646,11 +651,18 @@ sweet_fps_count(void)
+ 	}
+ 	frames++;
+ 	late += gap > 20000000ull;
++	if (sweet_fps_tick != 0 && now > sweet_fps_tick) {
++		uint64_t after = 0;
++		absolutetime_to_nanoseconds(now - sweet_fps_tick, &after);
++		sweet_fps_after_ns += after;
++	}
+ 	gap_max = gap > gap_max ? gap : gap_max;
+ 	absolutetime_to_nanoseconds(now - window, &ns);
+ 	if (ns >= 1000000000ull) {
+-		IOLog("SWEET FPS: %u frames in %llu ms, longest gap %llu ms, %u late\n", frames, ns / 1000000,
+-		    gap_max / 1000000, late);
++		IOLog("SWEET FPS: %u frames in %llu ms, longest gap %llu ms, %u late; a frame: %llu us in present + latch, "
++		    "came %llu us after the tick\n", frames, ns / 1000000, gap_max / 1000000, late,
++		    frames ? sweet_fps_wait_ns / 1000 / frames : 0, frames ? sweet_fps_after_ns / 1000 / frames : 0);
++		sweet_fps_wait_ns = sweet_fps_after_ns = 0;
+ 		window = now;
+ 		frames = late = 0;
+ 		gap_max = 0;
+@@ -690,10 +702,13 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		fDirty = false;                                 /* (anything older not shown at all) */
+ 		IOLockUnlock(fLock);
+ 		sweet_hold_set(dropped, false);
++		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+ 		present(rec);
+ 		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
+ 			IODelay(100);                           /* until the MDP has latched it */
+ 		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - waited, &wns);
++		sweet_fps_wait_ns += wns;
+ 		IOLockLock(fLock);
+ 		memcpy(shown, fShowHold, sizeof(shown));
+ 		memcpy(retired, fRetireHold, sizeof(retired));
+-- 
+2.43.0
+

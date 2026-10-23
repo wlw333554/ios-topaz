@@ -1,0 +1,62 @@
+From f59c010d84f062d45f5372364bca88b734d7c21b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 21:30:03 +0300
+Subject: [PATCH 942/947] topaz private: SWEET FPS line a second (frames
+ swapped, longest gap, late ones)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 35 +++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 23164dd..2a5c0bb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -623,9 +623,44 @@ static uint64_t sweet_fb_swap_count;
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++/*
++ * Frames reaching swap(), a line a second while they come: how many, the longest gap between
++ * two, and how many came more than 20 ms after the one before (a vsync missed).
++ */
++static void
++sweet_fps_count(void)
++{
++	static uint64_t last, window, gap_max;
++	static uint32_t frames, late;
++	uint64_t now = mach_absolute_time(), ns = 0, gap = 0;
++
++	if (last != 0) {
++		absolutetime_to_nanoseconds(now - last, &gap);
++	}
++	last = now;
++	if (window == 0 || gap > 500000000ull) {
++		window = now;
++		frames = late = 0;
++		gap_max = 0;
++		return;
++	}
++	frames++;
++	late += gap > 20000000ull;
++	gap_max = gap > gap_max ? gap : gap_max;
++	absolutetime_to_nanoseconds(now - window, &ns);
++	if (ns >= 1000000000ull) {
++		IOLog("SWEET FPS: %u frames in %llu ms, longest gap %llu ms, %u late\n", frames, ns / 1000000,
++		    gap_max / 1000000, late);
++		window = now;
++		frames = late = 0;
++		gap_max = 0;
++	}
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	sweet_fps_count();
+ 	SweetSurface *held[4] = {};
+ 	uint32_t mask = get32(rec, 0x104);
+ 	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
+-- 
+2.43.0
+

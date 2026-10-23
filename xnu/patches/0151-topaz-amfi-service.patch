@@ -1,0 +1,162 @@
+From d42d2a9dd814ae165b0d199c0d26ad9f3e8cb04c Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 10:57:28 +0300
+Subject: [PATCH] topaz-0151: AppleMobileFileIntegrity IOService + user client
+ (every cdhash trusted): ExtensionKit reads the signed extension cache,
+ extension points come back
+
+---
+ iokit/Kernel/arm/SweetAMFIService.cpp | 107 ++++++++++++++++++++++++++
+ iokit/Kernel/arm/SweetFramebuffer.cpp |   2 +
+ iokit/conf/files.arm64                |   1 +
+ 3 files changed, 110 insertions(+)
+ create mode 100644 iokit/Kernel/arm/SweetAMFIService.cpp
+
+diff --git a/iokit/Kernel/arm/SweetAMFIService.cpp b/iokit/Kernel/arm/SweetAMFIService.cpp
+new file mode 100644
+index 0000000..7d61209
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAMFIService.cpp
+@@ -0,0 +1,107 @@
++/*
++ * SWEET: an IOService named AppleMobileFileIntegrity, as the AMFI kext publishes on a device.
++ * ExtensionKit reads the signed extension cache (/System/Library/xpc/extensions.plist,
++ * +[NSDictionary _EX_dictionaryWithSignedURL:error:]) only after asking AMFI's user client
++ * whether the signature's cdhash is in the trust cache: IOServiceGetMatchingService(
++ * "AppleMobileFileIntegrity"), IOServiceOpen type 0, IOConnectCallMethod selector 6 with one
++ * scalar and the cdhash. Without the service: "Unable to find AMFI", no extension point in
++ * LaunchServices, PlugInKit -10814 for every extension point (no wallpapers, widgets, file
++ * providers). This kernel enforces no code signatures (sweet_amfi.c), so every hash is trusted:
++ * every call succeeds. Each selector is logged the first time.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++
++class AppleMobileFileIntegrity : public IOService
++{
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++public:
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++public:
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrity::newUserClient(task_t owningTask, void *securityID __unused, UInt32 type __unused,
++    IOUserClient **handler)
++{
++	AppleMobileFileIntegrityUserClient *client = OSTypeAlloc(AppleMobileFileIntegrityUserClient);
++
++	if (client == NULL || !client->initWithTask(owningTask, NULL, 0) || !client->attach(this) || !client->start(this)) {
++		if (client != NULL) {
++			client->detach(this);
++			client->release();
++		}
++		return kIOReturnNoMemory;
++	}
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch __unused, OSObject *target __unused, void *reference __unused)
++{
++	static uint64_t seen;
++
++	if (selector < 64 && !(seen & (1ULL << selector))) {
++		char name[32];
++		seen |= 1ULL << selector;
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AMFI: user client selector %u from %s (%u scalars, %u bytes in): trusted\n", selector, name,
++		    args->scalarInputCount, args->structureInputSize);
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++extern "C" void
++sweet_amfi_service_init(void)
++{
++	static bool done;
++	AppleMobileFileIntegrity *amfi;
++
++	if (done) {
++		return;
++	}
++	done = true;
++	amfi = OSTypeAlloc(AppleMobileFileIntegrity);
++	if (amfi == NULL || !amfi->init() || !amfi->attach(IOService::getServiceRoot())) {
++		IOLog("SWEET AMFI: no AppleMobileFileIntegrity service\n");
++		OSSafeReleaseNULL(amfi);
++		return;
++	}
++	amfi->registerService();
++	IOLog("SWEET AMFI: AppleMobileFileIntegrity service published\n");
++}
++
++#else
++extern "C" void sweet_amfi_service_init(void) {}
++#endif
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 55b84a7..05dcb0a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,7 @@ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video
+ extern "C" void (*sweet_console_show_hook)(void);
+ extern "C" void topaz_modem_init(void);
+ extern "C" void topaz_audio_init(void);
++extern "C" void sweet_amfi_service_init(void);
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+@@ -270,6 +271,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	topaz_modem_init();
+ 	topaz_audio_init();
++	sweet_amfi_service_init();
+ 	sweet_busy_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index ac7ea50..60ec873 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,6 +13,7 @@ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitc
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/TopazAudio.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/TopazRpm.cpp                                    optional iokitcpp
++iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+-- 
+2.43.0
+

@@ -1,0 +1,36 @@
+From c39a0e6940b6a3107e35258ab67b1ed7be14282d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 00:44:25 +0300
+Subject: [PATCH 931/947] Revert "topaz private: SpringBoard screen-sized
+ surfaces from the GPU pool too (snapshots drawn by the GPU were copied out:
+ 45-170 ms)"
+
+This reverts commit 8e8f9c3ce05515dba968a62b830a4971e7ad89da.
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1d34df0..c8f3255 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -408,14 +408,10 @@ sweet_gpu_pool_eligible(const SweetSurface *s)
+ 	    s->width >= 1000 && s->height >= 2000 && s->allocSize <= (48u << 20))) {
+ 		return false;
+ 	}
+-	/*
+-	 * only the window server's own (the display's frames) and SpringBoard's (its snapshots, which the GPU
+-	 * draws into for every app launch and switch: copied out, they cost 45-170 ms); applications'
+-	 * screen-sized surfaces came out black
+-	 */
++	/* only the window server's own (the display's frames); applications' screen-sized surfaces came out black */
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+-	return strcmp(name, "backboardd") == 0 || strcmp(name, "SpringBoard") == 0;
++	return strcmp(name, "backboardd") == 0;
+ }
+ 
+ static uint32_t
+-- 
+2.43.0
+

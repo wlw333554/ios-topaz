@@ -1,0 +1,41 @@
+From 4d433b4c05cdee3736a725c867a138f1ec48bfc4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 22:16:36 +0300
+Subject: [PATCH 926/947] topaz private: a surface buffer's memory is not given
+ back to the GPU pool (it was handed to the next Mesa buffer while the surface
+ still used it: GPU hangs)
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index db827f8..d7182d0 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -514,7 +514,10 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 			b->memory = NULL;               /* (now the kept one's) */
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(b->address, b->size);
+-			redwood_gpu_address_free(b->address, b->size);
++			/* topaz: in pass-through the address is the memory itself; a surface's is the surface's, not the pool's */
++			if (!(redwood_gpu_identity() && b->surface != NULL)) {
++				redwood_gpu_address_free(b->address, b->size);
++			}
+ 		}
+ 		if (b->memory != NULL) {
+ 			b->memory->release();
+@@ -545,7 +548,9 @@ RedwoodGPUUserClient::reap(void)
+ 			left->memory = NULL;
+ 		} else if (redwood_gpu_ready()) {
+ 			redwood_gpu_unmap(left->address, left->size);
+-			redwood_gpu_address_free(left->address, left->size);
++			if (!(redwood_gpu_identity() && left->surface != NULL)) {
++				redwood_gpu_address_free(left->address, left->size);
++			}
+ 		}
+ 		if (left->memory != NULL) {
+ 			left->memory->release();
+-- 
+2.43.0
+

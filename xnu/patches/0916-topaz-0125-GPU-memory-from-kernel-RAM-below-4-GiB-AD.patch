@@ -1,0 +1,87 @@
+From 0227e63751460a3651ac350baba0a43a50d0c1e8 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 16:44:04 +0300
+Subject: [PATCH 916/947] topaz-0125: GPU memory from kernel RAM below 4 GiB
+ (ADT --midmem)
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp  | 24 ++++++++++++++++++++++--
+ iokit/Kernel/arm/TopazAdreno.cpp | 17 ++++++++++++++++-
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 6f63c48..15adff8 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -775,7 +775,26 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	IOLockUnlock(gGPULock);
+ 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+ 	if (redwood_gpu_identity()) {
+-		/* topaz: from the GPU's pool below 4 GiB (contiguous, write-combined) */
++		/* topaz: kernel memory below 4 GiB, contiguous (ADT --midmem gives the kernel such RAM) */
++		IOBufferMemoryDescriptor * low = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
++		    (vm_size_t) size, 0x00000000fffff000ull);
++		if (low != NULL) {
++			IOLockLock(gGPULock);
++			b = newBuffer(low, 0, size, request->flags, &request->handle);
++			if (b != NULL) {
++				b->memory = low;
++				b->kernel = (uint8_t *) low->getBytesNoCopy();
++				gGPUStat.made++;
++			}
++			IOLockUnlock(gGPULock);
++			if (b == NULL) {
++				low->release();
++				return kIOReturnNoMemory;
++			}
++			return kIOReturnSuccess;
++		}
++		/* else: from the GPU's pool below 4 GiB (contiguous, write-combined) */
+ 		void * va = NULL;
+ 		uint64_t pa = topaz_gpu_pool_alloc(size, &va);
+ 
+@@ -1134,7 +1153,8 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+ 		b->seen = true;
+ 		*memory = b->memory;
+ 		/* topaz: pool memory is not the kernel's: mapped write-combined, not as a device */
+-		*options = redwood_gpu_identity() ? kIOMapWriteCombineCache : 0;
++		*options = (redwood_gpu_identity() && OSDynamicCast(IOBufferMemoryDescriptor, b->memory) == NULL) ?
++		    kIOMapWriteCombineCache : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(gGPULock);
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 5c0bec3..d066c51 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -288,10 +288,25 @@ kbuf_alloc_low(struct kbuf *b, uint64_t size)
+ 	return true;
+ }
+ 
++/*
++ * With the ADT's RAM from 0x80000000 (mkadt.py --midmem) the kernel has memory
++ * below 4 GiB of its own: GPU memory is ordinary IOKit memory, contiguous (the
++ * SMMU passes addresses through), below 4 GiB, write-combined.
++ */
+ static bool
+ kbuf_alloc(struct kbuf *b, uint64_t size)
+ {
+-	return kbuf_alloc_low(b, size);
++	size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++	b->md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, size, 0x00000000fffff000ull);
++	if (b->md == NULL) {
++		return kbuf_alloc_low(b, size);         /* (an ADT without the middle bank: the pool) */
++	}
++	b->va = (uint8_t *)b->md->getBytesNoCopy();
++	b->pa = b->md->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	b->size = size;
++	bzero(b->va, size);
++	return true;
+ }
+ 
+ __unused static bool
+-- 
+2.43.0
+

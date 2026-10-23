@@ -1,0 +1,35 @@
+From 4047eff1dd70eeaa49d6af5554c28ffd2cb78c34 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 19:07:36 +0300
+Subject: [PATCH 918/947] topaz debug: log dropped SweetSurface views of
+ backboardd (SSDROP)
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index fd2e424..c35b578 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -486,6 +486,17 @@ OSDefineMetaClassAndStructors(SweetSurfaceRef, OSObject);
+ void
+ SweetSurfaceRef::free()
+ {
++	/* topaz debug: which views go away, where their state pages were (match a crash address) */
++	static uint32_t dropped;
++	if (state != NULL && surface != NULL && dropped < 4000) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		if (strcmp(name, "backboardd") == 0) {
++			dropped++;
++			IOLog("SSDROP %s id %u state %#llx data %#llx count %u detached %d\n", name, surface->id,
++			    (unsigned long long)state->getAddress(), data ? (unsigned long long)data->getAddress() : 0ULL, count, detached);
++		}
++	}
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
+-- 
+2.43.0
+

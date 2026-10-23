@@ -1,0 +1,33 @@
+From b4367761d736d53079579a698069dc1189418c68 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 14:25:36 +0300
+Subject: [PATCH 939/947] topaz private: contiguous surfaces up to 16 MB, so
+ full-screen ones (11 MB) are shared too: they were read back with
+ glReadPixels, 40-60 ms in the middle of animations
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 38a6e2a..356a476 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -978,12 +978,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				gpu_low = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
+ 			}
+ 			/*
+-			 * gpu=1: physically contiguous memory (up to 8 MB), so that the Adreno, whose
++			 * gpu=1: physically contiguous memory (up to 16 MB: a full screen, 1125x2436, is 11 MB), so that the Adreno, whose
+ 			 * addresses are physical with the SMMU in pass-through, reads the surface where it
+ 			 * is: eagl binds it as a texture instead of copying it into one at every change
+ 			 * (glBindTexture was 3 ms of an 8 ms frame). Fall back to ordinary pages.
+ 			 */
+-			if (gpu_low && s->allocSize <= (8u << 20)) {
++			if (gpu_low && s->allocSize <= (16u << 20)) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize,
+ 				    0x0000000FFFFFC000ull);
+-- 
+2.43.0
+

@@ -1,0 +1,82 @@
+From 783c7c20dd8bac06cbf1e10d77c1d3bd7c5c0c3d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 14:18:54 +0300
+Subject: [PATCH 903/947] topaz-0111: GPU memory from the upper DDR bank
+ (36-bit SMMU)
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp   | 4 ++--
+ iokit/Kernel/arm/SweetSurface.cpp | 7 ++-----
+ iokit/Kernel/arm/TopazAdreno.cpp  | 9 +++++----
+ 3 files changed, 9 insertions(+), 11 deletions(-)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index b0d270c..7a041c0 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -746,8 +746,8 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+-	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+-	    kIOMemoryPhysicallyContiguous | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, 0x00000000fffff000ull);
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
+ 	if (memory == NULL) {
+ 		IOLog("RedwoodGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
+ 		    fBufferBytes >> 20);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0546327..fd2e424 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -894,11 +894,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				uint32_t on = 0;
+ 				gpu_low = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
+ 			}
+-			mem = gpu_low ?
+-			    IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize,
+-			    0x00000000fffff000ull) :
+-			    IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++			(void)gpu_low;                  /* the SMMU maps the upper bank: no restriction needed */
++			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, SWEET_UPAGE);
+ 		}
+ 		if (mem == NULL) {
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 0ca4bac..ed8667c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -9,8 +9,8 @@
+  * gfx3d from GPLL0), the zap shader through TrustZone (PAS 13), the GPU SMMU
+  * with stage-1 tables (4 KB granule, 4 GB GPU VA, one context bank), CP start
+  * (SQE microcode, ME_INIT, SET_SECURE_MODE 0), IB submission and fences. The
+- * A610 has no GMU. GPU-visible memory stays below 4 GiB (walks and fetches
+- * above it faulted under Windows).
++ * A610 has no GMU. Under Windows GPU memory stayed below 4 GiB; here the
++ * kernel has no RAM below 4 GiB at all, and the SMMU maps 36-bit addresses.
+  *
+  * Boot-arg gpu=1: a thread waits for the root filesystem, loads the firmware
+  * (/usr/share/firmware/topaz/{a610_zap.mdt,a610_zap.b02,a630_sqe.fw}), starts
+@@ -91,7 +91,8 @@ uint32_t gpu_log;
+ #define VA_KERNEL           0xF0000000ull
+ #define GMEM_SIZE           0x21000             /* 128K + 4K (bengal), TopazGpuW */
+ #define GMEM_BASE           0x100000
+-#define LOW_MASK            0x00000000fffff000ull
++/* topaz: all kernel RAM is the upper DDR bank (0x1_40000000+): the SMMU takes 36-bit output addresses */
++#define LOW_MASK            0x0000000ffffff000ull
+ 
+ #define FW_DIR              "/usr/share/firmware/topaz/"
+ 
+@@ -423,7 +424,7 @@ static bool
+ mmu_map(uint64_t va, uint64_t pa, bool ro)
+ {
+ 	uint64_t *t = l3_for(va, true);
+-	if (t == NULL || (pa >> 32) != 0) {
++	if (t == NULL || (pa >> 36) != 0) {
+ 		return false;
+ 	}
+ 	t[(va >> 12) & 511] = pa | PTE_PAGE | (ro ? PTE_AP_RO : 0);
+-- 
+2.43.0
+

@@ -1,0 +1,62 @@
+From a5dff543e561c1112e0670d0b141c7c509b7a2f8 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 14:55:49 +0300
+Subject: [PATCH 909/947] topaz-0117: SMMU pass-through test mode
+ (gpu_identity)
+
+---
+ iokit/Kernel/arm/TopazAdreno.cpp | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index a0d8b79..940b37f 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -162,6 +162,8 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+ #define GPU_POOL_BASE       0x90000000ull
+ #define GPU_POOL_SIZE       0x20000000ull       /* 512 MB */
+ static uint64_t gpu_pool_next = GPU_POOL_BASE;
++/* boot-arg gpu_identity (default 1): the SMMU passes addresses through (TopazGpuW G1), GPU VA = PA */
++static uint32_t gpu_identity = 1;
+ 
+ static bool
+ kbuf_alloc_low(struct kbuf *b, uint64_t size)
+@@ -517,19 +519,24 @@ smmu_setup(void)
+ 	wr(smmu, SMMU_CB0 + 0x010, 1);                  /* TCR2: PASize 36 bits */
+ 	wr(smmu, SMMU_CB0 + 0x038, 0x44);               /* MAIR0: attr0 = Normal non-cacheable */
+ 	wr(smmu, SMMU_CB0 + 0x03C, 0);
+-	wr(smmu, SMMU_CB0 + 0x000, 0x67);               /* SCTLR: CFIE CFRE AFE TRE M */
++	wr(smmu, SMMU_CB0 + 0x000, gpu_identity ? 0xE0 : 0x67);    /* SCTLR: M=0 pass-through, or CFIE CFRE AFE TRE M */
+ 	wr(smmu, 0xC00, 0);                             /* S2CR0 -> CB0 */
+ 	wr(smmu, 0x800, (1u << 31) | (1u << 16));       /* SMR0: SID 0 mask 1 */
+ 	smmu_on = true;
+ 	tlb_flush();
+-	IOLog("TopazGPU: SMMU TTBR0 %08x%08x SCTLR %08x TCR %08x IDR2 %08x\n", rd(smmu, SMMU_CB0 + 0x24),
+-	    rd(smmu, SMMU_CB0 + 0x20), rd(smmu, SMMU_CB0), rd(smmu, SMMU_CB0 + 0x30), rd(smmu, 0x28));
++	IOLog("TopazGPU: SMMU TTBR0 %08x%08x SCTLR %08x TCR %08x TCR2 %08x IDR0 %08x IDR2 %08x sCR0 %08x%s\n",
++	    rd(smmu, SMMU_CB0 + 0x24), rd(smmu, SMMU_CB0 + 0x20), rd(smmu, SMMU_CB0), rd(smmu, SMMU_CB0 + 0x30),
++	    rd(smmu, SMMU_CB0 + 0x10), rd(smmu, 0x20), rd(smmu, 0x28), rd(smmu, 0x0), gpu_identity ? " (identity)" : "");
+ 	return true;
+ }
+ 
+ static bool
+ kbuf_map(struct kbuf *b)
+ {
++	if (gpu_identity) {
++		b->iova = b->pa;                        /* pool memory is contiguous */
++		return true;
++	}
+ 	b->iova = kernel_va_next;
+ 	kernel_va_next += b->size + 4096;               /* guard page */
+ 	for (uint64_t off = 0; off < b->size; off += 4096) {
+@@ -962,6 +969,7 @@ topaz_adreno_init(void)
+ 	if (!PE_parse_boot_argn("gpu", &on, sizeof(on)) || on == 0 || hw_lock != NULL) {
+ 		return;
+ 	}
++	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
+ 	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 600) {
+ 		core_mhz = 600;
+ 	}
+-- 
+2.43.0
+

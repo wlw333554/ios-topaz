@@ -1,0 +1,137 @@
+From: topaz
+Subject: [PATCH] topaz: contiguous buffers set aside for screen-sized surfaces
+
+Ten 12 MB contiguous buffers taken at the first surface (with the 64 guard
+rows inside). Screen-sized BGRA surfaces made later found no 11 MB of
+contiguous memory, were not shared with the GPU and were read back every
+frame: 30-160 ms hitches in blurred animations. A buffer freed while a
+mapping or the GPU still holds it waits until they let go.
+---
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-10-22 14:37:56
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-10-22 15:20:23
+@@ -159,6 +159,100 @@
+ 	return false;
+ }
+ 
++/*
++ * gpu=1: contiguous buffers set aside for screen-sized surfaces (1125x2436 BGRA is 11 MB, 11.3 with
++ * the 64 guard rows), taken on the first surface while memory is still in one piece. Later an
++ * 11 MB contiguous allocation mostly failed: such a surface was not shared with the GPU, and eagl
++ * read each frame of it back (glReadPixels, 30-160 ms: the hitches in every blurred animation).
++ * A buffer goes back when its surface is freed and nobody else holds the memory. (A first try,
++ * before the guard rows, let the GPU's last tiles run into the next buffer: artifacts, a reboot.)
++ */
++#define SWEET_RES_SIZE  (12u << 20)
++#define SWEET_RES_COUNT 10
++static IOBufferMemoryDescriptor *sweet_res_free[SWEET_RES_COUNT];  /* sweet_surface_lock */
++/* freed while something still held the memory (a mapping, the GPU): ours again once it lets go */
++static IOBufferMemoryDescriptor *sweet_res_wait[2 * SWEET_RES_COUNT];
++
++static void
++sweet_res_fill(void)
++{
++	static bool filled;
++	IOBufferMemoryDescriptor *mem[SWEET_RES_COUNT];
++	unsigned n = 0;
++
++	if (filled) {
++		return;
++	}
++	filled = true;
++	for (; n < SWEET_RES_COUNT; n++) {
++		mem[n] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, SWEET_RES_SIZE,
++		    0x0000000FFFFFC000ull);
++		if (mem[n] == NULL) {
++			break;
++		}
++	}
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < n; i++) {
++		sweet_res_free[i] = mem[i];
++	}
++	IOLockUnlock(sweet_surface_lock);
++	IOLog("SWEET SURF: %u contiguous buffers of %u MB set aside for screen-sized surfaces\n", n, SWEET_RES_SIZE >> 20);
++}
++
++static IOBufferMemoryDescriptor *
++sweet_res_take(uint64_t size)
++{
++	IOBufferMemoryDescriptor *mem = NULL;
++
++	if (size > SWEET_RES_SIZE) {
++		return NULL;
++	}
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < SWEET_RES_COUNT && mem == NULL; i++) {
++		if (sweet_res_free[i] != NULL) {
++			mem = sweet_res_free[i];
++			sweet_res_free[i] = NULL;
++		}
++	}
++	for (unsigned i = 0; i < 2 * SWEET_RES_COUNT && mem == NULL; i++) {
++		if (sweet_res_wait[i] != NULL && sweet_res_wait[i]->getRetainCount() == 1) {
++			mem = sweet_res_wait[i];
++			sweet_res_wait[i] = NULL;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return mem;
++}
++
++static bool
++sweet_res_give(IOMemoryDescriptor *md)
++{
++	IOBufferMemoryDescriptor *mem = OSDynamicCast(IOBufferMemoryDescriptor, md);
++	bool kept = false;
++
++	if (mem == NULL || mem->getCapacity() != SWEET_RES_SIZE) {
++		return false;
++	}
++	IOLockLock(sweet_surface_lock);
++	if (mem->getRetainCount() == 1) {
++		for (unsigned i = 0; i < SWEET_RES_COUNT && !kept; i++) {
++			if (sweet_res_free[i] == NULL) {
++				sweet_res_free[i] = mem;
++				kept = true;
++			}
++		}
++	}
++	for (unsigned i = 0; i < 2 * SWEET_RES_COUNT && !kept; i++) {
++		if (sweet_res_wait[i] == NULL) {
++			sweet_res_wait[i] = mem;        /* (our reference stays: taken again only at retain count 1) */
++			kept = true;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return kept;
++}
++
+ static int
+ sweet_scanout_alloc_slot(void)
+ {
+@@ -202,6 +296,9 @@
+ 	}
+ 	if (wrapped && memory != NULL) {
+ 		memory->complete();
++	}
++	if (!wrapped && !gpuPool && memory != NULL && sweet_res_give(memory)) {
++		memory = NULL;
+ 	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+@@ -989,7 +1086,13 @@
+ 			 * pages came next. (The descriptor keeps them: RedwoodGPU gives them to the GPU.)
+ 			 */
+ 			uint64_t take = gpu_low ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
+-			if (gpu_low && take <= (16u << 20)) {
++			if (gpu_low) {
++				sweet_res_fill();
++				if (s->width >= 1000 && s->height >= 2000 && s->bytesPerElement == 4) {
++					mem = sweet_res_take(take);
++				}
++			}
++			if (mem == NULL && gpu_low && take <= (16u << 20)) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
+ 				    0x0000000FFFFFC000ull);

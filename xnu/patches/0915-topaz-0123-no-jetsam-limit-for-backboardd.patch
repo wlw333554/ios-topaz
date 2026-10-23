@@ -1,0 +1,47 @@
+From e060828a14b7f0db5182943e7a76b27991a9d1a1 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 16:20:12 +0300
+Subject: [PATCH 915/947] topaz-0123: no jetsam limit for backboardd
+
+---
+ bsd/kern/kern_memorystatus.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index 1750d3a..24ecbf3 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -2366,6 +2366,17 @@ memorystatus_update(proc_t p, int priority, uint64_t user_data, boolean_t is_ass
+ 	int ret;
+ 	boolean_t head_insert = false;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++	/*
++	 * topaz: the window server with Mesa (GPU OpenGL ES) needs more than the
++	 * iPhone X's limit for backboardd; over it, jetsam kills it in a loop.
++	 */
++	if (update_memlimit && strcmp(p->p_name, "backboardd") == 0) {
++		memlimit_active = memlimit_inactive = -1;
++		memlimit_active_is_fatal = memlimit_inactive_is_fatal = FALSE;
++	}
++#endif
++
+ 	memorystatus_log_info("memorystatus_update: changing (%s) pid %d: priority %d, user_data 0x%llx\n",
+ 	    (*p->p_name ? p->p_name : "unknown"), proc_getpid(p), priority, user_data);
+ 
+@@ -7683,6 +7694,12 @@ memorystatus_cmd_convert_memlimit_mb(pid_t pid, int32_t limit, int32_t *retval)
+ static int
+ memorystatus_set_memlimit_properties_internal(proc_t p, memorystatus_memlimit_properties_t *p_entry)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++	if (strcmp(p->p_name, "backboardd") == 0) {     /* topaz: see memorystatus_update() */
++		p_entry->memlimit_active = p_entry->memlimit_inactive = -1;
++		p_entry->memlimit_active_attr = p_entry->memlimit_inactive_attr = 0;
++	}
++#endif
+ 	int error = 0;
+ 
+ 	LCK_MTX_ASSERT(&proc_list_mlock, LCK_MTX_ASSERT_OWNED);
+-- 
+2.43.0
+

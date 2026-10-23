@@ -1,0 +1,53 @@
+From 671271f5012e6019c433c56714b761b07f6a97b4 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 22:04:19 +0300
+Subject: [PATCH 944/947] topaz private: boot-arg sweetfb_nohold=1 (test:
+ frames on the panel not marked in use)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4c71286..79ae337 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,9 +55,24 @@ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* Red
+  */
+ static uint64_t sweet_fps_tick;         /* mach time of the last vsync tick (SWEET FPS) */
+ 
++/* boot-arg sweetfb_nohold=1 (a test): frames on the panel are not marked in use */
++static bool
++sweet_fb_nohold(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		uint32_t v = 0;
++		on = PE_parse_boot_argn("sweetfb_nohold", &v, sizeof(v)) && v != 0;
++	}
++	return on;
++}
++
+ static void
+ sweet_hold(SweetSurface *s, bool on)
+ {
++	if (sweet_fb_nohold()) {
++		return;
++	}
+ 	OSAddAtomic64(on ? 1 : -1, (volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + 0x18));
+ }
+ 
+@@ -678,7 +693,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
+ 		uint32_t sid = get32(rec, 0x54 + 4 * i);
+ 		if ((mask & (1u << i)) && sid != 0 && (held[i] = sweet_surface_copy(sid)) != NULL) {
+-			sweet_hold(held[i], true);
++			if (!sweet_fb_nohold()) {
++				sweet_hold(held[i], true);
++			}
+ 		}
+ 	}
+ 	/*
+-- 
+2.43.0
+

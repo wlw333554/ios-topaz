@@ -1,0 +1,86 @@
+From 9b1d81e0bb3d526abf44ccb8788b253477c9786b Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 19:25:28 +0300
+Subject: [PATCH 940/947] topaz private: 64 guard rows behind gpu=1 surfaces
+ (GPU tiles past the last row hit the next pages); gpu_identity=0 shares
+ scattered surfaces through the SMMU
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp   | 24 ++++++++++++++++++++----
+ iokit/Kernel/arm/SweetSurface.cpp | 12 +++++++++---
+ 2 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 64a7d00..a4e5569 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -901,10 +901,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		 * GPU as they are: the first try shared everything contiguous (text masks LA08 with 640-
+ 		 * and 480-byte rows among them) and the GPU stopped after a minute.
+ 		 */
+-		if (!s->gpuPool && (s->bytesPerElement != 4 || s->planeCount > 1 || (s->bytesPerRow & 63) != 0)) {
+-			s->release();
+-			return kIOReturnUnsupported;
+-		}
++
+ 		if (!s->gpuPool) {
+ 			static uint32_t shared_told;
+ 			if (shared_told++ < 64) {
+@@ -913,7 +910,26 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 			}
+ 		}
+ 	}
++	if (!s->gpuPool && (s->bytesPerElement != 4 || s->planeCount > 1 || (s->bytesPerRow & 63) != 0)) {
++		s->release();
++		return kIOReturnUnsupported;
++	}
++	/*
++	 * gpu_identity=0: the SMMU translates, the buffer's pages need not be contiguous. The GPU's
++	 * whole tiles past the last row need pages behind them (a fault otherwise): the 64 rows
++	 * SweetSurface allocates beyond the picture, when the descriptor has them.
++	 */
+ 	size = round_page_64(s->allocSize);
++	if (!redwood_gpu_identity() && !s->wrapped) {
++		IOBufferMemoryDescriptor * bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++		uint64_t want = round_page_64(s->allocSize + 64ull * s->bytesPerRow);
++		if (bmd != NULL && bmd->getLength() >= want) {
++			size = want;
++		} else if (!s->gpuPool) {
++			s->release();
++			return kIOReturnUnsupported;
++		}
++	}
+ 	memory = IOSubMemoryDescriptor::withSubRange(s->memory, 0, size, kIODirectionInOut);
+ 	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
+ 		OSSafeReleaseNULL(memory);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 356a476..8e7965c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -983,14 +983,20 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			 * is: eagl binds it as a texture instead of copying it into one at every change
+ 			 * (glBindTexture was 3 ms of an 8 ms frame). Fall back to ordinary pages.
+ 			 */
+-			if (gpu_low && s->allocSize <= (16u << 20)) {
++			/*
++			 * gpu=1: 64 rows more than the picture, as for the pool's screens: the GPU writes whole
++			 * tiles, and the rows past the height (2436 is no multiple of a tile) went into whatever
++			 * pages came next. (The descriptor keeps them: RedwoodGPU gives them to the GPU.)
++			 */
++			uint64_t take = gpu_low ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
++			if (gpu_low && take <= (16u << 20)) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize,
++				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
+ 				    0x0000000FFFFFC000ull);
+ 			}
+ 			if (mem == NULL) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, SWEET_UPAGE);
++				    kIODirectionInOut | kIOMemoryKernelUserShared, take, SWEET_UPAGE);
+ 			}
+ 		}
+ 		if (mem == NULL) {
+-- 
+2.43.0
+

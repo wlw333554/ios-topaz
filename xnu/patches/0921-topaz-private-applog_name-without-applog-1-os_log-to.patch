@@ -1,0 +1,27 @@
+From 779aff52e38dd654206486a70b328e1bc204861d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 21:28:28 +0300
+Subject: [PATCH 921/947] topaz private: applog_name without applog=1 (os_log
+ to stderr; sweetnull= puts it in the kernel log)
+
+---
+ bsd/kern/kern_exec.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 645c3fd..2cb278f 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2639,7 +2639,8 @@ exec_applog_oslog(struct image_params *imgp)
+ 	if (exec_applog >= 2) {
+ 		return true;
+ 	}
+-	if (exec_applog == 0 || *p == 0 || imgp->ip_ndp == NULL) {
++	/* (applog_name works on its own too: with sweetnull=NAMES the kernel log gets what they write) */
++	if (*p == 0 || imgp->ip_ndp == NULL) {
+ 		return false;
+ 	}
+ 	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
+-- 
+2.43.0
+

@@ -1,0 +1,42 @@
+From 72beade971de176f3dca24a97c4add7211df94c7 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 11:27:59 +0300
+Subject: [PATCH] topaz-0152: display off shows one black kernel frame (the
+ fade read the last GPU-pool frame, which may be reused: garbage, then a hang)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 05dcb0a..48fb536 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -445,9 +445,22 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 */
+ 		/*
+ 		 * topaz: the DCS commands (0x51 0, 0x28, 0x10) do not reach the panel
+-		 * yet (video mode), so fade to black even with DSI: black AMOLED
+-		 * pixels are dark, which is what display off looks like.
++		 * yet (video mode). Show one black frame of the kernel's own instead:
++		 * black AMOLED pixels are dark. Not a fade from the last frame: with the
++		 * GPU pool the last frame is a surface that may already be reused
++		 * (garbage, then a hang).
+ 		 */
++		if (fb->fDsi != NULL && fb->fFlip[0] != NULL && fb->fFlip[1] != NULL) {
++			bool first = fb->fFadeStep == 0;
++			fb->fFadeStep = 1;
++			IOLockUnlock(fb->fLock);
++			if (first) {
++				bzero(fb->backBuffer(), (size_t)fb->fRowBytes * fb->fHeight);
++				fb->flipBack();
++			}
++			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			return;
++		}
+ 		if (fb->fFadeOrig != NULL) {
+ 			uint32_t step = fb->fFadeStep;
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+-- 
+2.43.0
+

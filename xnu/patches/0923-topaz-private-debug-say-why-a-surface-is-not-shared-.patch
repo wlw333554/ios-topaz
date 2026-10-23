@@ -1,0 +1,30 @@
+From 6d50a3e0d0912f65b5615792a439c0a5ee11bf61 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 21:44:57 +0300
+Subject: [PATCH 923/947] topaz private debug: say why a surface is not shared
+ with the GPU
+
+---
+ iokit/Kernel/arm/RedwoodGPU.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index ed0c7ea..db827f8 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -875,6 +875,12 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		IOByteCount length = 0;
+ 		addr64_t phys = s->memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
+ 		if (phys == 0 || length < s->allocSize || phys + s->allocSize > (1ull << 32)) {
++			static uint32_t told;
++			if (told++ < 16) {
++				IOLog("RedwoodGPU: surface %u (%ux%u, %u bytes) not shared: phys %#llx, contiguous %llu bytes, "
++				    "scanout slot %d%s\n", s->id, s->width, s->height, s->allocSize, (unsigned long long)phys,
++				    (unsigned long long)length, s->scanoutSlot, s->wrapped ? ", client memory" : "");
++			}
+ 			s->release();
+ 			return kIOReturnUnsupported;    /* (eagl.c then fills a texture from it and reads frames back) */
+ 		}
+-- 
+2.43.0
+

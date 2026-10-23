@@ -1,0 +1,44 @@
+From 5e1968b411bc274b1da61cc815957997fb17eaac Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 14:44:03 +0300
+Subject: [PATCH 907/947] topaz-0115: GPU cache maintenance through the real
+ dcache ops
+
+---
+ iokit/Kernel/arm/TopazAdreno.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index e4fc8a2..43825d3 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -27,7 +27,7 @@
+ extern "C" {
+ vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ void sweet_dcache_clean(vm_offset_t addr, unsigned length);
+-void flush_dcache64(addr64_t addr, unsigned count, int phys);
++void sweet_dcache_flush(vm_offset_t addr, unsigned length);   /* osfmk/arm/caches.c: real dc civac */
+ int topaz_fw_read(const char *path, void **data, size_t *size);
+ void topaz_fw_free(void *data, size_t size);
+ int topaz_root_mounted(void);
+@@ -796,7 +796,7 @@ void
+ redwood_gpu_to_memory(void *start, uint64_t size)
+ {
+ 	if (start != NULL && size != 0) {
+-		flush_dcache64((addr64_t)(uintptr_t)start, (unsigned)size, FALSE);    /* clean + invalidate */
++		sweet_dcache_flush((vm_offset_t)start, (unsigned)size);    /* clean + invalidate */
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+@@ -807,7 +807,7 @@ redwood_gpu_done(uint32_t fence)
+ 	if (mem.va == NULL) {
+ 		return false;
+ 	}
+-	flush_dcache64((addr64_t)(uintptr_t)mem.va, 64, FALSE);
++	sweet_dcache_flush((vm_offset_t)mem.va, 64);
+ 	return (int32_t)(*(volatile uint32_t *)mem.va - fence) >= 0;
+ }
+ 
+-- 
+2.43.0
+

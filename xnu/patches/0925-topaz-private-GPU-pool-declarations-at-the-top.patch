@@ -1,0 +1,39 @@
+From e079eecf14b616ec54ce2ff9fcf482635ef2f9b3 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Tue, 20 Oct 2026 21:56:59 +0300
+Subject: [PATCH 925/947] topaz private: GPU pool declarations at the top
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index bafcb07..e0dfeda 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -46,6 +46,11 @@
+ #include <libkern/c++/OSSerialize.h>
+ #include <sys/proc.h>
+ 
++/* topaz GPU (TopazAdreno.cpp): the GPU pool below 4 GiB */
++extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
++extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
++extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
+@@ -372,10 +377,6 @@ sweet_dict_u32(OSDictionary *dict, const char *key, uint32_t def)
+ 
+ static IOReturn sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, uint64_t size);
+ 
+-/* topaz GPU (TopazAdreno.cpp): the GPU pool below 4 GiB */
+-extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
+-extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+-extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
+ 
+ /*
+  * With gpu=1 the screen-sized surfaces come from the GPU pool: contiguous, below 4 GiB,
+-- 
+2.43.0
+

@@ -1,0 +1,66 @@
+From a11be35c443d1a534c0e525e859d9490450b3e1f Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 19 Oct 2026 15:10:41 +0300
+Subject: [PATCH 911/947] topaz-0119: GPU pool mapped in 64 MB chunks
+
+---
+ iokit/Kernel/arm/TopazAdreno.cpp | 33 ++++++++++++++++++++++++--------
+ 1 file changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index f19d9f5..48c880c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -162,7 +162,10 @@ kbuf_pa(struct kbuf *b, uint64_t off)
+ #define GPU_POOL_BASE       0x90000000ull
+ #define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
+-static uint8_t *gpu_pool_va;                    /* the whole pool, mapped once, write-combined */
++#define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
++#define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
++static uint8_t *gpu_chunk_va[GPU_POOL_CHUNKS];
++static bool gpu_pool_ready;
+ static struct { uint64_t start, size; } pool_free[2048];
+ static unsigned pool_free_count;
+ 
+@@ -218,16 +221,30 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	uint64_t pa;
+ 
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+-	if (gpu_pool_va == NULL) {
+-		gpu_pool_va = (uint8_t *)ml_io_map_wcomb((vm_offset_t)GPU_POOL_BASE, (vm_size_t)GPU_POOL_SIZE);
+-		if (gpu_pool_va == NULL) {
+-			return 0;
++	if (size > GPU_POOL_CHUNK - GPU_POOL_UNIT) {
++		return 0;
++	}
++	if (!gpu_pool_ready) {
++		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
++		for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
++			range_free(pool_free, &pool_free_count, 2048, GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
+ 		}
+-		range_free(pool_free, &pool_free_count, 2048, GPU_POOL_BASE, GPU_POOL_SIZE);
++		gpu_pool_ready = true;
+ 	}
+ 	pa = range_alloc(pool_free, &pool_free_count, size);
+-	if (pa != 0 && va != NULL) {
+-		*va = gpu_pool_va + (pa - GPU_POOL_BASE);
++	if (pa == 0) {
++		return 0;
++	}
++	unsigned c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
++	if (gpu_chunk_va[c] == NULL) {
++		gpu_chunk_va[c] = (uint8_t *)ml_io_map_wcomb((vm_offset_t)(GPU_POOL_BASE + c * GPU_POOL_CHUNK), (vm_size_t)GPU_POOL_CHUNK);
++		if (gpu_chunk_va[c] == NULL) {
++			range_free(pool_free, &pool_free_count, 2048, pa, size);
++			return 0;
++		}
++	}
++	if (va != NULL) {
++		*va = gpu_chunk_va[c] + (pa - GPU_POOL_BASE - c * GPU_POOL_CHUNK);
+ 	}
+ 	return pa;
+ }
+-- 
+2.43.0
+

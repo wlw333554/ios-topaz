@@ -1,0 +1,178 @@
+From d5681e9c3058a62bd28df57956e59daace4127a7 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 22:09:01 +0300
+Subject: [PATCH 945/947] topaz private: direct frames shown by a presenter
+ thread (SwapEnd returns at once, two may wait); vsync notification as (time,
+ time presented, counter)
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 116 +++++++++++++++++++++++++-
+ 1 file changed, 112 insertions(+), 4 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 79ae337..8e2bcc2 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -190,6 +190,21 @@ public:
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+ 	bool          directPresent(const uint8_t *rec);
++	/*
++	 * Direct frames go to a thread of ours (presenter): SwapEnd returns at once and backboardd is
++	 * at its next frame while this one waits for the GPU and the MDP's latch (8-10 ms a frame,
++	 * which held SwapEnd past CoreAnimation's next tick: 20 frames a second). Two may wait.
++	 */
++	IOLock       *fQLock;
++	uint8_t       fQRec[2][SWEET_FB_SWAP_REC_SIZE];
++	SweetSurface *fQHeld[2][4];
++	unsigned      fQFirst, fQWaiting;
++	bool          fQStarted;
++	void          presenter(void);
++	static void   presenterMain(void *self, wait_result_t result);
++	void          showDirect(const uint8_t *rec, SweetSurface **held);
++	void          showPending(const uint8_t *rec, SweetSurface **held);
++	bool          directEligible(const uint8_t *rec, SweetSurface **held);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+@@ -438,6 +453,17 @@ AppleCLCD::start(IOService *provider)
+ 	fPanelUS = 8333;
+ 	IOLog("SWEET FB: vsync %s the panel (%u lines a frame)\n", fVLock ? "follows" : "does not follow", fVTotal);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	uint32_t sync = 0;
++	if (!(PE_parse_boot_argn("sweetfb_sync", &sync, sizeof(sync)) && sync != 0) && (fQLock = IOLockAlloc()) != NULL) {
++		thread_t thread;
++		if (kernel_thread_start(&AppleCLCD::presenterMain, this, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			IOLog("SWEET FB: direct frames through a presenter thread (SwapEnd returns at once)\n");
++		} else {
++			IOLockFree(fQLock);
++			fQLock = NULL;
++		}
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -455,10 +481,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	sweet_fps_tick = now;
++	/*
++	 * What QuartzCore reads (darwin-redwood MiniIOMobileFramebuffer): three 64-bit numbers as six
++	 * halves -- the time of this refresh, the time it was presented, a counter. The counter came
++	 * first here: with CA_FORCE_TIMER its frame clock took the count for a time.
++	 */
+ 	uint64_t values[6] = {
+-		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)now, (uint32_t)(now >> 32),
++		(uint32_t)count, (uint32_t)(count >> 32),
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+@@ -705,13 +736,84 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	 * vsync, 8 ms at most). Held two ticks, the two surfaces CoreAnimation draws into paced it
+ 	 * to 20 frames a second.
+ 	 */
++	if (directEligible(rec, held) && fQLock != NULL) {
++		AbsoluteTime deadline;
++		clock_interval_to_deadline(200, kMillisecondScale, &deadline);
++		IOLockLock(fQLock);
++		while (fQWaiting >= 2) {
++			if (IOLockSleepDeadline(fQLock, &fQWaiting, deadline, THREAD_UNINT) == THREAD_TIMED_OUT && fQWaiting >= 2) {
++				IOLockUnlock(fQLock);
++				sweet_hold_set(held, false);    /* (the presenter is stuck: this frame is lost) */
++				return;
++			}
++		}
++		unsigned slot = (fQFirst + fQWaiting) % 2;
++		memcpy(fQRec[slot], rec, SWEET_FB_SWAP_REC_SIZE);
++		memcpy(fQHeld[slot], held, sizeof(fQHeld[slot]));
++		fQWaiting++;
++		IOLockWakeup(fQLock, fQRec, true);
++		IOLockUnlock(fQLock);
++		return;
++	}
++	if (directEligible(rec, held)) {
++		showDirect(rec, held);
++		return;
++	}
++	showPending(rec, held);
++}
++
++bool
++AppleCLCD::directEligible(const uint8_t *rec, SweetSurface **held)
++{
++	uint32_t mask = get32(rec, 0x104);
+ 	int layer = -1;
+ 	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
+ 		if (mask & (1u << i)) {
+ 			layer = layer < 0 ? (int)i : -2;
+ 		}
+ 	}
+-	if (layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown) {
++	return layer >= 0 && held[layer] != NULL && held[layer]->gpuPool && !fPowerOff && !fConsShown;
++}
++
++void
++AppleCLCD::presenterMain(void *self, wait_result_t result __unused)
++{
++	((AppleCLCD *)self)->presenter();
++}
++
++void
++AppleCLCD::presenter(void)
++{
++	static uint8_t rec[SWEET_FB_SWAP_REC_SIZE];     /* (one thread) */
++	SweetSurface *held[4];
++
++	for (;;) {
++		IOLockLock(fQLock);
++		while (fQWaiting == 0) {
++			IOLockSleep(fQLock, fQRec, THREAD_UNINT);
++		}
++		memcpy(rec, fQRec[fQFirst], sizeof(rec));
++		memcpy(held, fQHeld[fQFirst], sizeof(held));
++		IOLockUnlock(fQLock);
++		if (directEligible(rec, held)) {
++			showDirect(rec, held);
++		} else {
++			showPending(rec, held);
++		}
++		IOLockLock(fQLock);
++		fQFirst = (fQFirst + 1) % 2;
++		fQWaiting--;
++		IOLockWakeup(fQLock, &fQWaiting, false);
++		IOLockUnlock(fQLock);
++	}
++}
++
++void
++AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
++{
++	SweetSurface *held[4];
++	memcpy(held, heldIn, sizeof(held));
++	{
+ 		SweetSurface *dropped[4], *shown[4], *retired[4];
+ 		IOLockLock(fLock);
+ 		memcpy(dropped, fPendHold, sizeof(dropped));
+@@ -737,8 +839,14 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		if ((++sweet_fb_swap_count % 1000) == 0) {
+ 			IOLog("SWEET FB: %llu swaps (direct)\n", sweet_fb_swap_count);
+ 		}
+-		return;
+ 	}
++}
++
++void
++AppleCLCD::showPending(const uint8_t *rec, SweetSurface **heldIn)
++{
++	SweetSurface *held[4];
++	memcpy(held, heldIn, sizeof(held));
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+-- 
+2.43.0
+

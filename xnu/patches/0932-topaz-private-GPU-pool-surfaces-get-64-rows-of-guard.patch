@@ -1,0 +1,72 @@
+From a1ba7fd5e34927353f7c9cc5ccefba8953557c73 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 21 Oct 2026 00:55:57 +0300
+Subject: [PATCH 932/947] topaz private: GPU-pool surfaces get 64 rows of guard
+ (whole-tile writes past the end hit the next buffer: GPU hang)
+
+---
+ iokit/Kernel/arm/SweetSurface.cpp | 15 +++++++++++----
+ iokit/Kernel/arm/SweetSurface.h   |  3 ++-
+ 2 files changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index c8f3255..691d0b1 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -198,7 +198,7 @@ SweetSurface::free()
+ 	OSSafeReleaseNULL(values);
+ 	if (gpuPool && memory != NULL) {
+ 		OSSafeReleaseNULL(memory);
+-		topaz_gpu_pool_free(scanoutPhys, allocSize);
++		topaz_gpu_pool_free(scanoutPhys, poolSize);
+ 	}
+ 	if (wrapped && memory != NULL) {
+ 		memory->complete();
+@@ -908,10 +908,17 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL && sweet_gpu_pool_eligible(s)) {
+ 		void *va = NULL;
+-		uint64_t pa = topaz_gpu_pool_alloc(s->allocSize, &va);
++		/*
++		 * The GPU writes whole tiles: rows past the surface's height land after its end (2436 is
++		 * no multiple of a tile). Without room for them the next pool buffer got pixels -- once
++		 * a command buffer, read back as addresses (SMMU FAR 0x0001ff497b7b11c0: a grey pixel).
++		 */
++		uint64_t take = s->allocSize + 64ull * s->bytesPerRow;
++		uint64_t pa = topaz_gpu_pool_alloc(take, &va);
+ 		IOMemoryDescriptor *md = pa != 0 ? topaz_gpu_pool_md(pa, s->allocSize) : NULL;
+ 		if (md != NULL) {
+-			for (uint64_t i = 0; i < s->allocSize; i += 8) {
++			s->poolSize = take;
++			for (uint64_t i = 0; i < take; i += 8) {
+ 				*(volatile uint64_t *)((uint8_t *)va + i) = 0;
+ 			}
+ 			s->memory = md;
+@@ -922,7 +929,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				ret = kIOReturnNoResources;
+ 			}
+ 		} else if (pa != 0) {
+-			topaz_gpu_pool_free(pa, s->allocSize);
++			topaz_gpu_pool_free(pa, take);
+ 		}
+ 	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL && sweet_scanout_eligible(s)) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index a2991e0..5b74320 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -46,9 +46,10 @@ public:
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
+ 	bool                      gpuPool;      /* topaz GPU: memory from the GPU pool below 4 GiB (scanoutPhys = its address) */
++	uint64_t                  poolSize;     /* bytes taken from the GPU pool (allocSize and a guard) */
+ 	uint32_t                  drawn;        /* topaz GPU: last submission naming this surface (RedwoodGPU.cpp) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+-- 
+2.43.0
+
