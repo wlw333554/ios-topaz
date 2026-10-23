@@ -132,3 +132,43 @@ build's GNU as accepts it — repo code keeps `smc #0`):
   for this milestone).
 - They also run the same system on QEMU virt (no phone) — the `--qemu`
   mode of `mkadt_evergo.py` serves the same purpose here.
+
+## 2026-10-23 (later) — local end-to-end tooling check passes
+
+Added `tools/local-check-zig.py`: runs the *whole* evergo build chain with a
+synthetic minimal arm64 Mach-O in place of the real kernel, so a CI cycle is
+never spent on a tooling bug. Steps: `mkadt_evergo.py` → `mkpayload.py`
+(with a `--ramdisk`) → shim cross-compiled with zig clang → link with
+`shim.ld` → `objcopy -O binary` → newc cpio + gzip ramdisk carrying the
+payload (evergo packing) → `mkbootimg.py --header_version 3` → round-trip.
+
+Result (all green):
+
+```
+1. ADT ok: 10156 bytes, dram 0x80000000+0x80000000
+2. dummy kernel: 1416 bytes, entry 0x100000040
+   payload ok: 77904 bytes, magic SWEETXNU
+3. shim ok: Image 258048 bytes (image_size/_end 0x3f000)
+4. ramdisk ok: 78264 bytes cpio -> 2234 gzip, payload inside
+5. boot image ok: 266240 bytes, magic ANDROID!, kernel 0x3f000, ramdisk 0x8ba
+6. round-trip ok: SWEETXNU payload findable in the packed ramdisk
+```
+
+What that proves: `mkpayload.py` accepts our MT6833 ADT (incl. appending the
+RAM-disk segment and patching `/chosen/memory-map` `RAMDisk`), the shim still
+builds for `DEVICE_EVERGO` after the shared-code refactor, the evergo
+ramdisk packing works, and the v3 boot header is well formed.
+
+Also regression-checked `DEVICE_TOPAZ` with the same refactored sources:
+compiles with zero warnings and links (`shim.elf` 154864 bytes), so the
+device split did not break the topaz path.
+
+Two tool gotchas worth remembering (both handled inside the script, plus
+documented in EVERGO.md *Toolchain notes*):
+
+- clang's integrated assembler rejects an EL1 `smc #0`; the repo builds with
+  GNU `as` (which accepts it) so the source keeps `smc #0` and the script
+  only rewrites a scratch copy.
+- AOSP `mkbootimg.py` imports `gki.generate_gki_certificate` at module load,
+  but only calls it for header **v4** + `--gki_signing_*`; a 2-line stub on
+  `PYTHONPATH` is enough for our v3 images.

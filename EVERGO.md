@@ -96,6 +96,11 @@ needed.
 ## Build
 
 ```sh
+# 0. (optional) dry-run the whole tooling chain locally, no kernel needed.
+#    Exercises mkadt -> mkpayload -> shim cross build -> ramdisk -> mkbootimg
+#    with a synthetic Mach-O, so a CI cycle is never wasted on a tool bug.
+python3 tools/local-check-zig.py --mkbootimg /path/to/AOSP-mkbootimg.py
+
 # 1. kernel (GitHub macOS runner, ~8 min) - same as topaz, SWEET config
 gh workflow run xnu.yml -R YOU/ios-topaz --ref evergo
 gh run download RUN_ID -R YOU/ios-topaz -n xnu-kernel -D xnu/out
@@ -108,6 +113,39 @@ tools/build-evergo.sh xnu/out/kernel.development.sweet path/to/root.img
 # 3. boot (RAM only; nothing is written)
 fastboot boot shim/out/shim-boot.img
 ```
+
+### First-boot checklist
+
+1. Unlock the bootloader and keep a copy of the stock `boot.img`
+   (`fastboot getvar all` works, and `fastboot boot` never writes anything,
+   so a bad image only costs a reboot - hold Power to get back to fastboot
+   or to LK's normal boot).
+2. `fastboot boot shim/out/shim-boot.img`. LK loads it at the kernel address,
+   the shim runs first.
+3. **Milestone 1** is only this much: the shim screen (red) comes up with
+   `MIDR`/`MMFR0` (make sure `tg16` is non-zero), `GICD`/`GICR` lines,
+   `MEM bank/size` lines, and `XNU jumping`; then XNU paints its own console
+   into the splash framebuffer (`sweet-fbcon`). A `no root` / `vfs` panic
+   afterwards is expected and fine - it means the kernel booted.
+4. Copy the `MEM bank/size` lines: they are the real MT6833 DDR layout the
+   shim derived from the DTB. If the kernel's RAM window lands outside a
+   real bank, raise `PHYS_BASE` in `tools/mkadt_evergo.py` to match.
+5. If nothing appears on screen, the splash framebuffer address is the first
+   suspect - the shim reads `atag,videolfb-fb_base_l` from the DTB and falls
+   back to `0x7e605000`. On a device with a different splash reserve the
+   screen stays black while the kernel actually boots; check with
+   `fastboot oem` logging or a UART if you have one.
+
+### Toolchain notes
+
+- `tools/local-check-zig.py` needs `zig` (or `pip install ziglang`) and AOSP's
+  `mkbootimg.py`. It builds with clang, which unlike the repo's GNU `as`
+  rejects an EL1 `smc #0`; the script rewrites that one instruction in a
+  scratch copy, `shim/` is left untouched.
+- AOSP `mkbootimg.py` imports `gki.generate_gki_certificate` unconditionally
+  but only calls it for header **v4** + `--gki_signing_*`. For our v3 images
+  a two-line stub on `PYTHONPATH` is enough; `local-check-zig.py` creates one
+  automatically.
 
 Notes:
 
