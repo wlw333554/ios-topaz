@@ -1,0 +1,52 @@
+#pragma once
+/*
+ * evergo: Xiaomi Redmi Note 11 5G (21091116AC), MediaTek MT6833 (Dimensity 810).
+ * 6x Cortex-A55 @ MPIDR 0x000-0x005 + 2x Cortex-A76 @ MPIDR 0x100-0x101,
+ * all ARMv8.2 with the 16K granule, so the shim runs everything on the boot
+ * core (MTK LK starts CPU0, an A55) and XNU uses all eight cores.
+ *
+ * Facts from the evergo live device tree (mt6833.dts / evergo.dts,
+ * Xiaomi-MT6833/kernel_xiaomi_evergo branch R):
+ *   gic:    GICD 0x0c000000 (0x40000), GICR 0x0c040000 (0x200000)
+ *   timer:  arm,armv8-timer clock-frequency 13 MHz; vtimer PPI 13 (INTID 29),
+ *           ptimer PPI 14 (INTID 30)
+ *   memory: dtsi bank0 = 0x40000000 + 0x3e605000 (LK patches the real banks
+ *           into /memory; the shim reads them at runtime and clamps)
+ *   splash: atag,videolfb-fb_base_l = 0x7e605000, vram 0x1be0000, 60 fps
+ *   ufs:    mediatek,ufshci @ 0x11270000 (0x2300), MPHY @ 0x11fa0000
+ *   touch:  Novatek NT36672C on spi1 @ 0x11010000 (RST gpio13, IRQ gpio14)
+ *   wdt:    TOP_RGU_BASE 0x10007000
+ */
+#define DEVICE_NAME		"evergo"
+
+/* MTK resets go through PSCI only (ATF); no QC IMEM/PSHOLD registers. */
+#define IMEM_RESTART_REASON	0
+#define PSHOLD			0
+
+#define GICD_BASE		0x0c000000UL
+#define GICR_BASE		0x0c040000UL
+#define GICR_SIZE		0x200000UL
+#define VTIMER_INTID		29	/* PPI 13 */
+#define PTIMER_INTID		30	/* PPI 14 */
+#define TIMEBASE_HZ		13000000
+
+/* MTK LK leaves the splash framebuffer in /chosen (atag,videolfb-*); the
+ * default matches the evergo dts. */
+#define FB_BASE_DEFAULT		0x7e605000UL
+#define FB_W			1080
+#define FB_H			2400
+#define FB_STRIDE		(FB_W * 4)
+#define FB_FROM_DTB		1	/* read atag,videolfb-fb_base_l at boot */
+
+/* MTK LK boots CPU0 (A55): ARMv8.2 with the 16K granule, no hand-off. */
+#define NEEDS_GOLD_HANDOFF	0
+#define BOOT_CPU_MPIDR		0x0UL
+#define N_CORES			8
+#define CPU_MPIDR(i)		((i) < 6 ? (uint64_t)(i) : (0x100UL | ((i) - 6)))
+
+/* No QC cpufreq-hw block: clocks stay wherever MTK LK left them. */
+#define HAS_CPUFREQ_HW		0
+
+/* shim/ufs.c probes Qualcomm UFSHCI registers; MTK ufshci@11270000 needs a
+ * different driver (see EVERGO.md), so the probe is disabled. */
+#define HAS_UFS_PROBE		0

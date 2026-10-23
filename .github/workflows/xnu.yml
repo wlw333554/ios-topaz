@@ -16,7 +16,7 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main]
+    branches: [evergo]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -57,10 +57,12 @@ jobs:
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
-          # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
-          # (clang's apple-m1 default emits LSE atomics and LDAPR)
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"/' dxb/build.sh
-          grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed -mcpu=cortex-a53"' dxb/build.sh
+          # evergo: the MT6833 Cortex-A55/A76 cores are ARMv8.2 (LSE atomics,
+          # PAN, 16K granule), so the kernel keeps SWEET's own
+          # -march=armv8.2-a+crypto from patch 0004; unlike topaz's ARMv8.0
+          # cores no -mcpu downgrade (and no LSE/PAN stripping) is needed.
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed"/' dxb/build.sh
+          grep -c 'OTHER_CFLAGS="-mkernel -nostdinc -Wno-packed"' dxb/build.sh
           # xnu's makedefs take CC/CXX from the environment dxb exports; xcodebuild
           # (mig, ctf tools) needs a single executable, so point at wrappers
           sed -i '' 's|export CC="$(xcrun -find clang)"|export CC="$CCACHE_WRAP/clang"|; s|export CXX="$(xcrun -find clang++)"|export CXX="$CCACHE_WRAP/clang++"|' dxb/build.sh

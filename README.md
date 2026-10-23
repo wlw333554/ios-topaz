@@ -2,7 +2,14 @@
 
 **Apple's iOS 16 running on a Redmi Note 12 4G.**
 
+> **evergo branch:** this repository also carries an `evergo` branch porting
+> the same XNU/iOS stack to the **Redmi Note 11 5G** (`evergo`, MediaTek
+> MT6833) — see [EVERGO.md](EVERGO.md) there. The `topaz` branch (this
+> default view) targets the Qualcomm SM6225 phone.
+
 This is a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Apple's open-source XNU kernel, xnu-8796, on a Redmi Note 10 Pro) to the Xiaomi **Redmi Note 12 4G** (`topaz` / `tapas`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
+
+> **evergo branch:** the same port moved to the Xiaomi **Redmi Note 11 5G** (`evergo`, MediaTek MT6833 / Dimensity 810) — scaffolding and first-boot bring-up, see [EVERGO.md](EVERGO.md) and [NOTES-evergo.md](NOTES-evergo.md). This README describes the `topaz` branch.
 
 
 > **Thanks to HackiOS.** The GPU (Adreno through Mesa), display presentation, audio, Wi-Fi glue,

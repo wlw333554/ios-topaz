@@ -1,5 +1,5 @@
 /*
- * Minimal text console on the ABL splash framebuffer. With the MMU off
+ * Minimal text console on the bootloader splash framebuffer. With the MMU off
  * every access is Device memory, so stay aligned (-mstrict-align).
  */
 #include "console.h"
@@ -11,9 +11,19 @@
 #define MARGIN		24
 #define LABEL_COLS	8
 
-volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
+volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE_DEFAULT;
 static uint32_t con_bg;
 static int row;
+
+void con_set_fb(uint64_t addr)
+{
+	con_fb = (volatile uint32_t *)addr;
+}
+
+uint64_t con_fb_addr(void)
+{
+	return (uint64_t)con_fb;
+}
 
 void con_clear(uint32_t bg)
 {

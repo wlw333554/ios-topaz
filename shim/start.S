@@ -1,6 +1,7 @@
 /*
- * sweet boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
- * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
+ * sweet boot shim entry: arm64 Linux Image header so the Android bootloader
+ * (Qualcomm ABL / MediaTek LK) treats us like a kernel. The bootloader enters
+ * at EL1, MMU/D-cache off, x0 = DTB pointer.
  */
 	.section .text.head, "ax"
 	.globl _head

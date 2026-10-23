@@ -2,13 +2,18 @@
  * Milestone 4: act as iBoot for xnu.
  *
  * mkpayload.py already resolved the kernel's chained fixups and built the
- * ADT, so this only has to: find the payload in the ABL ramdisk, copy the
- * segments to phys_base + (vmaddr - virt_base), place the ADT and
+ * ADT, so this only has to: find the payload in the bootloader ramdisk, copy
+ * the segments to phys_base + (vmaddr - virt_base), place the ADT and
  * boot_args behind the kernel, and jump to the entry point with the MMU
  * and caches off, x0 = boot_args (physical).
+ *
+ * The DDR size is clamped at runtime to the /memory bank of the bootloader
+ * DTB that actually holds phys_base, so one image boots every RAM variant
+ * of the device (the ADT /chosen dram props are patched to match).
  */
 #include <stdint.h>
 #include "console.h"
+#include "device.h"
 #include "fdt.h"
 #include "loader.h"
 
@@ -79,40 +84,168 @@ typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 /* build.sh appends the payload to the Image at the first 4K boundary after _end */
 extern char _end[];
 
+/*
+ * ADT walk helpers (adt.py layout): node = {u32 nprops, u32 nchildren}, then
+ * per prop {char name[32], u32 size, value padded to 4}, then children.
+ */
+static uint64_t adt_node_size(const uint8_t *n)
+{
+	uint32_t nprops = *(const uint32_t *)n;
+	uint32_t nchildren = *(const uint32_t *)(n + 4);
+	const uint8_t *p = n + 8;
+
+	for (uint32_t i = 0; i < nprops; i++) {
+		uint32_t sz = *(const uint32_t *)(p + 32);
+		p += 36 + ((sz + 3) & ~3U);
+	}
+	uint64_t total = (uint64_t)(p - n);
+	for (uint32_t i = 0; i < nchildren; i++) {
+		uint64_t cs = adt_node_size(p);
+		total += cs;
+		p += cs;
+	}
+	return total;
+}
+
+/* MMU off: the ADT values are only 4-byte aligned, so write two words. */
+static void wr64(uint8_t *a, uint64_t v)
+{
+	*(volatile uint32_t *)a = (uint32_t)v;
+	*(volatile uint32_t *)(a + 4) = (uint32_t)(v >> 32);
+}
+
+/*
+ * Patch /chosen dram-base/dram-size (u64 properties) in the copied tree so
+ * they match the runtime-clamped kernel RAM.
+ */
+static void adt_patch_chosen_dram(uintptr_t adt, uint64_t base, uint64_t size)
+{
+	const uint8_t *root = (const uint8_t *)adt;
+	uint32_t nchildren = *(const uint32_t *)(root + 4);
+	const uint8_t *p = root + 8;
+
+	/* skip the root's own props */
+	uint32_t nprops = *(const uint32_t *)root;
+	for (uint32_t i = 0; i < nprops; i++) {
+		uint32_t sz = *(const uint32_t *)(p + 32);
+		p += 36 + ((sz + 3) & ~3U);
+	}
+	for (uint32_t i = 0; i < nchildren; i++) {
+		const uint8_t *c = p;
+		const char *name = (const char *)(c + 8);	/* prop 0 is the node name */
+
+		if (name[0] == 'c' && name[1] == 'h' && name[2] == 'o' && name[3] == 's' &&
+		    name[4] == 'e' && name[5] == 'n' && name[6] == '\0') {
+			uint32_t cnprops = *(const uint32_t *)c;
+			uint8_t *q = (uint8_t *)c + 8;
+			for (uint32_t j = 0; j < cnprops; j++) {
+				const char *pn = (const char *)q;
+				uint32_t sz = *(const uint32_t *)(q + 32);
+				if (sz == 8) {
+					if (pn[0] == 'd' && pn[1] == 'r' && pn[2] == 'a' &&
+					    pn[3] == 'm' && pn[4] == '-' && pn[5] == 'b')
+						wr64(q + 36, base);
+					else if (pn[0] == 'd' && pn[1] == 'r' && pn[2] == 'a' &&
+						 pn[3] == 'm' && pn[4] == '-' && pn[5] == 's')
+						wr64(q + 36, size);
+				}
+				q += 36 + ((sz + 3) & ~3U);
+			}
+			return;
+		}
+		p += adt_node_size(c);
+	}
+}
+
+/*
+ * Clamp the payload's kernel RAM to the bootloader-reported /memory bank that
+ * contains phys_base (MTK LK patches the detected sizes into the DTB; the
+ * 4/6/8 GB variants otherwise disagree with the build-time ADT). Patches the
+ * payload header and the ADT /chosen dram props in place.
+ */
+static void clamp_memory(uintptr_t dtb, struct payload *p, uintptr_t adt_pa)
+{
+	uint64_t base[8], size[8];
+	int n = fdt_memory_banks(dtb, base, size, 8);
+
+	for (int i = 0; i < n; i++) {
+		con_hex("MEM bank", base[i]);
+		con_hex("MEM size", size[i]);
+	}
+	con_hex("MEM built", p->mem_size);
+	if (!n)
+		return;
+
+	for (int i = 0; i < n; i++) {
+		if (p->phys_base >= base[i] && p->phys_base < base[i] + size[i]) {
+			uint64_t room = base[i] + size[i] - p->phys_base;
+			if (room == p->mem_size)
+				return;
+			if (room < 0x8000000) {	/* < 128 MB: refuse to shrink that far */
+				con_hex("MEM room", room);
+				con_str("MEM", "bank too small, keep built-in size");
+				return;
+			}
+			p->mem_size = room;
+			adt_patch_chosen_dram(adt_pa, p->phys_base, room);
+			con_hex("MEM clamped", room);
+			return;
+		}
+	}
+	con_str("MEM", "phys_base in no DTB bank, keep built-in size");
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
+	uintptr_t hit = 0;
 	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
 
 	/*
 	 * topaz: the ABL only passes the vendor_boot ramdisk for a v4 boot
 	 * image, so the payload rides behind the shim in the kernel Image.
-	 * Its exact size is unknown here; the kernel memory check below only
-	 * needs an upper bound, and the Image is far below phys_base.
+	 * evergo (MTK LK) passes the boot ramdisk in /chosen like every other
+	 * loader, so the initrd path is tried first there. Its exact size is
+	 * unknown here; the kernel memory check below only needs an upper bound,
+	 * and the Image is far below phys_base.
 	 */
+#if FB_FROM_DTB
+	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end)) {
+		rd_start = rd_end = 0;
+	}
+	if (rd_end > rd_start) {
+		con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+		for (uintptr_t a = rd_start; a + 8 <= rd_end; a++)
+			if (magic_ok((const char *)a)) {
+				hit = a;
+				break;
+			}
+	}
+	if (!hit && magic_ok((const char *)emb)) {
+		hit = emb;
+		rd_start = emb;
+		rd_end = emb + 0x8000000;
+		con_hex("EMBED", emb);
+	}
+#else
 	if (magic_ok((const char *)emb)) {
 		rd_start = emb;
 		rd_end = emb + 0x8000000;
 		con_hex("EMBED", emb);
+		hit = rd_start;
 	} else {
 		if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 		    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 			return "no initrd in /chosen";
 		con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 	}
-
-	/*
-	 * Boot image v4 (topaz ABL ignores v1/v2): ABL concatenates the
-	 * vendor_boot ramdisk(s) and ours, so the payload is somewhere inside
-	 * the initrd and not necessarily 8-byte aligned. Find it and move it
-	 * down to an aligned address; the vendor ramdisk below it is unused.
-	 */
-	uintptr_t hit = 0;
 	for (uintptr_t a = rd_start; a + 8 <= rd_end; a++)
 		if (magic_ok((const char *)a)) {
 			hit = a;
 			break;
 		}
+#endif
 	if (!hit)
 		return "no SWEETXNU payload";
 	if (hit != rd_start) {
@@ -126,7 +259,7 @@ const char *loader_boot(uintptr_t dtb)
 		rd_end = dst + (rd_end - hit);
 		rd_start = dst;
 	}
-	const struct payload *p = (const struct payload *)rd_start;
+	struct payload *p = (struct payload *)rd_start;
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
@@ -151,6 +284,7 @@ const char *loader_boot(uintptr_t dtb)
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	clamp_memory(dtb, p, adt_pa);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
@@ -162,7 +296,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->physBase = p->phys_base;
 	ba->memSize = p->mem_size;
 	ba->topOfKernelData = top;
-	ba->Video.v_baseAddr = FB_BASE;
+	ba->Video.v_baseAddr = con_fb_addr();
 	ba->Video.v_display = 1;
 	ba->Video.v_rowBytes = FB_STRIDE;
 	ba->Video.v_width = FB_W;

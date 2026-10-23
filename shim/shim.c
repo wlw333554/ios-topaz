@@ -1,25 +1,21 @@
 /*
  * Milestone 2: one boot answers the questions that decide the XNU port.
  *   - CPU feature registers (16K granule, GIC sysreg interface)
- *   - PSCI/SMCCC version and which PSCI calls the Qualcomm TZ offers
- *   - SMP: PSCI CPU_ON for the 7 secondaries, each reports its MPIDR
- *   - GICv3 Group 1 IRQ from the virtual timer (INTID 19 on Qualcomm)
+ *   - PSCI/SMCCC version and which PSCI calls the TZ offers
+ *   - SMP: PSCI CPU_ON for the secondaries, each reports its MPIDR
+ *   - GICv3 Group 1 IRQ from the virtual timer
  * Any unexpected exception paints a blue panic screen.
+ *
+ * Device-specific constants come from device.h (DEVICE_TOPAZ / DEVICE_EVERGO).
  */
 #include <stdint.h>
 #include "console.h"
+#include "device.h"
 #include "mmu.h"
+#include "fdt.h"
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
-#define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0440b000UL
-
-#define GICD_BASE		0x0f200000UL
-#define GICR_BASE		0x0f300000UL
-#define GICR_SIZE		0x100000UL
-#define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
 #define GICR_SGI		0x10000
@@ -30,9 +26,6 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
-#define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_CPU_SUSPEND	0xc4000001UL
@@ -44,8 +37,6 @@
 #define PSCI_SYSTEM_SUSPEND	0xc400000eUL
 #define PSCI_SYSTEM_RESET2	0xc4000012UL
 #define SMCCC_VERSION		0x80000000UL
-
-#define NR_CPUS			8
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
@@ -59,8 +50,7 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
-/* topaz: CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 */
-static inline uint64_t cpu_mpidr(int i) { return (uint64_t)(i >> 2) << 8 | (i & 3); }
+static void test_gic(void);
 
 static volatile uint64_t sec_mpidr[NR_CPUS];
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
@@ -109,10 +99,14 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	con_skip();
 	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
+#if IMEM_RESTART_REASON
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
 	__asm__ volatile("dsb sy" ::: "memory");
+#endif
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+#if PSHOLD
 	wr32(PSHOLD, 0);
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -168,28 +162,35 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 
 static uintptr_t find_gicr(void);
 
+#if NEEDS_GOLD_HANDOFF
 /*
- * topaz: xnu needs the 16K translation granule. ABL starts us on a Kryo 260
- * Silver core (Cortex-A53 class, TGran16 = 0); the Gold A73 cluster has it.
- * The boot core wakes gold CPU 0x100 with this DTB and parks itself; gold
- * runs the loader and xnu never sees the silver cluster.
+ * topaz: xnu needs the 16K translation granule. The bootloader starts us on a
+ * Kryo 260 Silver core (Cortex-A53 class, TGran16 = 0); the Gold A73 cluster
+ * has it. The boot core wakes gold CPU 0x100 with this DTB and parks itself;
+ * gold runs the loader and xnu never sees the silver cluster.
  */
 static volatile uint64_t gold_dtb;
-static void test_gic(void);
+#endif
 
 /*
- * xnu starts the other gold CPUs itself (PSCI CPU_ON), without the shim, so
+ * xnu starts the secondary CPUs itself (PSCI CPU_ON), without the shim, so
  * give their redistributors the same setup test_gic() gives the boot CPU:
  * awake, SGIs/PPIs in Group 1, default priority. The frames are MMIO, so the
- * boot CPU can do it for all of them.
+ * boot CPU can do it for all of them. Walks 64K GICR pages and matches the
+ * PE by its TYPER affinity, which works for any redistributor layout.
  */
-static void gold_gicr_prepare(void)
+static void secondary_gicr_prepare(void)
 {
-	for (uint32_t aff = 0x101; aff <= 0x103; aff++) {
+	uint64_t self = rsr("mpidr_el1") & 0xffffff;
+
+	for (int i = 0; i < N_CORES; i++) {
+		uint64_t aff = CPU_MPIDR(i);
+		if ((aff & 0xffffff) == self)
+			continue;	/* the boot core: test_gic() did it */
 		uintptr_t r = 0;
-		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
+		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PAGE) {
 			uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
-			if ((uint32_t)(typer >> 32) == aff) {
+			if ((uint32_t)(typer >> 32) == (uint32_t)aff) {
 				r = GICR_BASE + off;
 				break;
 			}
@@ -220,13 +221,15 @@ static void gold_gicr_prepare(void)
 }
 
 /*
- * Core speed probe: ticks (19.2 MHz) for a fixed dependent-add loop with the
- * I-cache on. Silver runs at whatever ABL set; gold has no cpufreq driver
+ * Core speed probe: ticks for a fixed dependent-add loop with the I-cache
+ * on. On topaz silver runs at whatever ABL set and gold has no cpufreq driver
  * after PSCI CPU_ON, so a much larger count than silver means a low clock.
  */
+#if NEEDS_GOLD_HANDOFF
 static volatile uint64_t silver_ticks;
+#endif
 
-static uint64_t speed_ticks(void)
+static __attribute__((unused)) uint64_t speed_ticks(void)
 {
 	uint64_t sctlr = rsr("sctlr_el1");
 	wsr("sctlr_el1", sctlr | (1UL << 12));	/* I-cache on (fine with MMU off) */
@@ -240,13 +243,14 @@ static uint64_t speed_ticks(void)
 	return t;
 }
 
+#if HAS_CPUFREQ_HW
 /*
  * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
- * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
+ * driver): freq-domain1, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
  */
 static void gold_cpufreq_max(void)
 {
-	uintptr_t b = 0x0f523000;
+	uintptr_t b = CPUFREQ_BASE;
 	uint32_t best = 0, best_khz = 0, prev = 0;
 	for (uint32_t i = 0; i < 12; i++) {
 		uint32_t v = rd32(b + 0x110 + i * 0x20);
@@ -264,7 +268,9 @@ static void gold_cpufreq_max(void)
 	__asm__ volatile("dsb sy" ::: "memory");
 	con_hex2("CPUFREQ", "old=", old, "mhz=", best_khz / 1000);
 }
+#endif
 
+#if NEEDS_GOLD_HANDOFF
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 {
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
@@ -282,8 +288,10 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 * be narrowed down.
 		 */
 		test_gic();
-		gold_gicr_prepare();
+		secondary_gicr_prepare();
+#if HAS_CPUFREQ_HW
 		gold_cpufreq_max();
+#endif
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
@@ -293,11 +301,14 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 	for (;;)
 		__asm__ volatile("wfe");
 }
+#endif
 
 void secondary_main(uint64_t idx)
 {
+#if NEEDS_GOLD_HANDOFF
 	if (gold_dtb)
 		gold_main(gold_dtb);
+#endif
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
 	if (idx == 1) {
 		uintptr_t r = find_gicr();
@@ -321,12 +332,12 @@ static void __attribute__((unused)) test_smp(void)
 	int64_t ret[NR_CPUS];
 
 	for (int i = 1; i < NR_CPUS; i++)
-		ret[i] = smc(PSCI_CPU_ON, cpu_mpidr(i), (uintptr_t)secondary_entry, i);
+		ret[i] = smc(PSCI_CPU_ON, CPU_MPIDR(i), (uintptr_t)secondary_entry, i);
 	delay_ms(500);
 	for (int i = 1; i < NR_CPUS; i++) {
 		char label[] = "CPU0";
 		label[3] = '0' + i;
-		if (cpu_mpidr(i) == self)
+		if (CPU_MPIDR(i) == self)
 			con_str(label, "is boot cpu");
 		else
 			con_hex2(label, "ret=", (uint32_t)ret[i], "mpidr=",
@@ -341,7 +352,7 @@ static uintptr_t find_gicr(void)
 	uint64_t aff = rsr("mpidr_el1");
 	uint32_t want = (aff & 0xffffff) | ((aff >> 8) & 0xff000000);
 
-	for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
+	for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PAGE) {
 		uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
 		if ((uint32_t)(typer >> 32) == want)
 			return GICR_BASE + off;
@@ -498,28 +509,40 @@ static uint64_t ticks_mem(void)
 
 static uint32_t to_us(uint64_t ticks)
 {
-	return ticks * 10 / 192;	/* 19.2 MHz */
+	return ticks * 10 / (TIMEBASE_HZ / 100000);	/* timer ticks -> us */
 }
 
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+	/*
+	 * MTK LK leaves the splash framebuffer address in /chosen
+	 * (atag,videolfb-fb_base_l); take it before the first console write.
+	 */
+#if FB_FROM_DTB
+	{
+		uint64_t fb;
+		if (fdt_chosen_u64(dtb, "atag,videolfb-fb_base_l", &fb) && fb)
+			con_set_fb(fb);
+	}
+#endif
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
-	/* topaz: xnu needs the 16K granule (TGran16 != 0); Cortex-A53 may lack it */
+	con_str("SHIM", DEVICE_NAME ": xnu loader");
+	/* xnu needs the 16K granule (TGran16 != 0); some boot cores lack it */
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
 	con_hex2("MIDR", "el1=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
+#if NEEDS_GOLD_HANDOFF
 	if (((mmfr0 >> 20) & 0xf) == 0) {
 		con_str("SILVER", "no 16K granule: handing off to gold CPU 0x100");
 		con_skip();
 		silver_ticks = speed_ticks();
 		gold_dtb = dtb;
 		__asm__ volatile("dsb sy" ::: "memory");
-		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
+		int64_t r = smc(PSCI_CPU_ON, BOOT_CPU_MPIDR, (uintptr_t)secondary_entry, 4);
 		if (r == 0) {
 			for (;;)	/* parked with DAIF masked (start.S) */
 				__asm__ volatile("wfi");
@@ -527,11 +550,20 @@ void shim_main(uint64_t dtb)
 		gold_dtb = 0;
 		con_hex("CPU_ON", (uint64_t)r);
 	}
+#endif
 	con_skip();
+	/*
+	 * XNU starts the secondary CPUs itself (PSCI CPU_ON) without the shim,
+	 * so give their redistributors the same setup test_gic() gives the boot
+	 * core before jumping (on topaz this happens in gold_main()).
+	 */
+	test_gic();
+	secondary_gicr_prepare();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
 
+#if HAS_UFS_PROBE
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
 	test_ufs();
@@ -540,6 +572,7 @@ void shim_main(uint64_t dtb)
 	con_str("UFS", "probe done, reset in ~3 min");
 	delay_ms(180000);
 	reset(20);
+#endif
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);
@@ -554,7 +587,7 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
-	con_str("SHIM", "sweet milestone 3");
+	con_str("SHIM", DEVICE_NAME ": diagnostics");
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);
@@ -566,7 +599,7 @@ void shim_main(uint64_t dtb)
 	con_hex2("PARANGE", "mmfr0=", rsr("id_aa64mmfr0_el1") & 0xf, "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
 	con_skip();
 	con_hex("PAR img", mmu_probe((uintptr_t)shim_main));
-	con_hex("PAR fb", mmu_probe(FB_PHYS + 0x1000));
+	con_hex("PAR fb", mmu_probe(FB_BASE_DEFAULT + 0x1000));
 	con_hex("PAR gic", mmu_probe(GICD_BASE));
 	con_hex("PAR 12G", mmu_probe(0x300000000UL));
 	con_skip();

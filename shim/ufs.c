@@ -32,6 +32,18 @@
 
 #define BLOCK		4096u
 
+/*
+ * gcc expands strcmp(x, "literal") inline; clang emits a libcall and the
+ * shim links with -nostdlib, so provide the one this file needs. Non-static:
+ * if the compiler does inline the calls, this is simply dead-stripped.
+ */
+int strcmp(const char *a, const char *b)
+{
+	while (*a && *a == *b)
+		a++, b++;
+	return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
 static inline uint32_t ufs_rd(uint32_t off) { return *(volatile uint32_t *)(UFS_BASE + off); }
 static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(UFS_BASE + off) = v; }
 
