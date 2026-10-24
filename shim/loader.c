@@ -313,6 +313,27 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 
+	/*
+	 * DIAG (bring-up): keep the shim diagnostics on screen so they can be
+	 * photographed before XNU clears the framebuffer. Set 0 via
+	 * -DSHIM_HOLD_BEFORE_JUMP=0 once XNU boots on its own.
+	 */
+#ifndef SHIM_HOLD_BEFORE_JUMP
+#define SHIM_HOLD_BEFORE_JUMP 0
+#endif
+#if SHIM_HOLD_BEFORE_JUMP
+	{
+		uint64_t t0;
+		__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t0));
+		for (;;) {
+			uint64_t t;
+			__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
+			if ((t - t0) >= (uint64_t)TIMEBASE_HZ * SHIM_HOLD_BEFORE_JUMP)
+				break;
+		}
+	}
+#endif
+
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
 	((xnu_entry_t)entry_pa)(ba_pa);
