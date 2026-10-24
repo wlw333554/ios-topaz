@@ -62,20 +62,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build tools + apfs-fuse + hfsprogs
+      - name: Install build tools + hfsprogs + build apfs-fuse
         run: |
           sudo add-apt-repository -y universe
           sudo apt-get update
+          # NOTE: apfs-fuse is NOT an Ubuntu package; it is built from source
+          # below. Never put it in the apt list or `apt-get install` fails
+          # with "Unable to locate package apfs-fuse" (exit 100).
           sudo apt-get install -y --no-install-recommends \
-            apfs-fuse hfsprogs rsync fuse3 ca-certificates curl jq git \
-            build-essential libfuse-dev zlib1g-dev libbz2-dev \
-            libzstd-dev pkg-config p7zip-full unzip
-          # Fallback: some runner images lack the apfs-fuse package; build it.
+            hfsprogs rsync fuse3 ca-certificates curl jq git \
+            build-essential cmake libfuse-dev libattr1-dev zlib1g-dev \
+            libbz2-dev libzstd-dev pkg-config p7zip-full unzip
           if ! command -v apfs-fuse >/dev/null 2>&1; then
-            echo "apfs-fuse not in apt repo -> building from source"
-            git clone --depth 1 https://github.com/sgan81/apfs-fuse /tmp/apfs-fuse
-            (cd /tmp/apfs-fuse && make)
-            sudo cp /tmp/apfs-fuse/apfs-fuse /usr/local/bin/
+            echo "building apfs-fuse from source (CMake)"
+            git clone --depth 1 --recurse-submodules --shallow-submodules \
+              https://github.com/sgan81/apfs-fuse /tmp/apfs-fuse
+            cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release
+            cmake --build /tmp/apfs-fuse/build -j"$(nproc)"
+            sudo install -m 755 /tmp/apfs-fuse/build/apfs-fuse /usr/local/bin/apfs-fuse
           fi
           sudo modprobe fuse 2>/dev/null || true
           echo "apfs-fuse : $(command -v apfs-fuse || echo MISSING)"
