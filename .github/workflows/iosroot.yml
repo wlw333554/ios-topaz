@@ -71,8 +71,8 @@ jobs:
           # with "Unable to locate package apfs-fuse" (exit 100).
           sudo apt-get install -y --no-install-recommends \
             hfsprogs rsync fuse3 ca-certificates curl jq git \
-            build-essential cmake libfuse-dev libattr1-dev zlib1g-dev \
-            libbz2-dev libzstd-dev pkg-config p7zip-full unzip
+            build-essential cmake libfuse3-dev libfuse-dev libattr1-dev \
+            zlib1g-dev libbz2-dev libzstd-dev pkg-config p7zip-full unzip
           if ! command -v apfs-fuse >/dev/null 2>&1; then
             echo "building apfs-fuse from source (CMake)"
             git clone --depth 1 --recurse-submodules --shallow-submodules \
