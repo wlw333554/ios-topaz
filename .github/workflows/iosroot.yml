@@ -28,6 +28,9 @@ on:
       dmgs_base_url:
         description: "Optional base URL hosting plain OS.dmg/SystemOS.dmg/AppOS.dmg"
         default: ""
+      local_dmgs_dir:
+        description: "Self-hosted runners only: local dir with OS.dmg/SystemOS.dmg/AppOS.dmg (skips all uploads)"
+        default: ""
 
 concurrency:
   group: iosroot-${{ github.ref }}
@@ -67,7 +70,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p dmgs
-          if [ -n "${{ inputs.dmgs_base_url }}" ]; then
+          if [ -n "${{ inputs.local_dmgs_dir }}" ]; then
+            echo "self-hosted: copying DMGs from local dir ${{ inputs.local_dmgs_dir }}"
+            for f in OS.dmg SystemOS.dmg AppOS.dmg; do
+              cp -f "${{ inputs.local_dmgs_dir }}/$f" "dmgs/$f"
+            done
+          elif [ -n "${{ inputs.dmgs_base_url }}" ]; then
             for f in OS.dmg SystemOS.dmg AppOS.dmg; do
               curl -fSL "${{ inputs.dmgs_base_url }}/$f" -o "dmgs/$f"
             done
