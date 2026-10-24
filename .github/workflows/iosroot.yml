@@ -87,6 +87,38 @@ jobs:
           echo "fsck.hfsplus: $(command -v fsck.hfsplus || echo MISSING)"
           df -h .
 
+      # Fail fast (before downloading ~7.5 GB and building for ~10 min) if the
+      # runner kernel cannot mount HFS+ or FUSE is unavailable. The GitHub
+      # runner kernel ships hfsplus only in linux-modules-extra-<ver>.
+      - name: Preflight (hfsplus module + FUSE device)
+        run: |
+          echo "kernel: $(uname -r)"
+          echo "== /proc/filesystems (hfs) =="; grep -i hfs /proc/filesystems || echo "(none)"
+          sudo modprobe hfsplus 2>/dev/null || true
+          if ! grep -qw hfsplus /proc/filesystems; then
+            echo "hfsplus missing -> installing linux-modules-extra-$(uname -r)"
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe hfsplus 2>/dev/null || true
+          fi
+          if ! grep -qw hfsplus /proc/filesystems; then
+            echo "still missing -> trying linux-modules-extra-azure"
+            sudo apt-get install -y linux-modules-extra-azure || true
+            sudo modprobe hfsplus 2>/dev/null || true
+          fi
+          if ! grep -qw hfsplus /proc/filesystems; then
+            echo "===== FATAL: kernel has NO hfsplus support (cannot populate HFS+) ====="
+            uname -a
+            echo "--- lsmod hfs ---"; lsmod | grep -i hfs || echo none
+            echo "--- /lib/modules/$(uname -r)/kernel/fs ---"; ls "/lib/modules/$(uname -r)/kernel/fs" 2>/dev/null || echo none
+            echo "--- apt policy ---"; apt-cache policy "linux-modules-extra-$(uname -r)" || true
+            exit 1
+          fi
+          echo "hfsplus module OK"
+          sudo modprobe fuse 2>/dev/null || true
+          test -e /dev/fuse || { echo "===== FATAL: /dev/fuse missing (apfs-fuse cannot mount) ====="; ls -l /dev/fuse 2>&1 || true; exit 1; }
+          echo "FUSE device OK"
+          echo "apfs-fuse=$(command -v apfs-fuse) mkfs.hfsplus=$(command -v mkfs.hfsplus)"
+
       - name: Acquire DMGs
         env:
           GH_TOKEN: ${{ github.token }}

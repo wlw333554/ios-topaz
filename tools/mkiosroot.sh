@@ -59,7 +59,16 @@ apfs_mount "$appos" appos
 truncate -s "$size" "$out"
 mkfs.hfsplus -s -J -v iOSRoot "$out"
 mkdir "$work/root"
-sudo mount -t hfsplus -o loop,force "$out" "$work/root"
+# Ensure the kernel hfsplus driver is loaded (GitHub runners ship it only in
+# linux-modules-extra-<ver>; the workflow preflight installs it).
+sudo modprobe hfsplus 2>/dev/null || true
+if ! sudo mount -t hfsplus -o loop,force "$out" "$work/root"; then
+	echo "ERROR: cannot mount the HFS+ image at $out" >&2
+	echo "  HFS is in /proc/filesystems as:" >&2
+	grep -i hfs /proc/filesystems >&2 || echo "  (none - kernel lacks hfsplus)" >&2
+	echo "  fix: sudo apt-get install -y linux-modules-extra-\$(uname -r) && sudo modprobe hfsplus" >&2
+	exit 1
+fi
 mounts=("$work/root" "${mounts[@]}")
 
 copy() {
