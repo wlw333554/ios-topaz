@@ -21,7 +21,7 @@ MT6833 hardware facts used here:
           fixed carve-out, which live below 0x80000000).
   splash  atag,videolfb-fb_base_l = 0x7e605000, vram 0x1be0000, 60 fps,
           1080x2400. The shim reads the real address from the DTB /chosen.
-  ufs     mediatek,ufshci @ 0x11270000 (0x2300) - driver not ported yet
+  ufs     mediatek,ufshci @ 0x11270000 (0x2300) - driver: bsd/dev/sweet_ufs.c (MTK path)
           (see EVERGO.md); the node exists for the future driver.
   wlan    mediatek,mt6833-consys (WiFi/BT combo; driver not ported yet).
 """

@@ -41,7 +41,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_ufs.c
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,568 @@
 +/*
 + * SWEET internal UFS root device (read-only).
 + *
@@ -498,6 +498,37 @@ new file mode 100644
 +	.d_type       = D_DISK,
 +};
 +
++/*
++ * MTK evergo: LK may gate the UFS clocks and hold the UFSHCI in reset before
++ * jumping to us. Enable infracfg_ao gates (UFS bit28 / UNIPRO_SYSCLK bit11 /
++ * UFS_MP_SAP_BCLK bit13) and pulse the UFSHCI reset (0x130/0x134 bit15).
++ * Selected by DT compatible so topaz (qcom) is untouched.
++ */
++static void
++sweet_ufs_mtk_prepare(DTEntry node)
++{
++	const char *compat = NULL;
++	unsigned int csize = 0;
++	vm_offset_t inf;
++
++	if (SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
++	    !compat || csize < 8 || strncmp(compat, "mediatek", 8) != 0) {
++		return;
++	}
++	inf = ml_io_map(0x10001000, 0x1000);
++	if (!inf) {
++		printf("SWEET UFS: MTK infracfg map failed\n");
++		return;
++	}
++	*(volatile uint32_t *)(inf + 0xa4) = (1u << 28) | (1u << 11) | (1u << 13);
++	*(volatile uint32_t *)(inf + 0x130) = (1u << 15);	/* assert UFSHCI reset */
++	delay(100);
++	*(volatile uint32_t *)(inf + 0x134) = (1u << 15);	/* release it */
++	delay(100);
++	(void)*(volatile uint32_t *)(inf + 0xac);
++	printf("SWEET UFS: MTK clocks on, UFSHCI reset released\n");
++}
++
 +static int
 +sweet_ufs_init(void)
 +{
@@ -528,6 +559,7 @@ new file mode 100644
 +	su.dma_pa = ptoa_64(pn);
 +	su.lun = 0;
 +	su.secsize = DEV_BSIZE;
++	sweet_ufs_mtk_prepare(node);
 +
 +	lck_mtx_lock(&sweet_ufs_lock);
 +	error = ufs_take_over_host();
