@@ -37,3 +37,4 @@
 /* Qualcomm UFSHCI at ufs_mem 0x4804000 (shim/ufs.c probe, no payload only) */
 #define HAS_UFS_PROBE		1
 #define UFS_PROBE_BASE		0x04804000UL
+#define UFS_PROBE_TAKEOVER	1	/* register map verified (UFSHCI 2.1) */

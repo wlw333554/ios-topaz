@@ -13,7 +13,11 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x04804000UL	/* ufshc@4804000, topaz live FDT */
+/* Base comes from the device header (device.h, via console.h). */
+#ifndef UFS_PROBE_BASE
+#error "device header must define UFS_PROBE_BASE"
+#endif
+#define UFS_BASE	UFS_PROBE_BASE
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -214,6 +218,16 @@ void test_ufs(void)
 	con_hex2("UFS", "utrlba=", ufs_rd(REG_UTRLBA), "hi=", ufs_rd(REG_UTRLBAU));
 	con_hex2("UFS", "dbr=", ufs_rd(REG_UTRLDBR), "nutrs=", (cap & 0x1f) + 1);
 
+	/* A dead / clock-gated block reads back 0 or all-ones: stop before any
+	 * write so an unverified MTK register map can never be corrupted. */
+	if (cap == 0 || cap == 0xffffffffu) {
+		con_str("UFS", "no response at base (clock/power gated?)");
+		return;
+	}
+#if !UFS_PROBE_TAKEOVER
+	con_str("UFS", "read-only dump only (takeover disabled on this device)");
+	return;
+#else
 	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
 		con_str("UFS", "host not enabled/ready: stop");
 		return;
@@ -275,4 +289,5 @@ void test_ufs(void)
 	if (esz != 128 || nent > 128)
 		return;
 	list_partitions(elba, nent);
+#endif /* UFS_PROBE_TAKEOVER */
 }

@@ -47,6 +47,14 @@
 /* No QC cpufreq-hw block: clocks stay wherever MTK LK left them. */
 #define HAS_CPUFREQ_HW		0
 
-/* shim/ufs.c probes Qualcomm UFSHCI registers; MTK ufshci@11270000 needs a
- * different driver (see EVERGO.md), so the probe is disabled. */
-#define HAS_UFS_PROBE		0
+/* MTK ufshci@11270000. Linux drives it through the standard ufshcd core
+ * (ufs-mediatek.c only adds vendor PHY/clock ops), so the UFSHCI register
+ * offsets are probably standard - but that is unverified on evergo, and the
+ * register map has not been confirmed. The probe therefore runs READ-ONLY:
+ * it dumps CAP/VER/HCS/HCE/... and does NOT write UTRLBA/UTRLRSR or issue
+ * SCSI. Flip UFS_PROBE_TAKEOVER to 1 only after the dump shows a sane
+ * UFSHCI (cap != 0/0xffffffff, HCS link-up). A wrong-map write could brick
+ * the UFS device, so this stays off until verified. */
+#define HAS_UFS_PROBE		1
+#define UFS_PROBE_BASE		0x11270000UL
+#define UFS_PROBE_TAKEOVER	0
