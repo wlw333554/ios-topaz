@@ -56,7 +56,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest migrates to Ubuntu 26 on 2026-10-19, which may
+    # change apfs-fuse / hfsplus packages. Keep the verified 24.04 image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
       - name: Checkout
