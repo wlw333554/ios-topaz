@@ -123,6 +123,14 @@ jobs:
               fi
             done
           fi
+          # Sanity: fail fast if any DMG is missing or truncated (expired link,
+          # partial download, wrong archive contents, etc.)
+          for pair in OS.dmg:4000000000 SystemOS.dmg:2000000000 AppOS.dmg:1000000; do
+            f="${pair%%:*}"; min="${pair##*:}"
+            sz=$(stat -c%s "dmgs/$f" 2>/dev/null || echo 0)
+            echo "$f size=$sz (min $min)"
+            if [ "$sz" -lt "$min" ]; then echo "ERROR: $f too small ($sz < $min) — link expired / download incomplete / wrong file"; exit 1; fi
+          done
           ls -la dmgs
 
       - name: Build root image
