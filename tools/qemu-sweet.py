@@ -118,8 +118,13 @@ def screen_result(screen, unknown):
 
 def qmp(sock_path, *cmds, pmemsave=None):
     """Run QEMU human-monitor commands over QMP (synchronous, unlike the echoing HMP socket)."""
-    s = socket.socket(socket.AF_UNIX)
-    s.connect(sock_path)
+    if sock_path.startswith('tcp:'):
+        host, port = sock_path[4:].rsplit(':', 1)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((host, int(port)))
+    else:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(sock_path)
     f = s.makefile('rw')
     f.readline()
 
@@ -175,14 +180,14 @@ def main():
     open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
-    mon = f'{out}/mon.sock'
-    if os.path.exists(mon):
-        os.unlink(mon)
+    # Windows Python has no AF_UNIX; use a TCP QMP endpoint instead.
+    QMP_PORT = int(os.environ.get('QMP_PORT', '4445'))
+    mon = f'tcp:127.0.0.1:{QMP_PORT}'
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
-           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
+           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'tcp:127.0.0.1:{QMP_PORT},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
