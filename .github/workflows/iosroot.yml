@@ -9,6 +9,12 @@ name: ios16-root image
 #   dmgs_tag      GitHub Release tag holding split DMG parts (OS.dmg.part00 ...)
 #   dmgs_base_url optional base URL where the three plain DMGs are hosted
 #                  (no splitting needed); wins over dmgs_tag when set
+#   archive_url   optional single .7z/.zip that contains the three DMGs
+#   os_url / systemos_url / appos_url  optional three explicit direct URLs
+#   local_dmgs_dir (self-hosted only) local dir holding the three DMGs
+#
+# Acquisition priority: local_dmgs_dir > archive_url > os_url > dmgs_base_url
+#                       > dmgs_tag (split parts from a Release)
 #
 # The three DMGs (OS.dmg ~4.7G, SystemOS.dmg ~2.7G, AppOS.dmg ~10M) exceed
 # GitHub's 2 GiB per-file cap, so when using dmgs_tag they MUST be split into
@@ -31,6 +37,18 @@ on:
       local_dmgs_dir:
         description: "Self-hosted runners only: local dir with OS.dmg/SystemOS.dmg/AppOS.dmg (skips all uploads)"
         default: ""
+      archive_url:
+        description: "Optional: one .7z/.zip archive that contains OS.dmg/SystemOS.dmg/AppOS.dmg"
+        default: ""
+      os_url:
+        description: "Optional: direct URL to OS.dmg (pair with systemos_url/appos_url)"
+        default: ""
+      systemos_url:
+        description: "Optional: direct URL to SystemOS.dmg"
+        default: ""
+      appos_url:
+        description: "Optional: direct URL to AppOS.dmg"
+        default: ""
 
 concurrency:
   group: iosroot-${{ github.ref }}
@@ -51,7 +69,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             apfs-fuse hfsprogs rsync fuse3 ca-certificates curl jq git \
             build-essential libfuse-dev zlib1g-dev libbz2-dev \
-            libzstd-dev pkg-config
+            libzstd-dev pkg-config p7zip-full unzip
           # Fallback: some runner images lack the apfs-fuse package; build it.
           if ! command -v apfs-fuse >/dev/null 2>&1; then
             echo "apfs-fuse not in apt repo -> building from source"
@@ -75,9 +93,24 @@ jobs:
             for f in OS.dmg SystemOS.dmg AppOS.dmg; do
               cp -f "${{ inputs.local_dmgs_dir }}/$f" "dmgs/$f"
             done
+          elif [ -n "${{ inputs.archive_url }}" ]; then
+            echo "downloading single archive from ${{ inputs.archive_url }}"
+            curl -fL --retry 5 --retry-delay 5 -o /tmp/ios_dmgs.pkg "${{ inputs.archive_url }}"
+            rm -rf /tmp/x && mkdir -p /tmp/x
+            7z x -y /tmp/ios_dmgs.pkg -o/tmp/x >/dev/null
+            for f in OS.dmg SystemOS.dmg AppOS.dmg; do
+              p=$(find /tmp/x -type f -name "$f" | head -n1)
+              if [ -z "$p" ]; then echo "ERROR: $f not found inside the archive"; exit 1; fi
+              cp -f "$p" "dmgs/$f"
+            done
+          elif [ -n "${{ inputs.os_url }}" ]; then
+            echo "downloading three explicit URLs"
+            curl -fL --retry 5 --retry-delay 5 -o dmgs/OS.dmg       "${{ inputs.os_url }}"
+            curl -fL --retry 5 --retry-delay 5 -o dmgs/SystemOS.dmg "${{ inputs.systemos_url }}"
+            curl -fL --retry 5 --retry-delay 5 -o dmgs/AppOS.dmg    "${{ inputs.appos_url }}"
           elif [ -n "${{ inputs.dmgs_base_url }}" ]; then
             for f in OS.dmg SystemOS.dmg AppOS.dmg; do
-              curl -fSL "${{ inputs.dmgs_base_url }}/$f" -o "dmgs/$f"
+              curl -fL --retry 5 --retry-delay 5 -o "dmgs/$f" "${{ inputs.dmgs_base_url }}/$f"
             done
           else
             gh release download "${{ inputs.dmgs_tag }}" -D dmgs --repo "${{ github.repository }}"
