@@ -1,0 +1,105 @@
+name: ios16-root image
+
+# Build the iOS 16 root filesystem image (ios16-root.img) that the evergo shim
+# kernel mounts as BSD root (rd=ufsroot0). Runs on Linux because mkiosroot.sh
+# needs apfs-fuse + hfsprogs + a FUSE mount + sudo.
+#
+# INPUTS
+#   size          root image size passed to mkiosroot.sh (default 16G)
+#   dmgs_tag      GitHub Release tag holding split DMG parts (OS.dmg.part00 ...)
+#   dmgs_base_url optional base URL where the three plain DMGs are hosted
+#                  (no splitting needed); wins over dmgs_tag when set
+#
+# The three DMGs (OS.dmg ~4.7G, SystemOS.dmg ~2.7G, AppOS.dmg ~10M) exceed
+# GitHub's 2 GiB per-file cap, so when using dmgs_tag they MUST be split into
+# <2 GiB parts first (see tools/split_dmgs.sh). The 16 GiB output is likewise
+# split before upload; reassemble locally with:
+#   cat ios16-root.img.part* > ios16-root.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      size:
+        description: "Root image size (mkiosroot.sh SIZE argument)"
+        default: "16G"
+      dmgs_tag:
+        description: "Release tag holding split DMG parts (OS.dmg.partNN etc.)"
+        default: "dmgs"
+      dmgs_base_url:
+        description: "Optional base URL hosting plain OS.dmg/SystemOS.dmg/AppOS.dmg"
+        default: ""
+
+concurrency:
+  group: iosroot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools + apfs-fuse + hfsprogs
+        run: |
+          sudo add-apt-repository -y universe
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            apfs-fuse hfsprogs rsync fuse3 ca-certificates curl jq git \
+            build-essential libfuse-dev zlib1g-dev libbz2-dev \
+            libzstd-dev pkg-config
+          # Fallback: some runner images lack the apfs-fuse package; build it.
+          if ! command -v apfs-fuse >/dev/null 2>&1; then
+            echo "apfs-fuse not in apt repo -> building from source"
+            git clone --depth 1 https://github.com/sgan81/apfs-fuse /tmp/apfs-fuse
+            (cd /tmp/apfs-fuse && make)
+            sudo cp /tmp/apfs-fuse/apfs-fuse /usr/local/bin/
+          fi
+          sudo modprobe fuse 2>/dev/null || true
+          echo "apfs-fuse : $(command -v apfs-fuse || echo MISSING)"
+          echo "mkfs.hfsplus: $(command -v mkfs.hfsplus || echo MISSING)"
+          echo "fsck.hfsplus: $(command -v fsck.hfsplus || echo MISSING)"
+          df -h .
+
+      - name: Acquire DMGs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dmgs
+          if [ -n "${{ inputs.dmgs_base_url }}" ]; then
+            for f in OS.dmg SystemOS.dmg AppOS.dmg; do
+              curl -fSL "${{ inputs.dmgs_base_url }}/$f" -o "dmgs/$f"
+            done
+          else
+            gh release download "${{ inputs.dmgs_tag }}" -D dmgs --repo "${{ github.repository }}"
+            # Reassemble split parts: <name>.partNN -> <name>
+            for base in OS.dmg SystemOS.dmg AppOS.dmg; do
+              if ls dmgs/${base}.part* >/dev/null 2>&1; then
+                echo "reassembling $base from parts"
+                cat dmgs/${base}.part* > "dmgs/${base}"
+                rm -f dmgs/${base}.part*
+              fi
+            done
+          fi
+          ls -la dmgs
+
+      - name: Build root image
+        run: |
+          sudo bash tools/mkiosroot.sh \
+            dmgs/OS.dmg dmgs/SystemOS.dmg dmgs/AppOS.dmg \
+            ios16-root.img "${{ inputs.size }}"
+
+      - name: Split output (GitHub artifact files are capped at 2 GiB)
+        run: |
+          mkdir -p out_parts
+          split -b 1900M -d ios16-root.img out_parts/ios16-root.img.part
+          ls -la out_parts
+          echo "Reassemble locally with: cat ios16-root.img.part* > ios16-root.img"
+
+      - name: Upload output parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios16-root-img-parts
+          path: out_parts/*
+          retention-days: 7
