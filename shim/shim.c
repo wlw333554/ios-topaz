@@ -512,9 +512,22 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / (TIMEBASE_HZ / 100000);	/* timer ticks -> us */
 }
 
+#if HAS_WDT_DISABLE
+/* MTK TOP_RGU watchdog: write MODE = KEY (0x22000000) with ENABLE(bit0)=0. */
+static void wdt_disable(void)
+{
+	*(volatile uint32_t *)(WDT_BASE + 0x00) = 0x22000000;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+#endif
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+
+#if HAS_WDT_DISABLE
+	wdt_disable();
+#endif
 
 	/*
 	 * MTK LK leaves the splash framebuffer address in /chosen

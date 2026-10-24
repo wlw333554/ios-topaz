@@ -63,3 +63,10 @@
 #define HAS_UFS_PROBE		0
 #define UFS_PROBE_BASE		0x11270000UL
 #define UFS_PROBE_TAKEOVER	0
+
+/* MTK watchdog (TOP_RGU). LK arms it and XNU has no driver to kick it, so a
+ * hang or panic resets the phone ~15s in, wiping the panic screen before it
+ * can be read. Disable it (MTK_WDT_MODE key, ENABLE cleared) just before the
+ * XNU jump so panics stay on screen. */
+#define HAS_WDT_DISABLE		1
+#define WDT_BASE		0x10007000UL
