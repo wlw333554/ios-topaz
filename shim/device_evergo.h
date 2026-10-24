@@ -48,13 +48,18 @@
 #define HAS_CPUFREQ_HW		0
 
 /* MTK ufshci@11270000. Linux drives it through the standard ufshcd core
- * (ufs-mediatek.c only adds vendor PHY/clock ops), so the UFSHCI register
- * offsets are probably standard - but that is unverified on evergo, and the
- * register map has not been confirmed. The probe therefore runs READ-ONLY:
- * it dumps CAP/VER/HCS/HCE/... and does NOT write UTRLBA/UTRLRSR or issue
- * SCSI. Flip UFS_PROBE_TAKEOVER to 1 only after the dump shows a sane
- * UFSHCI (cap != 0/0xffffffff, HCS link-up). A wrong-map write could brick
- * the UFS device, so this stays off until verified. */
-#define HAS_UFS_PROBE		1
+ * (ufs-mediatek.c only adds vendor PHY/clock ops), so the register offsets
+ * are probably standard UFSHCI - but that is unverified on evergo.
+ *
+ * HAS_UFS_PROBE is OPT-IN and off by default: with it on, shim.c runs the
+ * probe after loading the payload, keeps the result on screen for 3 minutes,
+ * then resets - it does NOT jump to XNU. So it produces a UFS-diagnostic
+ * image, not a bootable one. Flip to 1 only to capture the dump, then back.
+ *
+ * The probe is read-only (UFS_PROBE_TAKEOVER 0): it dumps CAP/VER/HCS/HCE and
+ * never writes UTRLBA/UTRLRSR or issues SCSI, because writing a wrong MTK
+ * register map could permanently brick the UFS device. Set TAKEOVER=1 only
+ * after a sane dump (cap != 0/0xffffffff, HCS link-up). */
+#define HAS_UFS_PROBE		0
 #define UFS_PROBE_BASE		0x11270000UL
 #define UFS_PROBE_TAKEOVER	0
