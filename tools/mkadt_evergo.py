@@ -15,12 +15,13 @@ MT6833 hardware facts used here:
           all ARMv8.2 (LSE, PAN, 16K granule) -> one homogeneous SMP cluster,
           XNU may use all eight cores (no sweet Gold/Silver split needed).
   gic     GICD 0x0c000000 (0x40000), GICR 0x0c040000 (0x200000).
-  timer   arm,armv8-timer clock-frequency 13 MHz; vtimer PPI 13 (INTID 29).
+  timer   arm,armv8-timer clock-frequency 13 MHz; vtimer PPI 11 (INTID 27).
   memory  dtsi bank0 = 0x40000000 + 0x3e605000; MTK LK patches the real banks
           into /memory. Default: bank1 0x80000000 + 2 GiB (above every MTK
           fixed carve-out, which live below 0x80000000).
-  splash  atag,videolfb-fb_base_l = 0x7e605000, vram 0x1be0000, 60 fps,
-          1080x2400. The shim reads the real address from the DTB /chosen.
+  splash  the panel scans DISP OVL0 layer 1, buffer at 0x7d006000 (measured on
+          the live device 2026-10-25), vram 0x1be0000, 60 fps, 1080x2400.
+          The DTB's atag,videolfb-fb_base_l is a different, non-visible address.
   ufs     mediatek,ufshci @ 0x11270000 (0x2300) - driver: bsd/dev/sweet_ufs.c (MTK path)
           (see EVERGO.md); the node exists for the future driver.
   wlan    mediatek,mt6833-consys (WiFi/BT combo; driver not ported yet).
@@ -48,15 +49,18 @@ SOC_BASE = 0x08000000
 # interrupt-controller: gic@0c000000 (GICD 0x40000) + redistributors 0x0c040000
 GICD, GICD_SIZE = 0x0c000000, 0x40000
 GICR, GICR_SIZE = 0x0c040000, 0x200000
-# splash framebuffer MTK LK leaves lit (videolfb); the shim overrides the
-# address from the DTB /chosen at boot.
-FB, FB_SIZE = 0x7e605000, 0x1be0000
+# The framebuffer the panel actually scans: DISP OVL0 **layer 1**, measured on
+# the live device 2026-10-25 (the shim reads OVL0_L1_ADDR at boot and gets
+# 0x7d006000). The old dts-derived 0x7e605000 was the DTB's atag,videolfb
+# base, which is NOT the visible layer - the shim overrides it at runtime
+# (adt_patch_fbcon) and the XNU early console (0081e) hardcodes the same value.
+FB, FB_SIZE = 0x7d006000, 0x1be0000
 SWEET_ECID = 0x4556474f00000001  # 'EVGO' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (mediatek,ufshci@11270000); QEMU virt has none
 UFS, UFS_SIZE = 0x11270000, 0x2300
 TIMEBASE = 13000000
-VTIMER_INTID = 29		# PPI 13
+VTIMER_INTID = 27		# PPI 11 (virtual timer)
 PTIMER_INTID = 30		# PPI 14
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
@@ -148,13 +152,13 @@ def build(seed=None, qemu=False, highmem=False, native=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # EVERGO SMP: all eight cores, 6x A55 (MPIDR 0x0-0x5) + 2x A76
-    # (MPIDR 0x100-0x101), one homogeneous cluster. Unlike topaz every core
-    # here is ARMv8.2 with the 16K granule, so MTK LK's boot core (CPU0, an
-    # A55) runs xnu directly and cpus=N selects how many start (N <= 8).
+    # EVERGO SMP: single-core bring-up test. v15 (6x A55) still hung before the
+    # framebuffer console, so try the boot core alone (cpu0). If this reaches
+    # fbcon we know XNU's SMP/secondary bring-up is the blocker; if it still
+    # hangs, the problem is earlier (MMU/PE) and unrelated to core count.
     # QEMU retains its original single-CPU tree: its MPIDRs differ.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    for core in range(1 if qemu else 1):
         big = (not qemu) and core >= 6
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),

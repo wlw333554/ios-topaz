@@ -24,7 +24,7 @@ branch R, `mt6833.dts` + `evergo.dts`):**
 
 - GICv3: GICD `0x0c000000` (0x40000), GICR `0x0c040000` (0x200000).
 - Arch timer 13 MHz (`timer { clock-frequency = <13000000> }`); vtimer PPI
-  13 → INTID 29, ptimer PPI 14 → INTID 30 (topaz used 19/18 — QC wiring).
+  11 → INTID 27, ptimer PPI 14 → INTID 30 (topaz/QC used 19/18 — QC PPI wiring; MTK uses standard ARM PPI 11/14).
 - Memory dtsi bank0 `0x40000000 + 0x3e605000`; MTK LK patches the detected
   banks into the DTB `/memory` node (guess: bank1 `0x80000000`+2G, bank2
   `0x1_40000000`+1G on the 4 GB model — to be confirmed on first boot from
@@ -62,7 +62,7 @@ branch R, `mt6833.dts` + `evergo.dts`):**
 **Verified locally.** `tools/mkadt_evergo.py` generates a 10156-byte ADT
 that dumps correctly: 8 CPU nodes (MPIDR 0–5, 0x100, 0x101), GIC
 `<0x4000000 0x40000 0x4040000 0x200000>` (i.e. `0x0c000000`/`0x0c040000`
-under SOC_BASE `0x08000000`), `virtual-timer-intid 0x1d` (29), timebase
+under SOC_BASE `0x08000000`), `virtual-timer-intid 0x1b` (27), timebase
 `0xc65d40` (13 MHz), fbcon `0x7e605000`, ufs `0x11270000`.
 `--qemu` (1 CPU, vtimer 27), `--highmem` (`0x1_40000000` + 1 GiB) and
 `--native` (1080×2400 canvas) modes verified by re-parsing the output.

@@ -4,6 +4,7 @@
  */
 #include "console.h"
 #include "font.h"
+#include "plog.h"
 
 #define SCALE		3
 #define CH_W		(8 * SCALE)
@@ -93,6 +94,11 @@ void con_str(const char *label, const char *s)
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
 	row++;
+	/* Mirror the line into persistent RAM (no-op unless HAS_PSTORE). */
+	plog_puts(label);
+	plog_puts(": ");
+	plog_puts(s);
+	plog_putc('\n');
 }
 
 void con_hex(const char *label, uint64_t v)
@@ -116,4 +122,19 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		put_str(col, buf, WHITE);
 	}
 	row++;
+	/* Mirror the line into persistent RAM (no-op unless HAS_PSTORE). */
+	fmt_hex(buf, va, 8);
+	plog_puts(label);
+	plog_puts(": ");
+	plog_puts(a);
+	plog_puts("=");
+	plog_puts(buf);
+	if (b) {
+		fmt_hex(buf, vb, 8);
+		plog_puts(" ");
+		plog_puts(b);
+		plog_puts("=");
+		plog_puts(buf);
+	}
+	plog_putc('\n');
 }

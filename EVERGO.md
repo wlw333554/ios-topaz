@@ -51,7 +51,7 @@ branch `R`):
 | SoC | MT6833, 6 nm; 6× Cortex-A55 @ 2.0 GHz + 2× Cortex-A76 @ 2.4 GHz |
 | CPU MPIDR | A55: `0x000`–`0x005`; A76: `0x100`–`0x101` (MTK puts little first) |
 | GICv3 | GICD `0x0c000000` (0x40000), GICR `0x0c040000` (0x200000) |
-| Arch timer | 13 MHz; vtimer PPI 13 → **INTID 29**, ptimer PPI 14 → INTID 30 |
+| Arch timer | 13 MHz; vtimer PPI 11 → **INTID 27**, ptimer PPI 14 → INTID 30 |
 | DDR | dtsi bank0 `0x40000000 + 0x3e605000` (LK patches real banks into `/memory`); fixed carve-outs live below `0x80000000` |
 | Splash FB | `atag,videolfb-fb_base_l = 0x7e605000`, vram `0x1be0000`, 60 fps, 1080×2400 (MTK LK passes it in DTB `/chosen`) |
 | Panel | `k16a_36_02_0a_vdo` / `k16a_42_02_0b_vdo`, DSI **video** mode; RST gpio86, backlight gpio87 |
@@ -157,11 +157,88 @@ Notes:
   draws its own console into the splash framebuffer (`sweet-fbcon`).
 - Use `HEADER_VERSION=3` (default). If MTK LK refuses the image, try
   `HEADER_VERSION=4`; both are accepted by evergo's bootloader.
-- The kernel build must **not** include topaz's 0081 patch; the CI on this
-  branch already builds with SWEET's `-march=armv8.2-a+crypto`.
+- The kernel build must **not** include topaz's 0081 patch (distinct from this
+  branch's `0081e` early-console patch); the CI on this branch already builds
+  with SWEET's `-march=armv8.2-a+crypto`.
 - Boot-args worth knowing: `cpus=8` (default on this SoC), `debug=0xc`
   (kprintf to the framebuffer console), `sweethw=1` would start sweet's
   Qualcomm input/USB drivers — **do not** use it on evergo.
+
+
+## Debugging the boot (early console + pstore)
+
+**Status 2026-10-25:** the shim side is proven on the real device — the panel
+now shows the loader's boot summary (`BOOT phys/size/entry/fb`, `BOOTARG`,
+`JUMP`, `XNU jumping`), so LK loads our image, the DTB parses, the display
+takeover works, the payload is found and XNU is entered. What is still invisible
+is **XNU's own early console**, because the kernel binary still carries sweet's
+framebuffer address. Patch `0081e` fixes that; it needs one CI kernel rebuild.
+
+Two bring-up bugs were found by comparing with the sibling MTK fork
+[squeeeezy/HelioDarwin](https://github.com/squeeeezy/HelioDarwin) (an
+`ios-topaz` re-target at MediaTek MT6789 / Helio G99). Both are fixed on this
+branch:
+
+1. **Diagnostic blind spot (XNU early console).** Patches 0010/0012 paint XNU's
+   stage markers (1..20) and panic text into sweet's framebuffer `0x9c000000`,
+   which is invisible on evergo: the panel scans DISP OVL0 **layer 1**, whose
+   buffer is at **`0x7d006000`** (measured on the live device — the shim reads
+   `OVL0_L1_ADDR` at boot and prints it as `BOOT fb`). Note the DTB's
+   `atag,videolfb-fb_base_l` (`0x7e605000`) is *not* the visible layer; that
+   stale value is where the old guess came from. Patch **`0081e`** redirects
+   XNU's early console to the visible buffer:
+   - `early_fb` init → `0x7d006000` (MMU off, VA = PA),
+   - `start.s` bootstrap block mapping → `0x7d000000` (a block descriptor must
+     be 2 MiB aligned, so the buffer is mapped as block base + `0x6000` offset),
+   - `sweet_early_map_final()` → same `0x7d000000` physical block at the
+     reserved kernel VA, and `sweet_early_relocate()` adds the `0x6000` offset.
+   `shim/device_evergo.h` keeps `XNU_EARLY_FB` in sync with the patch, and
+   `loader.c` prints `FBCHK` if the runtime visible address ever differs from
+   the one compiled into the kernel. After rebuilding the kernel, XNU's
+   `SWEET EARLY N:` markers and any panic string appear on the panel.
+   `HAS_WDT_DISABLE=1` keeps panics on screen instead of resetting after ~15 s.
+
+2. **Wrong virtual-timer IRQ (would hang the scheduler).** `VTIMER_INTID` was
+   `29`, copied from topaz's Qualcomm wiring. On MTK the standard ARM timer
+   PPIs are `[13,14,11,10]` = [secure-phys, non-secure-phys, **virtual**, hyp],
+   so the virtual timer is **PPI 11 = INTID 27** (29 is the secure-physical
+   timer and would misroute the scheduler tick). Fixed in `shim/device_evergo.h`
+   and `tools/mkadt_evergo.py`; patch 0017 reads `virtual-timer-intid` from the
+   ADT at runtime and routes the tick to it.
+
+### Persistent-RAM (ramoops) console — OPT-IN
+
+If the panel stays black (e.g. `disp_takeover` fails on a unit) or you want a
+post-mortem dump, `shim/plog.c` implements a Linux-compatible ramoops *console*
+zone: a DRAM ring buffer (sig `0x43474244` = `PERSISTENT_RAM_SIG`) that survives
+a warm reset. The shim mirrors every console line into it, so even a pre-XNU
+shim crash is captured. To use it:
+
+1. Pick a **free DRAM** address that survives reset and is not used by LK/XNU/
+   Linux. Reserve it in the **Linux** device tree (the image you boot to read it
+   back) — both as `reserved-memory` and as a `ramoops` node:
+   ```dts
+   reserved-memory {
+       #address-cells = <2>; #size-cells = <2>;
+       pstore_region: pstore@<addr> { reg = <0x0 <addr> 0x0 0x40000>; no-map; };
+   };
+   ramoops {
+       compatible = "ramoops";
+       memory-region = <&pstore_region>;
+       console-size = <0x40000>; record-size = <0x40000>;
+   };
+   ```
+2. In `shim/device_evergo.h` set `HAS_PSTORE 1` and `PSTORE_BASE` to that
+   address (`PSTORE_SIZE` default 0x40000). Rebuild the shim.
+3. After XNU hangs/panics and the watchdog resets, boot **Linux** normally (or a
+   recovery that has ramoops) and read the log:
+   `adb shell su -c 'cat /sys/fs/pstore/console-ramoops-0'`.
+
+For XNU-side logs in the same zone, add a `sweet_early_*` writer that maps
+`PSTORE_BASE` (like `sweet_early_map_final` maps the framebuffer) and appends
+each character — see HelioDarwin's `x676c/osfmk/arm64/sweet_early.c` for the
+reference implementation.
+
 
 ## Blockers (whole-driver ports)
 

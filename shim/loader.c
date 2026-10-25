@@ -158,6 +158,44 @@ static void adt_patch_chosen_dram(uintptr_t adt, uint64_t base, uint64_t size)
 }
 
 /*
+ * Patch /sweet-fbcon reg (u64 <addr, size>) to the runtime-visible layer.
+ * mkadt writes the atag videolfb base (0x7e605000); on evergo that is NOT the
+ * layer the panel scans (OVL0 layer 1 is), and XNU's framebuffer / IOMFB reads
+ * this node, so it must point at the layer the console actually draws to.
+ */
+static void adt_patch_fbcon(uintptr_t adt, uint64_t fb)
+{
+	const uint8_t *root = (const uint8_t *)adt;
+	uint32_t nprops = *(const uint32_t *)root;
+	uint32_t nchildren = *(const uint32_t *)(root + 4);
+	const uint8_t *p = root + 8;
+
+	for (uint32_t i = 0; i < nprops; i++) {	/* skip root props */
+		uint32_t sz = *(const uint32_t *)(p + 32);
+		p += 36 + ((sz + 3) & ~3U);
+	}
+	for (uint32_t i = 0; i < nchildren; i++) {
+		const uint8_t *c = p;
+		const char *name = (const char *)(c + 8);
+		if (name[0]=='s'&&name[1]=='w'&&name[2]=='e'&&name[3]=='e'&&name[4]=='t'&&
+		    name[5]=='-'&&name[6]=='f'&&name[7]=='b'&&name[8]=='c'&&name[9]=='o'&&
+		    name[10]=='n'&&name[11]=='\0') {
+			uint32_t cnprops = *(const uint32_t *)c;
+			uint8_t *q = (uint8_t *)c + 8;
+			for (uint32_t j = 0; j < cnprops; j++) {
+				const char *pn = (const char *)q;
+				uint32_t sz = *(const uint32_t *)(q + 32);
+				if (sz == 16 && pn[0]=='r'&&pn[1]=='e'&&pn[2]=='g'&&pn[3]=='\0')
+					wr64(q + 36, fb);
+				q += 36 + ((sz + 3) & ~3U);
+			}
+			return;
+		}
+		p += adt_node_size(c);
+	}
+}
+
+/*
  * Clamp the payload's kernel RAM to the bootloader-reported /memory bank that
  * contains phys_base (MTK LK patches the detected sizes into the DTB; the
  * 4/6/8 GB variants otherwise disagree with the build-time ADT). Patches the
@@ -176,14 +214,26 @@ static void clamp_memory(uintptr_t dtb, struct payload *p, uintptr_t adt_pa)
 	if (!n)
 		return;
 
+	/* Reject implausible banks. MTK LK reports /memory in a form
+	 * fdt_memory_banks can misread (garbled bases/sizes on evergo); feeding an
+	 * absurd room to adt_patch_chosen_dram below hangs the loader, so if any
+	 * bank is not a sane DRAM range, keep the built-in size and move on. */
+	for (int i = 0; i < n; i++) {
+		if (base[i] < 0x40000000ULL || base[i] > 0x10000000000ULL ||
+		    size[i] < 0x08000000ULL || size[i] > 0x10000000000ULL) {
+			con_str("MEM", "banks implausible, keep built-in size");
+			return;
+		}
+	}
+
 	for (int i = 0; i < n; i++) {
 		if (p->phys_base >= base[i] && p->phys_base < base[i] + size[i]) {
 			uint64_t room = base[i] + size[i] - p->phys_base;
 			if (room == p->mem_size)
 				return;
-			if (room < 0x8000000) {	/* < 128 MB: refuse to shrink that far */
+			if (room < 0x8000000 || room > 0x10000000000ULL) {
 				con_hex("MEM room", room);
-				con_str("MEM", "bank too small, keep built-in size");
+				con_str("MEM", "room implausible, keep built-in size");
 				return;
 			}
 			p->mem_size = room;
@@ -301,6 +351,7 @@ const char *loader_boot(uintptr_t dtb)
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	adt_patch_fbcon(adt_pa, con_fb_addr());	/* ADT fbcon -> visible layer */
 	clamp_memory(dtb, p, adt_pa);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
@@ -324,6 +375,22 @@ const char *loader_boot(uintptr_t dtb)
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
 	ba->memSizeActual = p->mem_size;
+
+	/* The GIC + MEM-bank diagnostics above fill the framebuffer and later lines
+	 * get DROPPED (the console does not scroll), so the jump status was
+	 * invisible. Clear the screen and print a compact boot summary + the jump
+	 * marker so it is unmistakable whether we reach XNU. */
+	con_clear(RED);
+	con_hex("BOOT phys", p->phys_base);
+	con_hex("BOOT size", p->mem_size);
+	con_hex("BOOT entry", p->entry_va);
+	con_hex("BOOT fb", con_fb_addr());
+		/* The XNU kernel has the early-console address compiled in (patch
+		 * 0081e). If LK ever moves the visible layer, the kernel writes to a
+		 * stale address and its output vanishes - say so on screen instead of
+		 * leaving a blank display to guess at. */
+		if (con_fb_addr() != (uint64_t)XNU_EARLY_FB)
+			con_str("FBCHK", "MISMATCH: XNU 0081e expects another FB");
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;

@@ -1,0 +1,16 @@
+# The XNU patch set is applied with `git apply` on the macOS CI runner and the
+# *.sh helpers in the same directory are executed there. Both need LF, whatever
+# the contributor's platform (and core.autocrlf) does - a CRLF patch fails to
+# apply and a CRLF shell script dies with "\r: command not found".
+xnu/patches/*.patch text eol=lf
+xnu/patches/*.sh    text eol=lf
+
+# Shim and tools sources: C, asm, linker script, shell, Python. LF everywhere.
+shim/*.c   text eol=lf
+shim/*.h   text eol=lf
+shim/*.S   text eol=lf
+shim/*.ld  text eol=lf
+shim/*.sh  text eol=lf
+tools/*.py text eol=lf
+tools/*.sh text eol=lf
+*.sh       text eol=lf

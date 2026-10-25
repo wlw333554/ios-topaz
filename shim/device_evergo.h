@@ -8,11 +8,13 @@
  * Facts from the evergo live device tree (mt6833.dts / evergo.dts,
  * Xiaomi-MT6833/kernel_xiaomi_evergo branch R):
  *   gic:    GICD 0x0c000000 (0x40000), GICR 0x0c040000 (0x200000)
- *   timer:  arm,armv8-timer clock-frequency 13 MHz; vtimer PPI 13 (INTID 29),
+ *   timer:  arm,armv8-timer clock-frequency 13 MHz; vtimer PPI 11 (INTID 27),
  *           ptimer PPI 14 (INTID 30)
  *   memory: dtsi bank0 = 0x40000000 + 0x3e605000 (LK patches the real banks
  *           into /memory; the shim reads them at runtime and clamps)
- *   splash: atag,videolfb-fb_base_l = 0x7e605000, vram 0x1be0000, 60 fps
+ *   splash: the panel scans DISP OVL0 **layer 1**; its buffer lives at
+ *           0x7d006000 (measured on the live device 2026-10-25, read from
+ *           OVL0_L1_ADDR). The DTB's atag,videolfb-fb_base_l is NOT that layer.
  *   ufs:    mediatek,ufshci @ 0x11270000 (0x2300), MPHY @ 0x11fa0000
  *   touch:  Novatek NT36672C on spi1 @ 0x11010000 (RST gpio13, IRQ gpio14)
  *   wdt:    TOP_RGU_BASE 0x10007000
@@ -26,13 +28,29 @@
 #define GICD_BASE		0x0c000000UL
 #define GICR_BASE		0x0c040000UL
 #define GICR_SIZE		0x200000UL
-#define VTIMER_INTID		29	/* PPI 13 */
+#define VTIMER_INTID		27	/* PPI 11 (virtual timer) */
 #define PTIMER_INTID		30	/* PPI 14 */
 #define TIMEBASE_HZ		13000000
 
-/* MTK LK leaves the splash framebuffer in /chosen (atag,videolfb-*); the
- * default matches the evergo dts. */
-#define FB_BASE_DEFAULT		0x7e605000UL
+/* The panel's visible layer: DISP OVL0 layer 1. The shim reads its address and
+ * byte pitch from the OVL0 L1 registers at boot (disp.c) and points the
+ * console and XNU boot_args.Video there; this is only the pre-probe default.
+ * Measured on the live device 2026-10-25: 0x7d006000 (NOT the DTB's
+ * atag,videolfb-fb_base_l, and NOT 0x7e605000 = the old dts guess). */
+#define FB_BASE_DEFAULT		0x7d006000UL
+
+/* The XNU early console (patch 0081e) writes to this address with the MMU off
+ * and then to a reserved kernel VA alias of the same physical block. It is a
+ * compile-time constant inside the kernel, so if LK ever moves the visible
+ * layer the kernel's address goes stale - loader.c prints FBCHK when the
+ * runtime address differs from this one. Keep in sync with
+ * xnu/patches/0081e-evergo-early-console-mtk-fb.patch. */
+#define XNU_EARLY_FB		0x7d006000UL
+/* 2 MiB-aligned block base the visible buffer lives in (0x7d006000 - 0x6000).
+ * A block descriptor must be 2 MiB aligned, so the mapping uses this and the
+ * console adds the 0x6000 offset. */
+#define XNU_EARLY_FB_BLOCK	0x7d000000UL
+#define XNU_EARLY_FB_OFFSET	0x6000UL
 #define FB_W			1080
 #define FB_H			2400
 #define FB_STRIDE		(FB_W * 4)
@@ -96,3 +114,18 @@
  * Backlight enable = lcm-bl-enable-gpios = <&pio 87 0>. */
 #define HAS_DISP_TAKEOVER	1
 #define BL_GPIO_PIN		87
+
+
+/* Persistent-RAM console (MediaTek ramoops) - OPT-IN debug channel.
+ * When HAS_PSTORE is 1, the shim (and, via a companion XNU patch, XNU) append
+ * boot logs to a DRAM zone that survives a warm reset and is recovered from
+ * Linux after a normal boot:
+ *   adb shell su -c 'cat /sys/fs/pstore/console-ramoops-0'
+ * PSTORE_BASE/SIZE MUST be free DRAM, reserved in the Linux DTB as a ramoops
+ * console-size region (see EVERGO.md). An address that collides with LK/XNU/
+ * Linux memory corrupts the boot, so this stays OFF (0) by default. */
+#ifndef HAS_PSTORE
+#define HAS_PSTORE		0
+#endif
+#define PSTORE_BASE		0x00000000UL	/* set to a verified free DRAM address */
+#define PSTORE_SIZE		0x00040000UL	/* 256 KiB console region */
