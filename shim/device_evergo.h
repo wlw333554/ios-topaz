@@ -70,3 +70,29 @@
  * XNU jump so panics stay on screen. */
 #define HAS_WDT_DISABLE		1
 #define WDT_BASE		0x10007000UL
+
+/* DISP OVL0 layer-1 source address + pitch. The color-hunt diagnostic (v7)
+ * proved the panel actually scans OVL0 **layer 1** (filling it turned the whole
+ * screen green), NOT layer 0. mtk_disp_ovl.h (mt6833): L1_ADDR = 0x0f60,
+ * L1_PITCH = 0x064, per-layer stride 0x20, OVL0 base 0x14005000. The shim reads
+ * L1's address (the real visible buffer) and its byte pitch, and points the
+ * console + XNU boot_args.Video there. */
+#define HAS_DISP_FB_PROBE	1
+#define DISP_OVL0_L1_ADDR	0x14005f60UL
+#define DISP_OVL0_L1_PITCH	0x14005064UL
+
+/* MTK LK may not put linux,initrd-* in /chosen, but it still decompresses the
+ * boot ramdisk to the header ramdisk_addr. If the /chosen search finds no
+ * SWEETXNU payload, loader.c scans this known address as a fallback. */
+#define HAS_RAMDISK_FALLBACK	1
+#define RAMDISK_LOAD_ADDR	0x51100000UL
+#define RAMDISK_SCAN_LEN	0x2000000UL	/* 32 MiB is plenty for our cpio */
+
+/* DISP takeover: LK blanks the panel (stops OVL scanout + turns the backlight
+ * off) at kernel hand-off, so the shim console and XNU early console are
+ * invisible. disp.c re-enables OVL0 (layer 0 points at our console buffer)
+ * and re-pulses the backlight GPIO. The DISP MUTEX / DSI / panel are left
+ * configured by LK and are NOT re-initialised here (next lever if still black).
+ * Backlight enable = lcm-bl-enable-gpios = <&pio 87 0>. */
+#define HAS_DISP_TAKEOVER	1
+#define BL_GPIO_PIN		87

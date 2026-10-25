@@ -214,8 +214,8 @@ const char *loader_boot(uintptr_t dtb)
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end)) {
 		rd_start = rd_end = 0;
 	}
+	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 	if (rd_end > rd_start) {
-		con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 		for (uintptr_t a = rd_start; a + 8 <= rd_end; a++)
 			if (magic_ok((const char *)a)) {
 				hit = a;
@@ -245,6 +245,23 @@ const char *loader_boot(uintptr_t dtb)
 			hit = a;
 			break;
 		}
+#endif
+#if HAS_RAMDISK_FALLBACK
+	if (!hit) {
+		/* MTK LK may not carry linux,initrd-* in /chosen, but it still
+		 * decompresses the boot ramdisk to the header ramdisk_addr. Scan
+		 * that known address for the SWEETXNU payload as a fallback. */
+		for (uintptr_t a = RAMDISK_LOAD_ADDR;
+		     a + 8 <= RAMDISK_LOAD_ADDR + RAMDISK_SCAN_LEN; a++) {
+			if (magic_ok((const char *)a)) {
+				hit = a;
+				rd_start = a;
+				rd_end = RAMDISK_LOAD_ADDR + RAMDISK_SCAN_LEN;
+				con_hex("RDFBK", a);
+				break;
+			}
+		}
+	}
 #endif
 	if (!hit)
 		return "no SWEETXNU payload";
@@ -298,7 +315,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->topOfKernelData = top;
 	ba->Video.v_baseAddr = con_fb_addr();
 	ba->Video.v_display = 1;
-	ba->Video.v_rowBytes = FB_STRIDE;
+	ba->Video.v_rowBytes = con_rowbytes();
 	ba->Video.v_width = FB_W;
 	ba->Video.v_height = FB_H;
 	ba->Video.v_depth = 32;

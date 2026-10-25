@@ -13,6 +13,7 @@
 
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE_DEFAULT;
 static uint32_t con_bg;
+static uint32_t con_stride = FB_STRIDE;	/* bytes per row, runtime-overridable */
 static int row;
 
 void con_set_fb(uint64_t addr)
@@ -25,10 +26,21 @@ uint64_t con_fb_addr(void)
 	return (uint64_t)con_fb;
 }
 
+void con_set_stride(uint32_t stride)
+{
+	if (stride)
+		con_stride = stride;
+}
+
+uint32_t con_rowbytes(void)
+{
+	return con_stride;
+}
+
 void con_clear(uint32_t bg)
 {
 	for (int y = 0; y < FB_H; y++) {
-		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
+		volatile uint32_t *line = con_fb + y * (con_stride / 4);
 		for (int x = 0; x < FB_W; x++)
 			line[x] = bg;
 	}
@@ -48,8 +60,8 @@ static void put_char(int col, char ch, uint32_t fg)
 		for (int gx = 0; gx < 8; gx++) {
 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
 			for (int sy = 0; sy < SCALE; sy++) {
-				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
-						       + x0 + gx * SCALE;
+			volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (con_stride / 4)
+					       + x0 + gx * SCALE;
 				for (int sx = 0; sx < SCALE; sx++)
 					p[sx] = c;
 			}

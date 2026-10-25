@@ -18,6 +18,8 @@ extern volatile uint32_t *con_fb;
 
 void con_set_fb(uint64_t addr);	/* before the first con_clear() */
 uint64_t con_fb_addr(void);
+void con_set_stride(uint32_t stride);	/* bytes per row; before first write */
+uint32_t con_rowbytes(void);
 
 void con_clear(uint32_t bg);
 void con_skip(void);

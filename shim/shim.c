@@ -15,6 +15,7 @@
 #include "fdt.h"
 #include "loader.h"
 #include "ufs.h"
+#include "disp.h"
 
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
@@ -540,9 +541,26 @@ void shim_main(uint64_t dtb)
 			con_set_fb(fb);
 	}
 #endif
+#if HAS_DISP_FB_PROBE
+	{
+		/* The panel really scans OVL0 **layer 1** (proven by the v7 color
+		 * hunt: filling layer 1 turned the whole screen green). Point the
+		 * console at layer 1's buffer and adopt its byte pitch so text
+		 * isn't skewed. /chosen's videolfb base is NOT the visible layer. */
+		uint32_t l1 = *(volatile uint32_t *)(DISP_OVL0_L1_ADDR);
+		if (l1 >= 0x40000000u && l1 != ~0u)
+			con_set_fb(l1);
+		uint32_t pitch = *(volatile uint32_t *)(DISP_OVL0_L1_PITCH);
+		if (pitch >= (uint32_t)(FB_W * 4) && pitch <= (uint32_t)(FB_W * 8))
+			con_set_stride(pitch);
+	}
+#endif
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
+#if HAS_DISP_TAKEOVER
+	disp_takeover();	/* re-light OVL0 + backlight so the text shows */
+#endif
 	con_str("SHIM", DEVICE_NAME ": xnu loader");
 	/* xnu needs the 16K granule (TGran16 != 0); some boot cores lack it */
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
@@ -575,6 +593,12 @@ void shim_main(uint64_t dtb)
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+
+	/* DIAGNOSTIC: hold right here so the loader "why" plus the INITRD/RDFBK
+	 * lines it just printed stay on screen (they'd otherwise scroll off during
+	 * the long diagnostics below). Only reached when loader_boot RETURNS. */
+	for (;;)
+		__asm__ volatile("wfi");
 
 #if HAS_UFS_PROBE
 	/* No payload: probe the internal UFS while the MMU is still off. */
@@ -626,5 +650,9 @@ void shim_main(uint64_t dtb)
 	test_gic();
 
 	stage = "done";
-	reset(40);
+	/* Diagnostic build: hold the diagnostics (LOADER why / INITRD / RDFBK)
+	 * on screen instead of auto-resetting, so they can be read without UART.
+	 * Only reached when loader_boot RETURNS (XNU did not take over). */
+	for (;;)
+		__asm__ volatile("wfi");
 }

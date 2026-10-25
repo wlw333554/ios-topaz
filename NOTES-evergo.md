@@ -163,6 +163,104 @@ Also regression-checked `DEVICE_TOPAZ` with the same refactored sources:
 compiles with zero warnings and links (`shim.elf` 154864 bytes), so the
 device split did not break the topaz path.
 
+## 2026-10-24 — TWRP dmesg: runtime ground truth for DISP + UFS
+
+Captured `E:\iOS\twrp_dmesg.txt` from a TWRP recovery booted on evergo
+(`fastboot flash boot twrp.img`). This is the **runtime** answer (not
+source/dts), so it locks down the display and UFS bring-up that the port
+still needs.
+
+**Display HW map (confirmed live — matches `device_evergo.h`):**
+
+- `dispsys_config` `0x14000000`; `disp_ovl0` `0x14005000` (comp_id 18);
+  `disp_ovl0_2l` `0x14006000`; `disp_rdma0` `0x14007000`; `disp_rsz0`
+  `0x14008000`; `disp_color0` `0x14009000`; `disp_ccorr0` `0x1400b000`;
+  `disp_aal0` `0x1400c000`; `disp_gamma0` `0x1400d000`;
+  `disp_postmask0` `0x1400e000`; `disp_dither0` `0x1400f000`; `dsi`
+  `0x14013000` (comp_id 12); `disp_wdma0` `0x14014000`; `disp_pwm0`
+  `0x1100e000`; `disp_smi_2x1_sub_common_u0/u1` `0x1401b000`/`0x1401c000`;
+  `m4u (iommu)` `0x14016000`; `emicen` `0x10219000`.
+- **`DISP_OVL0_L0_ADDR = 0x14005f40` is confirmed**: it is `disp_ovl0`
+  base `0x14005000` + `DISP_REG_OVL_ADDR_MT6833 = 0x0f40` (layer 0). So the
+  shim's "read OVL0 layer0 src addr, write console there" hijack reads the
+  buffer the panel is *actually* scanning.
+- Panel probe string: `wt,tianma,nt36672c,cphy,vdo,90hz` → **Tianma
+  `k16a_36_02_0a_vdo`** (current LCM), **CPHY** (not D-PHY), **VDO video
+  mode** (continuous refresh — our console writes will be visible if LK
+  leaves DISP on), **90 Hz**. Touch = Novatek NT36672C. A second CSOT panel
+  driver exists but is skipped (`csot_probe+ skip probe due to not current
+  lcm`). Resolution 1080×2400 (`mtk_dsi_connector_get_modes` htotal 1364 →
+  1080 active; vertical 2400 from dts).
+- Backlight = **LM36273** (TI LED driver) via `leds_mtk_disp`
+  (`lcd-backlight`, max 2047); `lm36273_brightness_set backlight=1200,
+  temp_level=847`. So backlight is an I2C/DSI-controlled LED driver, **not**
+  a bare PWM/gpio — if LK powers it off on hand-off we get a black (but
+  still-scanning) screen and would need to re-enable LM36273.
+
+**UFS (confirmed live):**
+
+- `ufshci@11270000` (0x2300), MPHY `0x11fa0000`. Device **SAMSUNG
+  KM8F9001JM-B813** (UFS 2.2). Negotiated power mode: **HS-G3, 2 lanes,
+  rate B (rate=2), FAST MODE** (from `gear=[3,3], lane[2,2]`). Initial
+  link is SLOWAUTO gear=[1,1] lane[1,1] then ramps up.
+- Regulators `vdd-hba`/`vccq`/`vccq2` are "assuming enabled" (no regulator
+  control in the dts node) — good simplification for a shim UFS driver.
+- Device reset via `ufs_mtk_pltfrm_ufs_device_reset`, host sw reset
+  `ufs_mtk_host_sw_rst`. Vendor crypto clks skipped.
+- `HAS_UFS_PROBE` is still opt-in/off; this is the data the read-only probe
+  would dump, useful when writing the real driver.
+
+**Implication for the boot screen.** The OVL0-layer0 hijack is architecturally
+correct and the dmesg validates every address. VDO mode means the panel is
+continuously refreshed from that buffer. So `shim/out` build
+`cb59c855…` (which reads `0x14005f40`, falls back to `atag,videolfb-fb_base_l`
+`0x7e605000`) should show: red SHIM banner → MMFR0/GICR/MEM/JUMP → XNU text
+on the **same** buffer (`loader.c` sets `ba->Video.v_baseAddr = con_fb_addr()`).
+Remaining risk if it is still black: MTK LK powering off DISP/backlight on
+hand-off → need a minimal DISP takeover (OVL0 + DSI/CPHY + LM36273 backlight).
+
+**Next action.** Flash `shim-boot-root.img` (cb59c855…), report what the
+screen shows (red banner / MTK logo / black). That single observation
+decides whether to escalate to a DISP takeover.
+
+## 2026-10-24 (later) — first phone boot attempt: result + diagnosis
+
+Flashed `cb59c855…` `shim-boot-root.img` to `boot` (A/B: `boot_a`/`boot_b`).
+**Result: MTK logo shows ~a few seconds (LK splash), then BLACK, then
+reboot.** The red SHIM banner is NEVER seen.
+
+**Diagnosis (high confidence).** The logo is LK (bootloader) showing its
+splash; the black screen is LK **blanking / powering off the display right
+before it jumps to the kernel** (our shim), which does not re-light it — so
+`con_clear(RED)` writes to a buffer that is no longer scanned. This
+empirically **confirms the "LK powers off DISP on hand-off" hypothesis**
+from the section above. The reboot is ambiguous: either XNU reaches a panic
+(no UFS/root driver yet) and resets, or a residual WDT fires — it implies
+the **shim→XNU chain may actually be functional** and only the display is
+missing (good news for the port, bad for visibility).
+
+**Implication.** Seeing XNU logs now requires the shim to **re-light the
+display** before/at hand-off:
+- Re-enable OVL0 layer0 → our console framebuffer (base `0x14005000`, src
+  addr `0x14005f40`, layer0 con/size/pitch regs needed).
+- Un-gate DISP clocks / power domains (DISPSYS `0x14000000` CG regs) if LK
+  gated them.
+- Re-enable backlight (LM36273, I2C-controlled) and re-init the panel
+  (Tianma `k16a_36_02_0a_vdo`, CPHY/VDO) only if it was put to sleep.
+- All init sequences live in `Xiaomi-MT6833/kernel_xiaomi_evergo`
+  (`mtk_disp_ovl.c`, panel tianma LCM driver, `lm36273` backlight,
+  `mtk_dsi.c`). This is the "minimal display path" milestone — a real
+  project, not a one-liner.
+
+**Faster alternative: UART serial.** MTK UART0 (`console=ttyS0,921600n1` in
+the TWRP cmdline; AP UART0 base ~`0x11002000`) — add a ~20-line `putc` to
+the shim and let XNU's early console (patch 0003) use it; capture with a
+USB-TTL on the board's UART test points. Gets the panic visible in minutes,
+no display driver needed, but requires soldering/hooking pads.
+
+**Decision pending from user:** pursue the screen (DISP takeover), UART
+serial, or both.
+
 Two tool gotchas worth remembering (both handled inside the script, plus
 documented in EVERGO.md *Toolchain notes*):
 
@@ -172,3 +270,299 @@ documented in EVERGO.md *Toolchain notes*):
 - AOSP `mkbootimg.py` imports `gki.generate_gki_certificate` at module load,
   but only calls it for header **v4** + `--gki_signing_*`; a 2-line stub on
   `PYTHONPATH` is enough for our v3 images.
+
+## 2026-10-24 (final) — DISP takeover implemented (user chose screen over UART)
+
+User picked **screen DISP takeover** over UART serial. Implemented
+`shim/disp.c` + `shim/disp.h`, gated by `HAS_DISP_TAKEOVER` (evergo only) and
+called from `shim_main()` right after `con_clear(RED)`. Rebuilt via
+`build_evergo_zig.py --root` → `shim-boot-root.img` (6.1 MB, ANDROID! v2,
+VERIFY ok, contains SWEETXNU), sha256 **f5083876…** (replaces cb59c855…).
+Staged into the flash package dir.
+
+**What the takeover does (runs with MMU OFF, physical addresses):**
+
+1. **Re-enable OVL0.** Soft-reset the engine (`OVL_RST` 1→0), set `ROI_SIZE`
+   = 1080×2400, point **layer 0** at our console framebuffer
+   (`DISP_REG_OVL_ADDR(0)` = base `0x14005000` + `0x0f40`), `SRC_SIZE` =
+   1080×2400, `OFFSET` = 0, `PITCH` = `FB_STRIDE` (**bytes**, not pixels —
+   confirmed from `mtk_disp_ovl.c`), `CON` = `OVL_FMT_ARGB8888 (3<<12)` |
+   `AEN` | alpha 0xff (matches our console's B,G,R,A memory order; word
+   `0xAARRGGBB`). Enable the layer's RDMA (`RDMA_CTRL`=1, `GMC`=0x40402020),
+   set `SRC_CON` layer0-enable bit, then `OVL_EN` = `1 | BYPASS_SHADOW(bit22)`
+   and kick `OVL_TRIG`. (Source of every offset: `mtk_disp_ovl.c`, MT6833 addr
+   offset `0x0f40`; shadow/bypass confirmed from the R-branch driver.)
+2. **Re-pulse the backlight.** `lcm-bl-enable-gpios = <&pio 87 0>`: drive
+   GPIO 87 high via the **modern mediatek "paris" PIO layout** (base
+   `0x1000b000`: `MODE` at `+0x300+(pin/8)*0x10` 4b/pin, `DIR` at `+0x000`,
+   `DOUT` at `+0x100`, 1b/pin, 32 pins/reg). RMW MODE→0 (GPIO), DIR→out,
+   DOUT→high.
+
+**Deliberately left to LK (not re-initialised):** the DISP **MUTEX**, the
+**DSI/CPHY** link and the **panel** hardware. LK configured all of these for
+the splash; at hand-off it only *stops OVL scanout + turns the backlight off*.
+So the minimal v1 lever is OVL + backlight. **ASSUMPTION:** LK did NOT disable
+the MUTEX or power down the panel — if it did, v1 stays black.
+
+**If v1 is STILL black → next levers (in order):**
+- Re-enable the DISP MUTEX (RMW its EN bit0, preserving LK's existing
+  MOD/SOF — base is inside `dispsys_config@0x14000000`, most likely
+  `0x14001000`; the mutex is the frame synchroniser and without it no frames
+  flow even with OVL on).
+- If LK fully powered the panel down: re-pulse panel `pm-enable-gpios`
+  `<&pio 136 0>`, `bias-gpios` `<&pio 137 0>,<&pio 138 0>`, toggle
+  `reset-gpios` `<&pio 86 0>` — then re-init DSI + Tianma `k16a_36_02_0a_vdo`
+  (big: needs the panel DCS init sequence + CPHY/VDO DSI config).
+- Backlight may actually be I2C LM36273, not pure GPIO: if GPIO 87 alone
+  doesn't light it, re-send the LM36273 brightness via I2C (needs an I2C
+  driver in the shim).
+
+**Why this is the decisive test.** If the red SHIM banner now appears, the
+**shim→XNU chain is proven functional** and the subsequent XNU early console
+(`loader.c` shares the same framebuffer) will show the panic that is currently
+causing the reboot — which names the next blocker (UFS/root driver). If it
+stays black, escalate to the levers above.
+
+## 2026-10-24 (22:08) — DISP v2: also re-arm DISP MUTEX0
+
+v1 (OVL0 + backlight GPIO 87) produced **nothing visible**. Strong signal that
+LK at hand-off stops the **DISP MUTEX** (frame synchroniser): OVL0 → RDMA0 →
+DSI0 frames are gated by it, so re-enabling OVL alone can't push pixels to the
+panel. This is consistent with the LK Redmi logo having been visible earlier
+(its OVL path ran under an enabled MUTEX).
+
+**v2 change (`shim/disp.c`):** added `disp_mutex_resume()` — reads MUTEX0 MOD/SOF/CTL
+(keeping LK's existing display-path config) and sets `MUTEX_EN(0)` bit0. Called
+first in `disp_takeover()`, before the OVL re-enable + backlight. MUTEX base
+`0x14001000` (inside `dispsys_config@0x14000000`); `EN=+0x000`, `CTL=+0x004`,
+`MOD=+0x008`, `SOF=+0x00c`, stride 0x20/instance (from `mtk_disp_mutex.c`).
+Rebuilt `build_evergo_zig.py --root` → `shim-boot-root.img` (6,117,376 B,
+VERIFY ok), sha256 **ca9be120…** (replaces f5083876…), re-staged into the flash
+package dir (overwrote `shim-boot-root.img` + refreshed its `.sha256`).
+
+**If v2 is STILL black** → remaining levers (each a bigger step, blind):
+- Re-pulse panel GPIOs and re-init DSI + Tianma `k16a_36_02_0a_vdo`
+  (`pm-enable <&pio 136>`, `bias <&pio 137>,<&pio 138>`, `reset <&pio 86>`).
+- Backlight may actually be I2C **LM36273**, not the GPIO-87 enable line — would
+  need a shim I2C driver (bus base + slave addr + reg sequence are guesses).
+- **Reliable alternative: UART.** With no output channel at all, every iteration
+  is a blind guess. Tapping the MTK UART test points with a USB-TTL adapter (and
+  a shim UART driver) is the only way to actually see shim/XNU output and stop
+  guessing register by register. QEMU shows the *generic* XNU boot (already
+  reaches idle) but cannot model MTK display/GIC, so it won't reveal the panel
+  fix.
+
+## 2026-10-24 (16:31) — DISP v3: CORRECTED MUTEX register layout (the real fix)
+
+**Root cause of v1/v2 black screen found.** v2's MUTEX offsets were **wrong**.
+I had guessed `EN=+0x000, CTL=+0x004, MOD=+0x008, SOF=+0x00c` (stride 0x20),
+but the **real** layout (extracted from the actual evergo kernel
+`mt6833/dispsys/ddp_reg_mutex.h`) is **per-mutex stride 0x20** with:
+- `EN  @ +0x020`, `RST @ +0x028`, `SOF @ +0x02C`, `MOD0 @ +0x030`.
+- There is **no per-mutex "CTL" register** at all (the only CFG is global at
+  `base+0x008`, left untouched).
+
+So v2's `disp_mutex_resume()` literally wrote bit0 of `MUTEX_INTEN` (base+0x000)
+instead of `MUTEX0_EN` (base+0x020) and never re-armed the synchroniser → the
+OVL→DSI path stayed gated → black. The offsets, not just "LK left MOD=0", were
+the bug. MUTEX physical base **0x14001000** (from `evergo.dts disp_mutex@14001000`)
+and OVL0 **0x14005000** were already correct.
+
+**v3 change (`shim/disp.c`):** rewrote `disp_mutex_resume()` to write, in order:
+1. `MUTEX_MOD0(0) = 0` (clear), then `= 0x45B5`
+2. `MUTEX_SOF(0) = 0x41` (SOF+EOF both sourced from DSI0, video mode)
+3. `MUTEX_EN(0) = 1`
+
+`0x45B5` is the authoritative primary-path module mask from the real kernel
+`ddp_mutex.c module_mutex_map[]`: OVL0(bit0)+RDMA0(bit2)+COLOR0(bit4)+CCORR0(bit5)
++AAL0(bit7)+GAMMA0(bit8)+DITHER0(bit10)+DSI0(bit14). `0x41` = `SOF_FLD(bits[2:0])=1
+| EOF_FLD(bits[8:6])=1`, matching `ddp_mutex_set_l()` for the DSI0 video path.
+Added a 200k-iteration `spin_delay()` after the backlight GPIO pulse so the
+panel/backlight settle. `disp_mutex_resume()` reads MOD0/EN back and prints them
+via `con_hex2`, so the on-screen "MUX mod0=… en=…" line now *proves* the write
+landed (if it reads back 0x45B5/1, the mutex is genuinely armed).
+
+**Rebuilt** `build_evergo_zig.py --root` → `shim-boot-root.img` (6,117,376 B,
+VERIFY ok, SWEETXNU present). Re-staged into the flash package dir, sha256
+**a4c3bb19…** (replaces ca9be120…; 4e3586f7… was an intermediate v3 build before a
+backlight-settle delay bump, also flashed-safe).
+
+**Why this is the decisive test.** With the correct MUTEX registers, the
+display frame-sync is genuinely re-armed for the first time. If the red SHIM
+banner + "MUX/DISP" debug lines now appear, the shim→XNU chain is proven and
+the next blocker is whatever makes XNU panic → reboot (UFS/root). If it stays
+black, the display pipeline was *fully* powered down by LK (not just
+mutex-gated) and we must escalate to panel-GPIO re-pulse + DSI re-init + LM36273
+I2C backlight — see prior sections. No UART required for this test; the screen
+itself is the channel.
+
+## 2026-10-24 (22:56) — DISP v4: GPIO base was WRONG (真·根因)
+
+v3（写对 MUTEX）**仍黑**。深挖发现根因不在显示链，而在 **GPIO 控制器基址**：
+
+- mt6833 pinctrl（`pio: pinctrl`）用 `reg_bases = <&gpio>,<&iocfg_rb>,...`，
+  `base[0] = &gpio = 0x10005000`。MODE/DIR/DO/DI 字段表（pinctrl-mt6833.c）
+  **全部 `i_base=0`** → 都相对 **0x10005000**。
+- disp.c 里 `PIO_BASE` 一直写成 **0x1000b000 = &eint（中断控制器 apirq）**，
+  于是 v1/v2/v3 所有 GPIO poke（背光、pinmux、方向、输出）**全打到中断控制器
+  上，背光 GPIO 87 从未真正翻转** → 这才是「始终黑屏」的根本原因。
+- 偏移本身是对的：MODE `0x300+(p/8)*0x10`(4bit)、DIR `0x000+(p/32)*0x10`、
+  **DO(输出) `0x100+(p/32)*0x10`**、DI(输入) `0x200+(p/32)*0x10`。只有 base 错。
+
+**v4 修复（`shim/disp.c`）：**
+1. `PIO_BASE` 0x1000b000 → **0x10005000**。
+2. 新增 `panel_power_up()`：按 evergo.dts 面板 GPIO 链上电——`pm-enable`(GPIO136)、
+   `bias VSP+`(GPIO137)、`bias VSN-`(GPIO138)、`backlight`(GPIO87)，
+   bias 之间加毫秒级 `spin_delay`。**不脉冲 reset(86)、不重发 DCS init**——
+  复用 LK 已初始化的 DSI 状态（DSI0 持续刷帧）；DVDD(PMIC VCN13) 假定仍开。
+3. 保留 v3 的 MUTEX 重开 + OVL 重指。
+4. **加了一个「盲确认信号」**：背光灭→亮闪一次。用户无 UART/黑屏时，若看到
+   背光闪 ⇒ 面板供电链已通、问题在视频管线；无反应 ⇒ 供电链仍死。上屏还打印
+   `PANEL pm/bias/bl` 与 `DISP do=`（读回 DO 寄存器验证 GPIO 写成功）。
+
+已重编 `build_evergo_zig.py --root` → `shim-boot-root.img`（6,117,376B，VERIFY ok
+含 SWEETXNU），已覆盖刷机包，sha256 **d836b5093f3a4719dad4c33d59b008f11be45675563a4550e49aaaab75be4045**
+（替换 a4c3bb19…）。
+
+**判定**：这次背光/偏压是真·驱动 GPIO。若红 SHIM 横幅+MUX/PANEL/DISP 调试行出现
+⇒ 彻底通了；若只见背光闪一下仍无字 ⇒ 视频/DSI 或 PWM0 亮度是下一个 blocker
+（PWM0 重开+占空比、reset 脉冲、DCS 重初始化）。
+
+## 2026-10-24 (23:30) — v6: 照搬 ruby，停止面板接管（方向性修正）
+
+用户提示参考 **Redmi Note 12 Pro 5G = ruby（MT6877/天玑1080）** 的 iOS bringup：
+`github.com/lky005/ruby-ios-bringup`（+ `ruby-ios-probes`）。拉取其显示/boot-chain
+文档与 shim 后，结论与我们的做法**相反**：
+
+- ruby 的 shim **完全不碰显示硬件**：不重开 MUTEX、不重指 OVL、不驱面板 GPIO、
+  不点背光。**LK 把整条显示链留着运行**。
+- 屏幕显示的是 LK「可见扫描层」的内容。ruby 可见层 = `0x7cdfc000`（pitch 4352），
+  **不是** kernel/atag fb 基址 `0x7ba10000`。文档原话：「早期 shim 写 0x7ba10000，
+  屏幕不可见；v2 改用 0x7cdfc000」。
+- ruby 的「红屏探针」成功判据就是「整屏变红」——只往可见层填红、零硬件接管即成功。
+- 显示最终由 **XNU 的 IOMFB** 把 iOS surface memcpy 进该可见层完成；shim 调试靠
+  持久日志环（sweet-log），不是屏幕。
+
+**对 evergo 的判断**：evergo 与 ruby 同属 MTK，LK 极可能也把显示留着。我们 v1–v5
+一直黑，是因为 `disp_takeover()` 在**搞坏本来正常的显示**——重配 MUTEX(MOD0=0x45B5
+可能与 LK 实际配置不符)、把 OVL 重指、驱面板 GPIO、点背光/PWM，全是多余甚至有害的。
+（v4 的 GPIO 基址修正 0x10005000 本身没错，但「该不该驱这些 GPIO」这个前提错了。）
+
+**v6（`shim/disp.c`）**：`disp_takeover()` 改为**只读诊断**——不写任何显示硬件，
+只读回 OVL0 layer0 地址(l0)/pitch 并 `con_hex2` 上屏，打印 `DISP fb=/l0=/pitch=/hw=0`。
+控制台仍在 shim_main 的 fb 探针设好的「OVL0 layer0 = 可见层」上画（con_clear 红）。
+旧硬件序列保留在 `#if DISP_HW_TAKEOVER`（默认 0），一改即可切回。
+
+已重编 `build_evergo_zig.py --root` → `shim-boot-root.img`（6,117,376B，VERIFY ok，
+无警告），已覆盖刷机包，sha256 **a211272f4f06b8eb22e098ec8903236c6f036a9714eb59b35a6484cb8232a3f6**
+（替换 d836b509…）。ruby 参考文件存于 `E://iOS//ruby_ref//`。
+
+**判定（照搬 ruby 红屏判据）**：
+- **整屏变红**（哪怕文字因 stride 略歪）⇒ 链路通！证明 evergo LK 确实留着显示、
+  我们之前的接管正是在搞坏它。下一步把该可见层地址+几何正确地传给 XNU IOMFB，
+  并核对 layer pitch（ruby 是 4352 非 4320）让文字清晰。
+- **仍全黑** ⇒ evergo LK 与 ruby 不同、确实在交接时灭屏 ⇒ 才需要 `DISP_HW_TAKEOVER=1`
+  重新上电，但要先解决可见层地址/pitch。
+
+## 2026-10-24 (23:50) — 真凶：kernel 没 gzip + 镜像必须整 128 MiB
+
+用户发现反复重启，并指出「boot_a/b 是 128MB，你给的才 ~5MB」。结合 ruby boot-chain
+文档（「LK 只认完整 128 MiB + stock kernel 流大小」）解剖原厂 `boot_a_backup.img` 后实锤：
+
+- MTK LK 是 **「gzip kernel -> 0x40080000」**，kernel/ramdisk 都必须是 **gzip 流**。
+- 原厂布局（标准 Android boot）：header @0x0、**kernel gzip @0x800**（kernel_size=14,638,612）、
+  **ramdisk gzip @0xdf6800**（=0x800+roundup(kernel_size,2048)，ramdisk_size=36,170,076）、
+  **DTB @0x3075800**（=ramdisk+roundup(ramdisk_size,2048)，即 stock_dtb.bin 169925B）、
+  AVB0 @0x309f000、AVB footer @0x7ffffc0。总 134,217,728 = 128 MiB。
+- **我们的旧构建把 221KB 的裸 shim Image 直接当 kernel 写（first4=`00020014`，非 gzip）**，
+  且只产出 ~6MB 小镜像 → LK gunzip 失败/布局不符 → **shim 从来没被加载过**。
+  v1–v6 的「黑屏」很可能是 LK 加载失败，不是我们显示没搞定（display 调试的前提被推翻）。
+
+**修复（ruby 配方，`build_full_boot.py`）**：拿原厂 128MB 备份，**只把 kernel 区
+[0x800,0xdf6800) 和 ramdisk 区 [0xdf6800,0x3075800) 换成我们 gzip 后的数据**，
+header/DTB/AVB0/footer 全原样。用「串联空 gzip 成员 + 一个 FEXTRA 成员」把每区填满到
+精确区大小，保证整段都是合法 gzip（任何 gunzip 行为都得到我们的数据）。round-trip 验证通过。
+
+产出 `E://iOS//build_out//shim-boot-full.img` = **134,217,728 B (128 MiB)**，已覆盖到刷机包
+`E://iOS//ios16-redmi-note-11-5g//shim-boot-full.img`，sha256
+**8a198a8607eca7ff46cf1bce4c096e861a270c36ed2339a8bc2625c3f028ef7f**。
+
+**刷法（关键：刷整个 128MB 镜像，不是旧的 6MB）**：
+```
+fastboot flash boot E://iOS//ios16-redmi-note-11-5g//shim-boot-full.img
+fastboot reboot
+```
+**判定**：这次 shim 才第一次真正被 LK 加载执行。若链路正常，应看到 con_clear 的红屏 /
+SHIM 横幅；XNU 早期 console 会暴露真正的下一个 blocker（很可能是 UFS 根驱动）。
+
+## 2026-10-25 (00:29) — v8：可见层锁定 OVL0 layer1（绿=layer1）
+
+v7 颜色 HUNT 结果：**整屏变绿 = 可见层是 OVL0 第 1 层（layer1, 0x14005f60）**，不是
+我们一直假设的 layer0，也不是 /chosen 的 videolfb 基址。（与 ruby 一致：可见层不在默认层。）
+
+修复：
+- `device_evergo.h`：`DISP_OVL0_L1_ADDR=0x14005f60`、`DISP_OVL0_L1_PITCH=0x14005064`
+  （替换原 L0；L1_ADDR/L1_PITCH 偏移据真实内核 ddp_reg_ovl.h 确认）。
+- `shim.c` fb 探针：改读 OVL0 **L1** 地址设 con_fb，并读 L1 的字节 pitch 设 console
+  stride（新增运行时 stride，避免文字歪）。
+- `console.c/.h`：新增 `con_set_stride()/con_rowbytes()`，con_clear/put_char 改用运行时
+  stride（默认仍 FB_STRIDE=4320）。
+- `loader.c`：`Video.v_rowBytes = con_rowbytes()`（XNU IOMFB 用真实 pitch，不歪）。
+- `disp.c`：恢复 v6 只读版（不碰显示硬件、不停住，让 shim 继续启动 XNU）；硬件序列留在
+  `#if DISP_HW_TAKEOVER`。
+
+重编 + 打补丁 → `shim-boot-full.img`（128 MiB，VERIFY ok，无警告），已覆盖刷机包，
+sha256 **d8db69cbefa00457815e4ca747a36b249e863c0563b459fdc12efebadd849dc4**。
+
+**判定**：这次 con_fb=可见层 L1，应看到 con_clear 红底 + SHIM 横幅/DISP 调试字（文字不歪）。
+之后 XNU IOMFB 会把 iOS surface blit 到同一 L1 层 → 苹果 logo → 锁屏。若见到这些，显示链路
+全通，下一步就是 XNU 卡住点（多半 UFS 根）。
+
+## 2026-10-25 (00:52) — v9：SMC 编码 bug + ramdisk 回退（蓝屏诊断实锤）
+
+用户拍蓝屏：PANIC(SYNC) STAGE=psci ESR=0x56000000 ELR=0x40081A3B FAR=0 X30=0x400819E0。
+反查 shim.elf（链接基址0，运行基址0x40080000）：ELR=**reset()+0x7B**、X30 也在 reset()。
+ESR EC=0x15=**SVC**（非 SMC）。⇒ 两个叠加 bug：
+
+1. **SMC 编码错误**：`build_evergo_zig.py` 把 `smc #0` 替换成 `.inst 0xd4000001`，
+   但 0xd4000001=**SVC #0**，SMC #0 应为 **0xd4000003**。于是 shim 所有 PSCI 调用
+   （PSCI_VERSION、reset 的 SYSTEM_RESET…）实际发 SVC → 同步异常（EC 0x15）。
+   诊断路径里 smc(PSCI_VERSION) 首先踩雷 → exc_handler 蓝屏 → reset(40) 的 smc 又踩 → 每 40s 刷一次蓝屏（ELR 落在 reset）。**已修为 0xd4000003**（已在编译产物确认）。
+2. **loader_boot 返回了**（STAGE=psci 在诊断路径，只有 loader_boot 返回才会到）→ XNU 没启动。
+   最可能原因：MTK LK 的 DTB /chosen 没有 `linux,initrd-*`，loader 找不到 ramdisk →
+   `no SWEETXNU payload`（该行被蓝屏盖掉）。
+
+v9 修复：
+- `build_evergo_zig.py`：`.inst 0xd4000001` → `0xd4000003`（真 SMC）。
+- `device_evergo.h` + `loader.c`：加 ramdisk 回退——/chosen 找不到时，直接搜已知
+  ramdisk 装载地址 `0x51100000`（LK 会把 boot ramdisk 解压到这）里的 SWEETXNU。
+- `shim.c`：诊断路径末尾由 reset(40) 改为 `for(;;) wfi` 停住，方便无 UART 读屏。
+
+重编+补丁 → `shim-boot-full.img`（128MiB，VERIFY ok，无警告），sha256
+**8ec1493e470aef4bbbc49448fd4bb3373be35927d7362401b0a470fcba5cc69f**，已覆盖刷机包。
+
+**判定**：若 ramdisk 回退命中 → loader 直接跳 XNU（可能启动）；若仍未启动 → 屏幕停住不重置，
+显示 `LOADER <why>` + `INITRD lo/hi` + `RDFBK <addr>`，据 why 精准修 payload 定位。
+
+## 2026-10-25 (01:30) — v11：payload 内嵌 kernel + ramdisk 改未压缩（LK 不解压 ramdisk）
+
+用户红屏定格实锤：`INITRD lo=51100000 hi=53377E95C`、`LOADER no SWEETXNU payload`。
+推断：hi-lo≈36MB=header ramdisk_size（原始），且扫不到 SWEETXNU ⇒ **MTK LK 不解压
+ramdisk，把 gzip 压缩的 ramdisk 原样载入 0x51100000**，SWEETXNU 被压缩所以按字节扫不到
+（本地验证：gzip ramdisk 里无 SWEETXNU 明文，未压缩 cpio 里有）。这也正是 topaz/ruby 用
+「payload 内嵌进 kernel Image」的原因——kernel LK 是会解压的。
+
+v11（`build_full_boot.py`）双保险：
+1. **内嵌**：kernel Image 后接 payload.bin（page 对齐到 _end），gzip 进 kernel 区
+   （155648+16613632=16.77MB → gzip 5.73MB， fits 14.6MB）。LK 解压 kernel 后 payload
+   以明文落在 0x40080000+page(_end)，loader 的 `emb` 回退命中。
+2. **ramdisk 改未压缩 cpio**：ramdisk 区直接放未压缩 cpio（零填充到区大小）。LK 原样载入，
+   loader 的 initrd 扫描按字节命中 SWEETXNU。
+   round-trip 验证：kernel 解出 shim+payload（含 SWEETXNU）、ramdisk 原始 cpio 可扫到 SWEETXNU。
+
+重打 → `shim-boot-full.img`（128MiB，VERIFY ok，无警告），sha256
+**beeeeaec0f3e3402abed53eefae9c3184805ace9d559972523cba3eb8d82573c4**，已覆盖刷机包。
+
+**判定**：这次 loader 应能命中 payload（initrd 明文优先，emb 兜底）→ 打印 `ENTRY/JUMP/XNU
+jumping` 并跳 XNU。若见 XNU 启动但仍卡（苹果 logo / 无画面），就是下一个 blocker：
+iOS 根文件系统未刷（rd=ufsroot0）或 XNU 早期驱动。
