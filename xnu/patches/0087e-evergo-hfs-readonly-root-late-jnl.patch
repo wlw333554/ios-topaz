@@ -1,0 +1,54 @@
+From: evergo <evergo@localhost>
+Subject: [PATCH 0087e] evergo: read-only root with FSK lastMountedVersion: skip journal in late init too
+
+Our root volume has lastMountedVersion 'fsck', so the mount takes
+hfs_late_journal_init() instead of hfs_early_journal_init(); its
+read-only gate had the same MNT_ROOTFS exclusion, and the write
+attempt against the read-only UFS device failed the root mount
+with EINVAL (22).  Mirror 0086e: drop the exclusion and continue
+without a journal when the journal is dirty.
+---
+diff --git a/bsd/sweet_hfs/core/hfs_vfsutils.c b/bsd/sweet_hfs/core/hfs_vfsutils.c
+index 9556c95..55ce907 100644
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -2827,10 +2827,18 @@ hfs_late_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp, void *_a
+ 	hfsmp->jnl_start = jib_offset / SWAP_BE32(vhp->blockSize);
+ 	hfsmp->jnl_size  = jib_size;
+ 
+-	if ((hfsmp->hfs_flags & HFS_READ_ONLY) && (vfs_flags(hfsmp->hfs_mp) & MNT_ROOTFS) == 0) {
+-	    // if the file system is read-only, check if the journal is empty.
+-	    // if it is, then we can allow the mount.  otherwise we have to
+-	    // return failure.
++	if (hfsmp->hfs_flags & HFS_READ_ONLY) {
++	    /*
++	     * evergo (0087e): same story as 0086e but in the late journal init
++	     * path.  A volume with lastMountedVersion == FSK skips
++	     * hfs_early_journal_init entirely and lands here, where the
++	     * MNT_ROOTFS exclusion again sent our read-only root into
++	     * journal_create()/journal_open(JOURNAL_RESET), which wrote to the
++	     * read-only UFS device (do_jnl_io: strategy err 0x1e) and failed
++	     * the root mount with EINVAL.  Treat the root like any other
++	     * read-only volume, and when the journal is dirty simply mount
++	     * without a journal instead of failing.
++	     */
+ 	    retval = journal_is_clean(hfsmp->jvp,
+ 				      jib_offset,
+ 				      jib_size,
+@@ -2843,13 +2851,15 @@ hfs_late_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp, void *_a
+ 
+ 	    if (retval) {
+ 		    const char *name = vnode_getname_printable(devvp);
+-		    printf("hfs: late journal init: volume on %s is read-only and journal is dirty.  Can not mount volume.\n", 
++		    printf("hfs: late journal init: %s is read-only with a dirty journal; continuing without one\n",
+ 		    name);
+ 		    vnode_putname_printable(name);
++		    retval = 0;
+ 	    }
+ 
+ 	    return retval;
+ 	}
++	}
+ 
+ 	if ((jib_flags & kJIJournalNeedInitMask) || recreate_journal) {
+ 		printf("hfs: Initializing the journal (joffset 0x%llx sz 0x%llx)...\n",
