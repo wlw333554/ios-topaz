@@ -9,7 +9,7 @@ with EINVAL (22).  Mirror 0086e: drop the exclusion and continue
 without a journal when the journal is dirty.
 ---
 diff --git a/bsd/sweet_hfs/core/hfs_vfsutils.c b/bsd/sweet_hfs/core/hfs_vfsutils.c
-index 9556c95..55ce907 100644
+index 9556c95..954b22e 100644
 --- a/bsd/sweet_hfs/core/hfs_vfsutils.c
 +++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
 @@ -2827,10 +2827,18 @@ hfs_late_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp, void *_a
@@ -35,7 +35,7 @@ index 9556c95..55ce907 100644
  	    retval = journal_is_clean(hfsmp->jvp,
  				      jib_offset,
  				      jib_size,
-@@ -2843,13 +2851,15 @@ hfs_late_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp, void *_a
+@@ -2843,9 +2851,10 @@ hfs_late_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp, void *_a
  
  	    if (retval) {
  		    const char *name = vnode_getname_printable(devvp);
@@ -47,8 +47,3 @@ index 9556c95..55ce907 100644
  	    }
  
  	    return retval;
- 	}
-+	}
- 
- 	if ((jib_flags & kJIJournalNeedInitMask) || recreate_journal) {
- 		printf("hfs: Initializing the journal (joffset 0x%llx sz 0x%llx)...\n",
