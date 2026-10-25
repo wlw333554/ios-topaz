@@ -13,6 +13,7 @@
 #define WHITE	0xffffffffU
 #define YELLOW	0xffffff00U
 #define GREEN	0xff00ff00U
+#define MAGENTA	0xffff00ffU
 
 extern volatile uint32_t *con_fb;
 
@@ -27,3 +28,5 @@ void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
+/* filled rectangle in framebuffer pixels (x, y = top-left) */
+void con_block(int x, int y, int w, int h, uint32_t color);

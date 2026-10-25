@@ -192,6 +192,13 @@ branch:
      be 2 MiB aligned, so the buffer is mapped as block base + `0x6000` offset),
    - `sweet_early_map_final()` → same `0x7d000000` physical block at the
      reserved kernel VA, and `sweet_early_relocate()` adds the `0x6000` offset.
+   - The **bootstrap** block in `start.s` uses `0x7c000000`, not `0x7d000000`:
+     a block descriptor must be 32 MiB aligned (L2 block size, 16 KiB granule,
+     L2 index = VA >> 25). sweet's `0x9c000000` happens to be 32 MiB aligned,
+     so the L2 slot it selects maps back onto itself. `0x7d000000` is only
+     16 MiB aligned: slot 62 covers `0x7c000000..0x7e000000`, so with a PA base
+     of `0x7d000000` every console write would land **16 MiB above** the panel
+     buffer (and over the other OVL layer, which blanks the screen).
    `shim/device_evergo.h` keeps `XNU_EARLY_FB` in sync with the patch, and
    `loader.c` prints `FBCHK` if the runtime visible address ever differs from
    the one compiled into the kernel. After rebuilding the kernel, XNU's

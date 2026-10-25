@@ -89,6 +89,21 @@ void con_skip(void)
 	row++;
 }
 
+/*
+ * Filled rectangle in framebuffer pixels. Used for the bring-up canary: a
+ * distinctive block in the bottom-right corner, far from where the console
+ * text and XNU's early markers go, so its presence/absence after the jump
+ * tells us whether XNU ever touched the framebuffer.
+ */
+void con_block(int x, int y, int w, int h, uint32_t color)
+{
+	for (int j = 0; j < h; j++) {
+		volatile uint32_t *line = con_fb + (y + j) * (con_stride / 4);
+		for (int i = 0; i < w; i++)
+			line[x + i] = color;
+	}
+}
+
 void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);

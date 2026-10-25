@@ -20,6 +20,14 @@
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
 
+/* Bring-up diagnostics: values captured while loading, printed in the final
+ * on-screen summary (the detailed log is wiped by the con_clear(RED) that
+ * precedes the summary, and the summary is all the user gets to photograph). */
+static uint64_t diag_fbcon_addr, diag_fbcon_size;
+static uint32_t diag_fbcon_w, diag_fbcon_h, diag_fbcon_stride;
+static int diag_fbcon_found;
+static uint64_t diag_bank_base, diag_bank_size, diag_room;
+
 struct payload_seg {
 	uint64_t vmaddr, vmsize, file_off, file_size;
 };
@@ -115,6 +123,28 @@ static void wr64(uint8_t *a, uint64_t v)
 }
 
 /*
+ * The name of an ADT node is the VALUE of its "name" property, not a string
+ * in the node header: node = {u32 nprops, u32 nchildren, props...} and
+ * prop = {char name[32], u32 size, value}. The node header only holds the two
+ * counts, so c+8 is the first property's *name field* (the literal "name"),
+ * which is why the old inline comparisons never matched.
+ */
+static const char *adt_node_name(const uint8_t *c)
+{
+	uint32_t nprops = *(const uint32_t *)c;
+	const uint8_t *q = c + 8;
+
+	for (uint32_t j = 0; j < nprops; j++) {
+		const char *pn = (const char *)q;
+		uint32_t sz = *(const uint32_t *)(q + 32);
+		if (pn[0] == 'n' && pn[1] == 'a' && pn[2] == 'm' && pn[3] == 'e' && pn[4] == '\0')
+			return (const char *)(q + 36);
+		q += 36 + ((sz + 3) & ~3U);
+	}
+	return (const char *)0;
+}
+
+/*
  * Patch /chosen dram-base/dram-size (u64 properties) in the copied tree so
  * they match the runtime-clamped kernel RAM.
  */
@@ -132,9 +162,9 @@ static void adt_patch_chosen_dram(uintptr_t adt, uint64_t base, uint64_t size)
 	}
 	for (uint32_t i = 0; i < nchildren; i++) {
 		const uint8_t *c = p;
-		const char *name = (const char *)(c + 8);	/* prop 0 is the node name */
+		const char *name = adt_node_name(c);
 
-		if (name[0] == 'c' && name[1] == 'h' && name[2] == 'o' && name[3] == 's' &&
+		if (name && name[0] == 'c' && name[1] == 'h' && name[2] == 'o' && name[3] == 's' &&
 		    name[4] == 'e' && name[5] == 'n' && name[6] == '\0') {
 			uint32_t cnprops = *(const uint32_t *)c;
 			uint8_t *q = (uint8_t *)c + 8;
@@ -176,8 +206,8 @@ static void adt_patch_fbcon(uintptr_t adt, uint64_t fb)
 	}
 	for (uint32_t i = 0; i < nchildren; i++) {
 		const uint8_t *c = p;
-		const char *name = (const char *)(c + 8);
-		if (name[0]=='s'&&name[1]=='w'&&name[2]=='e'&&name[3]=='e'&&name[4]=='t'&&
+		const char *name = adt_node_name(c);
+		if (name && name[0]=='s'&&name[1]=='w'&&name[2]=='e'&&name[3]=='e'&&name[4]=='t'&&
 		    name[5]=='-'&&name[6]=='f'&&name[7]=='b'&&name[8]=='c'&&name[9]=='o'&&
 		    name[10]=='n'&&name[11]=='\0') {
 			uint32_t cnprops = *(const uint32_t *)c;
@@ -185,8 +215,21 @@ static void adt_patch_fbcon(uintptr_t adt, uint64_t fb)
 			for (uint32_t j = 0; j < cnprops; j++) {
 				const char *pn = (const char *)q;
 				uint32_t sz = *(const uint32_t *)(q + 32);
-				if (sz == 16 && pn[0]=='r'&&pn[1]=='e'&&pn[2]=='g'&&pn[3]=='\0')
+				if (sz == 16 && pn[0]=='r'&&pn[1]=='e'&&pn[2]=='g'&&pn[3]=='\0') {
+					/* reg = <base, size>: remember the size, point the
+					 * base at the visible layer. */
+					diag_fbcon_size = ((uint64_t)*(const uint32_t *)(q + 40) << 32) |
+					    (uint64_t)*(const uint32_t *)(q + 36);
+					diag_fbcon_addr = fb;
+					diag_fbcon_found = 1;
 					wr64(q + 36, fb);
+				} else if (sz == 4 && pn[0]=='w'&&pn[1]=='i'&&pn[2]=='d'&&pn[3]=='t'&&pn[4]=='h'&&pn[5]=='\0') {
+					diag_fbcon_w = *(const uint32_t *)(q + 36);
+				} else if (sz == 4 && pn[0]=='h'&&pn[1]=='e'&&pn[2]=='i'&&pn[3]=='g'&&pn[4]=='h'&&pn[5]=='t'&&pn[6]=='\0') {
+					diag_fbcon_h = *(const uint32_t *)(q + 36);
+				} else if (sz == 4 && pn[0]=='s'&&pn[1]=='t'&&pn[2]=='r'&&pn[3]=='i'&&pn[4]=='d'&&pn[5]=='e'&&pn[6]=='\0') {
+					diag_fbcon_stride = *(const uint32_t *)(q + 36);
+				}
 				q += 36 + ((sz + 3) & ~3U);
 			}
 			return;
@@ -229,6 +272,9 @@ static void clamp_memory(uintptr_t dtb, struct payload *p, uintptr_t adt_pa)
 	for (int i = 0; i < n; i++) {
 		if (p->phys_base >= base[i] && p->phys_base < base[i] + size[i]) {
 			uint64_t room = base[i] + size[i] - p->phys_base;
+			diag_bank_base = base[i];
+			diag_bank_size = size[i];
+			diag_room = room;
 			if (room == p->mem_size)
 				return;
 			if (room < 0x8000000 || room > 0x10000000000ULL) {
@@ -379,23 +425,55 @@ const char *loader_boot(uintptr_t dtb)
 	/* The GIC + MEM-bank diagnostics above fill the framebuffer and later lines
 	 * get DROPPED (the console does not scroll), so the jump status was
 	 * invisible. Clear the screen and print a compact boot summary + the jump
-	 * marker so it is unmistakable whether we reach XNU. */
+	 * marker so it is unmistakable whether we reach XNU.
+	 *
+	 * The extra lines are the bring-up diagnostics the clear() used to wipe:
+	 * the real framebuffer geometry, what the ADT's fbcon node says, and the
+	 * memory bank the kernel runs in. */
 	con_clear(RED);
 	con_hex("BOOT phys", p->phys_base);
 	con_hex("BOOT size", p->mem_size);
 	con_hex("BOOT entry", p->entry_va);
 	con_hex("BOOT fb", con_fb_addr());
-		/* The XNU kernel has the early-console address compiled in (patch
-		 * 0081e). If LK ever moves the visible layer, the kernel writes to a
-		 * stale address and its output vanishes - say so on screen instead of
-		 * leaving a blank display to guess at. */
-		if (con_fb_addr() != (uint64_t)XNU_EARLY_FB)
-			con_str("FBCHK", "MISMATCH: XNU 0081e expects another FB");
+	con_hex2("DISP", "fb=", (uint32_t)con_fb_addr(), "pitch=", con_rowbytes());
+	/* The XNU kernel has the early-console address compiled in (patch
+	 * 0081e). If LK ever moves the visible layer, the kernel writes to a
+	 * stale address and its output vanishes - say so on screen instead of
+	 * leaving a blank display to guess at. */
+	if (con_fb_addr() != (uint64_t)XNU_EARLY_FB)
+		con_str("FBCHK", "MISMATCH: XNU 0081e expects another FB");
+	con_hex2("FBCON", "at=", (uint32_t)diag_fbcon_addr, "sz=", (uint32_t)diag_fbcon_size);
+	con_hex2("FBCON", "w=", diag_fbcon_w, "h=", diag_fbcon_h);
+	con_hex2("FBCON", "stride=", diag_fbcon_stride, "ok=", (uint32_t)diag_fbcon_found);
+	con_hex2("MEM", "bank=", (uint32_t)diag_bank_base, "size=", (uint32_t)diag_bank_size);
+	con_hex("MEM room", diag_room);
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
+	con_str("CANARY", "magenta block, bottom-right 64x64");
+
+	/*
+	 * Bring-up canary + pattern fill. The lower two thirds of the screen get
+	 * bands of distinct colours (XNU's early markers live in the top rows and
+	 * in a small block at the bottom-left, so nothing collides), and the
+	 * bottom-right corner gets a magenta block. After the jump:
+	 *   bands + block intact -> XNU never touched the framebuffer (died early)
+	 *   screen black         -> XNU reached the display code and cleared it
+	 *   bands partly eaten   -> we can see exactly which rows XNU wrote
+	 * This is the only way to tell "XNU died before the console" from
+	 * "XNU's console is up but its output goes somewhere else".
+	 */
+	{
+		static const uint32_t cols[8] = {
+			0xff00ff00, 0xff00ffff, 0xffff0000, 0xff0000ff,
+			0xffffff00, 0xff00ff00, 0xff0000ff, 0xffffffff
+		};
+		for (int i = 0; i < 24; i++)
+			con_block(0, 800 + i * 64, FB_W, 64, cols[i & 7]);
+	}
+	con_block(FB_W - 64, FB_H - 64, 64, 64, MAGENTA);
 
 	/*
 	 * DIAG (bring-up): keep the shim diagnostics on screen so they can be
