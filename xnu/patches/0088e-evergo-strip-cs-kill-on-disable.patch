@@ -1,0 +1,35 @@
+From: evergo <evergo@localhost>
+Subject: [PATCH 0088e] evergo: strip CS_HARD/CS_KILL at exec when cs enforcement is disabled
+
+Without a trust cache the pages of Apple-signed binaries never
+validate; launchd's CodeDirectory carries CS_KILL, so the first
+page-in killed init with SIGKILL (CS_KILLED) even with
+cs_enforcement_disable=1.  When both enforcement knobs are off,
+clear CS_HARD/CS_KILL on every execed image so invalid pages only
+taint the process.
+---
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..6f14796 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1404,6 +1404,20 @@ grade:
+ 	if (proc_getcsflags(p) & CS_EXEC_SET_ENFORCEMENT) {
+ 		imgp->ip_csflags |= CS_ENFORCEMENT;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0088e): we run with no trust cache, so pages of Apple-signed
++	 * binaries can never validate; Apple's launchd carries CS_KILL in its
++	 * CodeDirectory, so the first page-in of init killed it with SIGKILL
++	 * (CS_KILLED, namespace 9 code 0xa) even with the
++	 * cs_enforcement_disable boot-arg honored.  When both enforcement knobs
++	 * are off, strip the kill/hard bits from every execed image: invalid
++	 * pages then only taint the process instead of killing it.
++	 */
++	if (!cs_system_enforcement() && !cs_process_enforcement(p)) {
++		imgp->ip_csflags &= ~(CS_HARD | CS_KILL);
++	}
++#endif
+ 	if (proc_getcsflags(p) & CS_EXEC_INHERIT_SIP) {
+ 		if (proc_getcsflags(p) & CS_INSTALLER) {
+ 			imgp->ip_csflags |= CS_INSTALLER;
