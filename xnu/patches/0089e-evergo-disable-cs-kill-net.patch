@@ -1,0 +1,97 @@
+From f0089e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0089e] evergo: disable the whole exec-time code-signing kill net
+
+launchd was still SIGKILLed (CS_KILLED, exec reason namespace 9) after
+0088e.  0088e only stripped CS_HARD/CS_KILL; CS_ENFORCEMENT survived and
+(a) makes mach_loader's initial-page validation fail the whole exec and
+(b) makes process_signature() set vm_map_cs_enforcement(TRUE) so every
+page fault revalidates.  Additionally every failure inside
+process_signature() (SECURITY_POLICY, TASKGATED_OTHER, MACHINE_THREAD,
+launch constraints) SIGKILLs init unconditionally.
+
+With both enforcement knobs off, evergo now:
+  - strips CS_HARD/CS_KILL/CS_ENFORCEMENT at exec,
+  - skips process_signature() entirely,
+  - ignores LC_ENCRYPTION_INFO instead of killing (no FP crypter here),
+  - logs the exec reason namespace/code on late exec failures.
+---
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 6f14796..4ac5181 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1415,7 +1415,11 @@ grade:
+ 	 * pages then only taint the process instead of killing it.
+ 	 */
+ 	if (!cs_system_enforcement() && !cs_process_enforcement(p)) {
+-		imgp->ip_csflags &= ~(CS_HARD | CS_KILL);
++		/* 0089e: also drop CS_ENFORCEMENT: mach_loader's initial-page
++		 * validation turns a tainted page into LOAD_FAILURE while
++		 * CS_ENFORCEMENT is set, and process_signature() would set
++		 * vm_map_cs_enforcement(TRUE) so every fault revalidates. */
++		imgp->ip_csflags &= ~(CS_HARD | CS_KILL | CS_ENFORCEMENT);
+ 	}
+ #endif
+ 	if (proc_getcsflags(p) & CS_EXEC_INHERIT_SIP) {
+@@ -2062,6 +2066,13 @@ badtoolate:
+ 	if (!spawn) {
+ 		{
+ 			assert(exec_failure_reason != OS_REASON_NULL);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			if (exec_failure_reason != OS_REASON_NULL) {
++				printf("SWEET exec: %s: late exec failure: namespace %u code 0x%llx\n",
++				    current_proc()->p_name, exec_failure_reason->osr_namespace,
++				    exec_failure_reason->osr_code);
++			}
++#endif
+ 			if (bootarg_execfailurereports) {
+ 				set_proc_name(imgp, current_proc());
+ 			}
+@@ -7361,6 +7372,23 @@ process_signature(proc_t p, struct image_params *imgp)
+ 	proc_csflags_update(p, imgp->ip_csflags);
+ 	proc_unlock(p);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0089e): with code-signing enforcement disabled there is no
++	 * trust cache, so no Apple-signed binary can ever validate.  Skip the
++	 * whole signature-dependent kill net for every exec: it can only
++	 * SIGKILL init (SECURITY_POLICY / TASKGATED_OTHER / MACHINE_THREAD /
++	 * launch-constraint reasons) and never helps us.  proc flags were just
++	 * updated from ip_csflags with the kill bits already stripped.
++	 */
++	if (!cs_system_enforcement() && !cs_process_enforcement(p)) {
++		printf("SWEET exec: %s: enforcement disabled, signature checks skipped"
++		    " (mac_return %d, cs_error %p)\n",
++		    p->p_name, imgp->ip_mac_return, (void *)imgp->ip_cs_error);
++		return 0;
++	}
++#endif
++
+ 	/* Set the switch_protect flag on the map */
+ 	if (proc_getcsflags(p) & (CS_HARD | CS_KILL)) {
+ 		vm_map_switch_protect(get_task_map(proc_task(p)), TRUE);
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+index 1756185..3867d22 100644
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -1344,6 +1344,20 @@ parse_machfile(
+ 				if (pass != 3) {
+ 					break;
+ 				}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				/*
++				 * evergo (0089e): there is no FairPlay text crypter on
++				 * this platform, so set_code_unprotect() can only fail
++				 * and SIGKILL init with EXEC_EXIT_REASON_FAIRPLAY/DECRYPT.
++				 * With enforcement disabled, ignore the load command
++				 * instead of killing the process.
++				 */
++				if (!cs_process_global_enforcement()) {
++					printf("SWEET mach_loader: %s: LC_ENCRYPTION_INFO ignored (no crypter, enforcement off)\n",
++					    vp->v_name);
++					break;
++				}
++#endif
+ 				ret = set_code_unprotect(
+ 					(struct encryption_info_command *) lcp,
+ 					addr, map, slide, vp, file_offset,
