@@ -22,7 +22,7 @@ An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, socket, struct, subprocess, sys, time, zlib
 
-FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
+FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400   # FB_BASE is overridable with --fb-base
 FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
@@ -152,20 +152,29 @@ def qmp(sock_path, *cmds, pmemsave=None):
 
 
 def main():
+    global FB_BASE
     ap = argparse.ArgumentParser()
     ap.add_argument('payload'); ap.add_argument('outdir')
     ap.add_argument('--secs', type=float, default=20)
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a76')	# ARMv8.2 like Kryo 470, same ID_AA64MMFR0
+    ap.add_argument('--fb-base', type=lambda s: int(s, 0), default=FB_BASE,
+                    help='framebuffer base the kernel writes (sweet 0x9c000000; evergo 0x7d006000)')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
+    ap.add_argument('--font-va', type=lambda s: int(s, 0),
+                    help='VA of _iso_font: take the font from the payload (no llvm-nm needed)')
+    ap.add_argument('--keep-raw', action='store_true', help='keep fb.raw')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     a = ap.parse_args()
+    FB_BASE = a.fb_base
     if a.fail_on_panic and not a.kernel:
         ap.error('--fail-on-panic requires --kernel')
     payload = open(a.payload, 'rb').read()
     font = None
-    if a.kernel:
+    if a.font_va:
+        font = payload_data(payload, a.font_va, 256 * 16)
+    elif a.kernel:
         symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
         fonts = [int(line.split()[0], 16) for line in symbols.splitlines()
                  if line.split()[-1:] == ['_iso_font']]
@@ -215,7 +224,8 @@ def main():
             screen, unknown = decode_screen(raw, font)
             open(f'{out}/fb.txt', 'w').write(screen)
             result = screen_result(screen, unknown)
-        os.unlink(f'{out}/fb.raw')
+        if not a.keep_raw:
+            os.unlink(f'{out}/fb.raw')
     else:
         print(f'qemu exited early: {p.returncode}', file=sys.stderr)
     for f in ('ram.bin',):

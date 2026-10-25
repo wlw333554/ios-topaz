@@ -1,0 +1,40 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -542,9 +542,13 @@
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
+ 	sweet_early_mark(20, "kprintf startup complete");
+-	if (serial_exists) {
+-		sweet_early_disable();
+-	}
++	/*
++	 * Bring-up (0082e): do NOT disable the early console here. The fbcon
++	 * wipes the whole screen when it initialises (see fbcon_init()), which
++	 * used to erase the stage markers above and leave a black display with
++	 * no way to tell how far the kernel got. Keeping the early console alive
++	 * also keeps any later panic visible.
++	 */
+ 
+ 	serialmode = 0;
+ 	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -747,9 +747,13 @@
+ 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+ 	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+ 	fbcon_col = fbcon_row = 0;
+-	for (uint32_t r = 0; r < fbcon_rows; r++) {
+-		fbcon_clear_row(r);
+-	}
++	/*
++	 * Bring-up (0082e): do not wipe the whole screen. The XNU early console
++	 * (sweet_early) draws its stage markers into this same buffer, and the
++	 * full-screen clear used to erase them - the phone then showed nothing
++	 * at all even though the kernel had booted all the way to stage 20.
++	 * fbcon_clear_row() still clears each row as the fbcon uses it.
++	 */
+ }
+ 
+ static unsigned int
