@@ -78,9 +78,13 @@
  * never writes UTRLBA/UTRLRSR or issues SCSI, because writing a wrong MTK
  * register map could permanently brick the UFS device. Set TAKEOVER=1 only
  * after a sane dump (cap != 0/0xffffffff, HCS link-up). */
+#ifndef HAS_UFS_PROBE		/* -DHAS_UFS_PROBE=1 builds the diagnostic image */
 #define HAS_UFS_PROBE		0
+#endif
 #define UFS_PROBE_BASE		0x11270000UL
+#ifndef UFS_PROBE_TAKEOVER	/* -DUFS_PROBE_TAKEOVER=1 for the SCSI probe */
 #define UFS_PROBE_TAKEOVER	0
+#endif
 
 /* MTK watchdog (TOP_RGU). LK arms it and XNU has no driver to kick it, so a
  * hang or panic resets the phone ~15s in, wiping the panic screen before it

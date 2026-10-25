@@ -151,13 +151,6 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	return *status_out ? 4 : 0;
 }
 
-static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
-{
-	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
-	uint32_t ocs, st;
-	return scsi(0, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
-}
-
 static uint64_t le64(const uint8_t *p)
 {
 	uint64_t v = 0;
@@ -166,10 +159,18 @@ static uint64_t le64(const uint8_t *p)
 	return v;
 }
 
-/* Name the filesystem whose superblock starts at block lba (f2fs/ext4). */
-static const char *fs_type(uint32_t lba)
+/* Name the filesystem whose superblock starts 1024 bytes into a partition
+ * that begins at byte offset part_byte (device blocks of blk bytes). */
+static const char *fs_type(uint8_t lun, uint64_t part_byte, uint32_t blk)
 {
-	if (read_blocks(lba, 1, data))
+	if (part_byte % blk)
+		return "unaligned";
+	uint8_t rd[10] = { 0x28, 0,
+	    (uint8_t)(part_byte / blk >> 24), (uint8_t)(part_byte / blk >> 16),
+	    (uint8_t)(part_byte / blk >> 8), (uint8_t)(part_byte / blk),
+	    0, 0, 1, 0 };
+	uint32_t ocs, st;
+	if (scsi(lun, rd, sizeof(rd), data, blk, &ocs, &st))
 		return "read error";
 	const uint8_t *sb = data + 1024;
 	if (sb[0] == 0x10 && sb[1] == 0x20 && sb[2] == 0xf5 && sb[3] == 0xf2)
@@ -179,33 +180,83 @@ static const char *fs_type(uint32_t lba)
 	return "other";
 }
 
-/* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
-static void list_partitions(uint32_t entry_lba, uint32_t nent)
+/* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB.
+ * The entry array starts at byte offset ent_byte on the device (the table's
+ * sector size and the device's logical block size may differ). */
+static void list_partitions(uint8_t lun, uint64_t ent_byte, uint32_t nent, uint32_t gsec, uint32_t blk)
 {
-	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
-	uint32_t blocks = (nent * 128 + BLOCK - 1) / BLOCK;
-	if (read_blocks(entry_lba, blocks, ents)) {
-		con_str("UFS PART", "read error");
+	static uint8_t ents[32 * 1024] __attribute__((aligned(4096)));
+	uint64_t first_blk = ent_byte / blk;
+	uint32_t skew = (uint32_t)(ent_byte % blk);
+	uint32_t blocks = (skew + nent * 128 + blk - 1) / blk;
+	if (blocks * blk > sizeof(ents))
+		blocks = sizeof(ents) / blk;
+	uint8_t rd[10] = { 0x28, 0,
+	    (uint8_t)(first_blk >> 24), (uint8_t)(first_blk >> 16),
+	    (uint8_t)(first_blk >> 8), (uint8_t)first_blk,
+	    0, (uint8_t)(blocks >> 8), (uint8_t)blocks, 0 };
+	uint32_t ocs, st;
+	uint32_t rc = scsi(lun, rd, sizeof(rd), ents, blocks * blk, &ocs, &st);
+	con_hex2("UFS PART", "rc=", rc, "blocks=", blocks);
+	if (rc)
 		return;
-	}
+	const uint8_t *base = ents + skew;
 	for (uint32_t i = 0; i < nent; i++) {
-		const uint8_t *e = ents + i * 128;
+		const uint8_t *e = base + i * 128;
 		uint64_t first = le64(e + 32), last = le64(e + 40);
-		if (!first)
+		if (!first || last < first)
 			continue;
 		char name[17];
 		for (int c = 0; c < 16; c++) {
-			uint8_t ch = e[56 + 2 * c];
+			uint8_t ch = e[56 + 2 * c] & 0x7f;
 			name[c] = (ch >= 32 && ch < 127) ? ch : (ch ? '?' : 0);
 		}
 		name[16] = 0;
-		if (((last - first + 1) >> 8) < 64)	/* keep the screen to the big ones */
+		uint64_t bytes = (last - first + 1) * gsec;
+		if (bytes < (64ull << 20))	/* keep the screen to the big ones */
 			continue;
-		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
+		con_hex2(name, "lba=", (uint32_t)first,
+		    "MiB=", (uint32_t)(bytes >> 20));
 		if (!__builtin_strcmp(name, "userdata") || !__builtin_strcmp(name, "cust") ||
 		    !__builtin_strcmp(name, "cache"))
-			con_str(" fs", fs_type((uint32_t)first));
+			con_str(" fs", fs_type(lun, first * gsec, blk));
 	}
+}
+
+/*
+ * Is this QEMU's virt machine? The probe reads a hard-coded MMIO base
+ * (UFS_PROBE_BASE); nothing answers there under QEMU and the read would abort.
+ *
+ * Deliberately fail-open: only a positive "linux,dummy-virt" match suppresses
+ * the probe. The phone's blob is not even a standard FDT (its magic is MTK's
+ * 0xd7b7ab1e, not 0xd00dfeed), so a check that required a well-formed FDT would
+ * silently skip the dump on the one machine we care about.
+ */
+int
+ufs_is_qemu(uintptr_t fdt)
+{
+	static const char want[] = "linux,dummy-virt";
+
+	if (!fdt)
+		return 0;
+	if (__builtin_bswap32(*(volatile uint32_t *)fdt) != 0xd00dfeedu)
+		return 0;			/* not an FDT at all: assume real hw */
+	uint32_t total = __builtin_bswap32(*(volatile uint32_t *)(fdt + 4));
+	if (total < 64 || total > (16u << 20))
+		return 0;
+	const char *b = (const char *)fdt;
+	unsigned n = 0;
+	while (want[n])
+		n++;
+
+	for (uint32_t i = 0; i + n <= total; i++) {
+		unsigned k = 0;
+		while (k < n && b[i + k] == want[k])
+			k++;
+		if (k == n)
+			return 1;
+	}
+	return 0;
 }
 
 void test_ufs(void)
@@ -254,40 +305,81 @@ void test_ufs(void)
 		return;
 	}
 
-	uint32_t ocs = 0, st = 0, rc;
+	/*
+	 * evergo ground truth (measured): LUN 0 is a 4 MiB boot LUN full of
+	 * 0xff - no GPT. The partition table with userdata lives on another
+	 * LUN, so scan them all (0..7): TUR, capacity, first 8 KiB, GPT.
+	 */
 	static const uint8_t tur[6] = { 0x00 };
-	/* A first command may report a unit attention; retry a few times. */
-	for (int i = 0; i < 3; i++) {
-		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-		con_hex2("UFS TUR", "rc=", rc, "ocs/st=", ocs << 8 | st);
-		if (!rc)
-			break;
-	}
-
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
-	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
-	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
-	if (!rc)
-		con_hex2("UFS LUN0", "lastlba=", be32(data), "blk=", be32(data + 4));
+	for (uint8_t lun = 0; lun < 8; lun++) {
+		uint32_t ocs = 0, st = 0, rc;
+		/* A first command on a LUN may report a unit attention; retry. */
+		for (int i = 0; i < 3; i++) {
+			rc = scsi(lun, tur, sizeof(tur), 0, 0, &ocs, &st);
+			if (!rc)
+				break;
+		}
+		con_hex2("UFS LUN", "n=", lun, "tur rc=", rc);
+		if (rc)
+			continue;		/* no such / not ready LUN */
 
-	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
-	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
-	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
-	con_hex2("UFS READ", "rc=", rc, "ocs/st=", ocs << 8 | st);
-	if (rc)
-		return;
-	con_hex2("UFS MBR", "sig=", data[510] | data[511] << 8, "type=", data[450]);
-	const uint8_t *gpt = data + BLOCK;
-	char sig[9];
-	for (int i = 0; i < 8; i++)
-		sig[i] = (gpt[i] >= 32 && gpt[i] < 127) ? gpt[i] : '.';
-	sig[8] = 0;
-	con_str("UFS GPT", sig);
-	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16, esz = gpt[84] | gpt[85] << 8;
-	uint32_t elba = gpt[72] | gpt[73] << 8;
-	con_hex2("UFS GPT", "entries=", nent, "lba=", elba);
-	if (esz != 128 || nent > 128)
-		return;
-	list_partitions(elba, nent);
+		rc = scsi(lun, cap10, sizeof(cap10), data, 8, &ocs, &st);
+		if (rc) {
+			con_hex2("UFS CAP", "n=", lun, "rc=", rc);
+			continue;
+		}
+		uint32_t lastlba = be32(data);
+		uint32_t blk = be32(data + 4);
+		con_hex2("UFS LUN", "n=", lun, "lastlba=", lastlba);
+		con_hex2("UFS LUN", "blk=", blk,
+		    "MiB=", (uint32_t)(((uint64_t)lastlba + 1) * blk >> 20));
+		if (!blk || blk > 8192u)
+			blk = 4096u;
+
+		/* The first 8 KiB in the device's own blocks: the GPT header
+		 * sits at LBA 1 of the table's sector size, which may be 512
+		 * bytes even when UFS reports 4 KiB blocks (then it is at byte
+		 * 512, inside block 0). */
+		uint32_t nblk = 8192u / blk;
+		uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		rd10[7] = nblk >> 8;
+		rd10[8] = nblk & 0xff;
+		rc = scsi(lun, rd10, sizeof(rd10), data, nblk * blk, &ocs, &st);
+		con_hex2("UFS READ", "n=", lun, "rc=", rc);
+		if (rc)
+			continue;
+
+		const uint8_t *gpt = 0;
+		uint32_t gsec = blk;
+		for (uint32_t off = 0; off <= 4096u; off += 512u) {
+			if (data[off] == 'E' && data[off + 1] == 'F' &&
+			    data[off + 2] == 'I' && data[off + 3] == ' ' &&
+			    data[off + 4] == 'P') {
+				gpt = data + off;
+				gsec = (off == 512u) ? 512u : blk;
+				break;
+			}
+		}
+		if (!gpt) {
+			con_hex2("UFS", "n=", lun, "b0=", be32(data));
+			continue;
+		}
+
+		char sig[9];
+		for (int i = 0; i < 8; i++)
+			sig[i] = (gpt[i] >= 32 && gpt[i] < 127) ? gpt[i] : '.';
+		sig[8] = 0;
+		con_str("UFS GPT", sig);
+		con_hex2("UFS GPT", "lun=", lun, "at=", (uint32_t)(gpt - data));
+		con_hex2("UFS GPT", "secsize=", gsec, "blk=", blk);
+		uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16;
+		uint32_t esz = gpt[84] | gpt[85] << 8;
+		uint32_t elba = gpt[72] | gpt[73] << 8 | gpt[74] << 16 | gpt[75] << 24;
+		con_hex2("UFS GPT", "entries=", nent, "esz=", esz);
+		con_hex2("UFS GPT", "entlba=", elba, "sec=", gsec);
+		if (esz == 128 && nent && nent <= 128)
+			list_partitions(lun, (uint64_t)elba * gsec, nent, gsec, blk);
+	}
 #endif /* UFS_PROBE_TAKEOVER */
 }
