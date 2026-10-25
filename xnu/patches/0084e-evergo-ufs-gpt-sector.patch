@@ -1,0 +1,109 @@
+From: evergo <evergo@localhost>
+Subject: [PATCH 0084e] evergo: UFS GPT header/entries for 512-byte-sector tables
+
+The GPT the bootloader flashes uses 512-byte sectors while UFS
+reports 4 KiB logical blocks, so the header sits at byte 512
+(device block 0), not device block 1. Read block 0, accept the
+header at either offset, and convert partition LBAs through the
+detected sector size. Hexdump the probed block for diagnosis.
+---
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 93be89f..4f5c486 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -299,33 +299,73 @@ ufs_sync_cache(void)
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++/*
++ * Locate the GPT regardless of the sector size the table was written with.
++ * UFS reports 4 KiB logical blocks, but the partition table the bootloader
++ * flashes may use 512-byte sectors, which puts the header at byte 512 -
++ * inside device block 0 - not at device block 1 (measured on evergo: the
++ * block-1 read succeeded but carried no "EFI PART").
++ */
+ static int
+ ufs_find_partition(const char *want)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+-	int error = ufs_read_blocks(1, 1);
++	const uint8_t *hdr = NULL;
++	unsigned gpt_sec = 0;
++	int error = ufs_read_blocks(0, 1);
+ 	if (error) {
+ 		return error;
+ 	}
+-	if (memcmp(b, "EFI PART", 8) != 0) {
++	printf("SWEET UFS: LUN %u blk0 %02x%02x%02x%02x %02x%02x%02x%02x"
++	    " @512 %02x%02x%02x%02x %02x%02x%02x%02x\n",
++	    su.lun, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
++	    b[512], b[513], b[514], b[515], b[516], b[517], b[518], b[519]);
++	if (memcmp(b + 512, "EFI PART", 8) == 0) {
++		hdr = b + 512;
++		gpt_sec = 512;
++	} else if (memcmp(b, "EFI PART", 8) == 0) {
++		hdr = b;
++		gpt_sec = 4096;
++	} else {
++		error = ufs_read_blocks(1, 1);
++		if (error) {
++			return error;
++		}
++		if (memcmp(b, "EFI PART", 8) == 0) {
++			hdr = b;
++			gpt_sec = 4096;
++		}
++	}
++	if (hdr == NULL) {
+ 		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
+ 		return ENXIO;
+ 	}
++	printf("SWEET UFS: GPT on LUN %u, %u-byte sectors\n", su.lun, gpt_sec);
++
+ 	uint64_t entry_lba;
+ 	uint32_t nent, esz;
+-	memcpy(&entry_lba, b + 72, 8);
+-	memcpy(&nent, b + 80, 4);
+-	memcpy(&esz, b + 84, 4);
++	memcpy(&entry_lba, hdr + 72, 8);
++	memcpy(&nent, hdr + 80, 4);
++	memcpy(&esz, hdr + 84, 4);
+ 	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
+ 		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+ 		return ENXIO;
+ 	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	/*
++	 * The entry array starts at entry_lba * gpt_sec bytes, which need not be
++	 * 4 KiB aligned; read the covering device blocks and index into them.
++	 */
++	uint64_t ent_byte = entry_lba * (uint64_t)gpt_sec;
++	uint32_t skew = (uint32_t)(ent_byte & (UFS_BLOCK - 1));
++	uint32_t span = skew + nent * esz;
++	error = ufs_read_blocks(ent_byte / UFS_BLOCK,
++	    (span + UFS_BLOCK - 1) / UFS_BLOCK);
+ 	if (error) {
+ 		return error;
+ 	}
++	const uint8_t *entries = b + skew;
+ 	for (uint32_t i = 0; i < nent; i++) {
+-		const uint8_t *e = b + i * esz;
++		const uint8_t *e = entries + i * esz;
+ 		char name[37];
+ 		unsigned c;
+ 		for (c = 0; c < 36; c++) {
+@@ -345,8 +385,12 @@ ufs_find_partition(const char *want)
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		/* partition bounds are GPT sectors; the device reads 4 KiB blocks */
++		su.first_block = first * gpt_sec / UFS_BLOCK;
++		su.nblocks = (last - first + 1) * gpt_sec / UFS_BLOCK;
++		if (su.nblocks == 0) {
++			return ENXIO;
++		}
+ 		return 0;
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
