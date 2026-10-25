@@ -13,6 +13,12 @@
 #define HAS_PSTORE 0
 #endif
 
+/* Print the zone's content (the PREVIOUS boot's kernel log) with the 8x16
+ * font at 1:1, below y_px. Returns the number of lines printed. This is a
+ * READER: the shim never writes to the zone, so the kernel's log (written by
+ * patch 0083e) survives untouched. */
+int plog_dump(uint64_t base, uint64_t size, int y_px);
+
 #if HAS_PSTORE
 void plog_init(void);
 void plog_putc(char c);

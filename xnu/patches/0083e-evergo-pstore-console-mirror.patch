@@ -1,0 +1,101 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -713,7 +713,11 @@
+ 
+ extern unsigned char iso_font[256 * 16];
+ 
+-#define FBCON_SCALE     2
++/* Bring-up (0083e): scale 1 -> the fbcon then holds 2400/16 = 150 rows
++ * instead of 75, so the whole boot log fits on the panel. The fbcon is a
++ * ring buffer (fbcon_row = (row+1) % fbcon_rows), so with scale 2 the
++ * early lines were scrolled away before we could read them. */
++#define FBCON_SCALE     1
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
+ 
+@@ -756,6 +760,75 @@
+ 	 */
+ }
+ 
++/*
++ * Persistent-RAM console mirror (Linux ramoops layout, sig "DBGC"). The zone
++ * is described by /chosen/sweet-pstore = <base, size>; the shim prints its
++ * content on the next boot, so the full kernel log survives the fbcon's
++ * ring buffer. The zone lives outside the kernel's RAM window, so the VM can
++ * never touch it - we map it ourselves the same way the fbcon maps the
++ * framebuffer.
++ */
++#define PSTORE_SIG 0x43474244U	/* Linux PERSISTENT_RAM_SIG */
++static uint64_t pstore_base, pstore_size;
++static volatile uint8_t *pstore_buf;
++static volatile uint32_t *pstore_hdr;
++static int pstore_ready;
++
++static void
++pstore_console_init(void)
++{
++	DTEntry entry;
++	uint64_t const *reg;
++	unsigned int size;
++
++	if (pstore_ready) {
++		return;
++	}
++	pstore_ready = 1;
++	if (SecureDTLookupEntry(NULL, "/chosen", &entry) != kSuccess) {
++		return;
++	}
++	if (SecureDTGetProperty(entry, "sweet-pstore", (void const **)&reg, &size) != kSuccess ||
++	    size < 16 || !reg[0] || reg[1] < 4096) {
++		return;
++	}
++	pstore_base = reg[0];
++	pstore_size = reg[1];
++	/* map it like the framebuffer: Normal-NC, uncached */
++	void *va = ml_io_map_wcomb(pstore_base, pstore_size);
++	if (va == NULL) {
++		pstore_base = 0;
++		return;
++	}
++	pstore_hdr = (volatile uint32_t *)va;
++	pstore_buf = (volatile uint8_t *)((uint8_t *)va + 12);
++	if (pstore_hdr[0] != PSTORE_SIG) {
++		pstore_hdr[0] = PSTORE_SIG;
++		pstore_hdr[1] = 0;	/* start */
++		pstore_hdr[2] = 0;	/* size  */
++	}
++}
++
++static void
++pstore_console_putc(char c)
++{
++	uint32_t cap, start, len, off;
++
++	if (!pstore_buf) {
++		return;
++	}
++	cap = (uint32_t)(pstore_size - 12);
++	start = pstore_hdr[1];
++	len = pstore_hdr[2];
++	off = (start + len) % cap;
++	pstore_buf[off] = (uint8_t)c;
++	if (len < cap) {
++		pstore_hdr[2] = len + 1;
++	} else {
++		pstore_hdr[1] = (start + 1) % cap;	/* full: drop the oldest */
++	}
++}
++
+ static unsigned int
+ fbcon_transmit_ready(void)
+ {
+@@ -765,6 +838,8 @@
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++	pstore_console_init();
++	pstore_console_putc((char)c);
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;

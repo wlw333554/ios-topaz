@@ -67,6 +67,14 @@ QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'evergo boot manifest').digest()
+# Persistent-RAM console zone (Linux ramoops layout, sig "DBGC").
+# 256 KiB in bank0, 4 MiB below the framebuffer block: outside the kernel's RAM
+# window, so the VM can never touch it. The kernel mirrors the console here
+# (patch 0083e) and the shim prints the previous boot's log from it.
+PSTORE_BASE = 0x7b000000
+PSTORE_SIZE = 0x00040000
+# Build marker (kernel sha256 prefix), injected by build_evergo_zig.py.
+BUILD_ID = os.environ.get('EVERGO_BUILD_ID', 'dev')
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -115,12 +123,20 @@ def build(seed=None, qemu=False, highmem=False, native=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('firmware-version', cstr('evergo-shim')),
-        ('system-firmware-version', cstr('evergo-shim')),
+        # The kernel prints this as "iBoot version: %.128s", so it doubles
+        # as a build marker: the phone screen then says which image ran.
+        ('firmware-version', cstr('evergo-shim-' + BUILD_ID)),
+        ('system-firmware-version', cstr('evergo-shim-' + BUILD_ID)),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
+        # Persistent-RAM console zone (Linux ramoops layout): the kernel's fbcon
+        # mirrors every console character here (patch 0083e) and the shim prints
+        # the previous boot's log from it. It lives in bank0 BELOW the kernel's
+        # RAM window, so the VM can never touch it. Both the kernel and the shim
+        # read the address from here, so there is a single source of truth.
+        ('sweet-pstore', u64(PSTORE_BASE, PSTORE_SIZE)),
         # libimg4 (cryptexd) aborts "failed to get crypto algorithm" without
         # it; real A11+ device trees say sha2-384.
         ('crypto-hash-method', cstr('sha2-384')),
@@ -163,7 +179,12 @@ def build(seed=None, qemu=False, highmem=False, native=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', (cstr('arm,cortex-a76') if big else cstr('arm,cortex-a55')) + cstr('ARM,v8')),
+            # 'qcom,kryo470' must stay: patches 0018 (boot CPU driver) and 0038
+            # (AppleKeyStore) match their IONameMatch on it, so without it the
+            # CPU nub never appears and the IOKit matching never completes -
+            # the boot thread then waits forever (kernel idle, no more output).
+            ('compatible', (cstr('mediatek,mt6833-cpu') if big else cstr('mediatek,mt6833-cpu'))
+                          + cstr('qcom,kryo470') + cstr('ARM,v8')),
             ('reg', u32(core if qemu else (0x100 | (core - 6) if big else core))),  # MPIDR Aff1:Aff0
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology

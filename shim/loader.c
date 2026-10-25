@@ -16,6 +16,7 @@
 #include "device.h"
 #include "fdt.h"
 #include "loader.h"
+#include "plog.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -142,6 +143,53 @@ static const char *adt_node_name(const uint8_t *c)
 		q += 36 + ((sz + 3) & ~3U);
 	}
 	return (const char *)0;
+}
+
+/*
+ * Read a 16-byte (two u64) property of /chosen from the ADT. The kernel gets
+ * the same value from the same property, so the persistent-RAM console zone
+ * has one source of truth.
+ */
+static int adt_get_chosen_u64x2(uintptr_t adt, const char *prop, uint64_t *a, uint64_t *b)
+{
+	const uint8_t *root = (const uint8_t *)adt;
+	uint32_t nchildren = *(const uint32_t *)(root + 4);
+	const uint8_t *p = root + 8;
+	uint32_t nprops = *(const uint32_t *)root;
+	uint32_t plen = 0;
+	while (prop[plen])
+		plen++;
+
+	for (uint32_t i = 0; i < nprops; i++) {
+		uint32_t sz = *(const uint32_t *)(p + 32);
+		p += 36 + ((sz + 3) & ~3U);
+	}
+	for (uint32_t i = 0; i < nchildren; i++) {
+		const uint8_t *c = p;
+		const char *name = adt_node_name(c);
+
+		if (name && name[0] == 'c' && name[1] == 'h' && name[2] == 'o' && name[3] == 's' &&
+		    name[4] == 'e' && name[5] == 'n' && name[6] == '\0') {
+			uint32_t cnprops = *(const uint32_t *)c;
+			uint8_t *q = (uint8_t *)c + 8;
+			for (uint32_t j = 0; j < cnprops; j++) {
+				const char *pn = (const char *)q;
+				uint32_t sz = *(const uint32_t *)(q + 32);
+				int match = (sz >= 16);
+				for (uint32_t k = 0; match && k < plen; k++)
+					match = (pn[k] == prop[k]);
+				if (match && pn[plen] == '\0') {
+					*a = *(const uint64_t *)(q + 36);
+					*b = *(const uint64_t *)(q + 44);
+					return 1;
+				}
+				q += 36 + ((sz + 3) & ~3U);
+			}
+			return 0;
+		}
+		p += adt_node_size(c);
+	}
+	return 0;
 }
 
 /*
@@ -431,6 +479,10 @@ const char *loader_boot(uintptr_t dtb)
 	 * the real framebuffer geometry, what the ADT's fbcon node says, and the
 	 * memory bank the kernel runs in. */
 	con_clear(RED);
+#ifndef EVERGO_BUILD_ID
+#define EVERGO_BUILD_ID "dev"
+#endif
+	con_str("BUILD", EVERGO_BUILD_ID);
 	con_hex("BOOT phys", p->phys_base);
 	con_hex("BOOT size", p->mem_size);
 	con_hex("BOOT entry", p->entry_va);
@@ -453,6 +505,21 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 	con_str("CANARY", "magenta block, bottom-right 64x64");
+
+	/*
+	 * Previous boot's kernel log: the kernel's fbcon mirrored every console
+	 * character into the persistent-RAM zone (patch 0083e), and the fbcon's own
+	 * ring buffer would have scrolled most of it away. Print it below the
+	 * summary with the 1:1 font (the shim console is 3x = 45 columns).
+	 */
+	{
+		uint64_t ps_base = 0, ps_size = 0;
+		if (adt_get_chosen_u64x2(adt_pa, "sweet-pstore", &ps_base, &ps_size)) {
+			int n = plog_dump(ps_base, ps_size, 768);
+			if (n)
+				con_hex("PREVLOG", (uint64_t)n);
+		}
+	}
 
 	/*
 	 * Bring-up canary + pattern fill. The lower two thirds of the screen get
