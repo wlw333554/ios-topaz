@@ -1,0 +1,53 @@
+From: evergo <evergo@localhost>
+Subject: [PATCH 0086e] evergo: mount a read-only root with a dirty journal, journal-less
+
+hfs_early_journal_init() excluded MNT_ROOTFS from its read-only
+journal_is_clean() gate, so a read-only root ran journal_open()
+-> replay_journal() and wrote to the (read-only) UFS device:
+do_jnl_io: strategy err 0x1e (EROFS), hfs_mountfs error 22,
+cannot mount root.  Drop the exclusion and, on a dirty journal,
+continue without a journal instead of failing; the RO mount path
+in hfs_MountHFSPlusVolume() already copes with that.
+---
+diff --git a/bsd/sweet_hfs/core/hfs_vfsutils.c b/bsd/sweet_hfs/core/hfs_vfsutils.c
+index 5cd3dd1..9556c95 100644
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -2554,10 +2554,16 @@ hfs_early_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 	hfsmp->jnl_start = jib_offset / SWAP_BE32(vhp->blockSize);
+ 	hfsmp->jnl_size  = jib_size;
+ 
+-	if ((hfsmp->hfs_flags & HFS_READ_ONLY) && (vfs_flags(hfsmp->hfs_mp) & MNT_ROOTFS) == 0) {
+-	    // if the file system is read-only, check if the journal is empty.
+-	    // if it is, then we can allow the mount.  otherwise we have to
+-	    // return failure.
++	if (hfsmp->hfs_flags & HFS_READ_ONLY) {
++	    /*
++	     * evergo (0086e): the MNT_ROOTFS exclusion above made a read-only
++	     * root skip this gate, so journal_open() ran replay_journal() and
++	     * wrote to our read-only UFS device (do_jnl_io: strategy err 0x1e,
++	     * hfs_mountfs error 22).  Treat the root like any other read-only
++	     * volume, and when the journal is dirty simply mount without a
++	     * journal instead of failing: hfs_MountHFSPlusVolume() already
++	     * handles a journaled volume mounted read-only with no journal.
++	     */
+ 	    retval = journal_is_clean(hfsmp->jvp,
+ 				      jib_offset + embeddedOffset,
+ 				      jib_size,
+@@ -2567,12 +2573,12 @@ hfs_early_journal_init(struct hfsmount *hfsmp, HFSPlusVolumeHeader *vhp,
+ 	    hfsmp->jnl = NULL;
+ 
+ 	    buf_brelse(jinfo_bp);
++	    jinfo_bp = NULL;
+ 
+ 	    if (retval) {
+-		    const char *name = vnode_getname_printable(devvp);
+-		    printf("hfs: early journal init: volume on %s is read-only and journal is dirty.  Can not mount volume.\n",
+-		    name);
+-		    vnode_putname_printable(name);
++		    printf("hfs: early journal init: %s is read-only with a dirty journal; continuing without one\n",
++		    dev_name);
++		    retval = 0;
+ 	    }
+ 
+ 	    goto cleanup_dev_name;
