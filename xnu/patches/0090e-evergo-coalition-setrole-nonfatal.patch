@@ -1,0 +1,89 @@
+From: evergo <evergo@localhost>
+Subject: [PATCH 0090e] evergo: do not panic when a spawned task is not in the requested jetsam coalition
+
+posix_spawn() with coalition attributes - what launchd uses for every
+daemon - resolves the requested coalition ids in kern_exec.c, forks with
+them, and then calls coalitions_set_roles() to set the new task's role.
+But task_create_internal() only adopts the task into those coalitions
+when coalitions_adopt_task() succeeds; if that fails (the coalition was
+already reaped or terminated, or the task already carries one of that
+type) the task stays without one, and the per-type set_taskrole then
+trips:
+
+    coalition.c:1031 assertion failed: tas->coaition[COALITION_TYPE_JETSAM]==coal
+
+kern_exec.c:3756 says the same thing in a comment ("also the call to
+coalitions_set_roles will panic").  On a real device the coalitions are
+always healthy; during bring-up, where daemons crash and launchd reaps
+their coalitions, they are not.
+
+Make both steps non-fatal: coalitions_set_roles() skips types the task
+is not actually a member of, and i_coal_jetsam_set_taskrole() reports a
+mismatch instead of asserting.  A task that ends up without a jetsam
+role only loses jetsam accounting; the process itself still runs.
+---
+diff --git a/osfmk/kern/coalition.c b/osfmk/kern/coalition.c
+--- a/osfmk/kern/coalition.c
++++ b/osfmk/kern/coalition.c
+@@ -1028,7 +1028,24 @@
+ 	struct i_jetsam_coalition *cj;
+ 	queue_t q = NULL;
+ 	assert(coal && coal->type == COALITION_TYPE_JETSAM);
+-	assert(task->coalition[COALITION_TYPE_JETSAM] == coal);
++	/*
++	 * evergo (0090e): this assertion panicked during bring-up:
++	 *   coalition.c:1031 assertion failed:
++	 *   tas->coaition[COALITION_TYPE_JETSAM]==coal
++	 * A spawned task can get here without ever having been adopted into
++	 * coal, because coalitions_adopt_task() in task_create_internal()
++	 * gave up on it (the coalition was reaped or terminated, or the task
++	 * already carried one of that type).  XNU's own comment at
++	 * kern_exec.c:3756 warns about exactly this ("also the call to
++	 * coalitions_set_roles will panic").  Report and skip instead: a task
++	 * without a jetsam role only loses jetsam accounting, it still runs.
++	 */
++	if (task->coalition[COALITION_TYPE_JETSAM] != coal) {
++		printf("coalition: set_taskrole: pid %d is not in jetsam "
++		    "coalition id:%lld, skipping role %d\n", task_pid(task),
++		    coal->id, role);
++		return KERN_SUCCESS;
++	}
+ 
+ 	cj = &coal->j;
+ 
+@@ -1853,6 +1870,18 @@
+ 	}
+ }
+ 
++		/*
++		 * evergo (0090e): only set a role in a coalition this task
++		 * actually joined.  task_create_internal() may have failed to
++		 * adopt it, and then the per-type set_taskrole would trip its
++		 * assertion and panic the kernel.
++		 */
++		if (task->coalition[i] != coalitions[i]) {
++			printf("coalitions_set_roles: pid %d not a member of %s "
++			    "coalition id:%lld, skipping\n", task_pid(task),
++			    coal_type_str(i), coalitions[i]->id);
++			continue;
++		}
+ /*
+  * coalitions_set_roles
+  * for each type of coalition, if the task is a member of a coalition of
+@@ -1873,7 +1902,15 @@
+ 		coalition_lock(coalitions[i]);
+ 		kr = coal_call(coalitions[i], set_taskrole, task, roles[i]);
+ 		coalition_unlock(coalitions[i]);
+-		assert(kr == KERN_SUCCESS);
++		/*
++		 * evergo (0090e): an assert here turns any role failure into a
++		 * kernel panic on a development build.  Report instead.
++		 */
++		if (kr != KERN_SUCCESS) {
++			printf("coalitions_set_roles: pid %d set_taskrole failed "
++			    "for %s coalition id:%lld (kr %d)\n", task_pid(task),
++			    coal_type_str(i), coalitions[i]->id, kr);
++		}
+ 	}
+ 
+ 	return kr;

@@ -590,6 +590,29 @@ void shim_main(uint64_t dtb)
 	 */
 	test_gic();
 	secondary_gicr_prepare();
+#if HAS_UFS_PROBE
+	/*
+	 * UFS-diagnostic image: read the UFSHCI state the bootloader handed us
+	 * BEFORE anything writes to the controller, and hold it on screen. This is
+	 * the only way to tell "LK left UFS running" from "LK powered it down",
+	 * and those two need completely different fixes in XNU's driver.
+	 *
+	 * Read-only (UFS_PROBE_TAKEOVER is 0 in the device header). The watchdog is
+	 * already disabled above, so the dump stays on the panel until the reset
+	 * below. Skipped only under QEMU, where the MMIO base does not exist.
+	 */
+	if (!ufs_is_qemu(dtb)) {
+		stage = "ufs";
+		test_ufs();
+		con_skip();
+		con_str("UFS", "probe done, reset in ~3 min");
+		delay_ms(180000);
+		reset(20);
+	} else {
+		con_str("UFS", "QEMU virt detected: probe skipped");
+	}
+#endif
+
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
@@ -599,17 +622,6 @@ void shim_main(uint64_t dtb)
 	 * the long diagnostics below). Only reached when loader_boot RETURNS. */
 	for (;;)
 		__asm__ volatile("wfi");
-
-#if HAS_UFS_PROBE
-	/* No payload: probe the internal UFS while the MMU is still off. */
-	stage = "ufs";
-	test_ufs();
-	con_skip();
-	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
-	con_str("UFS", "probe done, reset in ~3 min");
-	delay_ms(180000);
-	reset(20);
-#endif
 
 	stage = "fill off";
 	uint64_t fill_off = ticks_fill(RED);

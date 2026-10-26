@@ -508,17 +508,22 @@ const char *loader_boot(uintptr_t dtb)
 
 	/*
 	 * Previous boot's kernel log: the kernel's fbcon mirrored every console
-	 * character into the persistent-RAM zone (patch 0083e), and the fbcon's own
-	 * ring buffer would have scrolled most of it away. Print it below the
-	 * summary with the 1:1 font (the shim console is 3x = 45 columns).
+	 * character into the persistent-RAM zone (patch 0083e), and the fbcon's
+	 * own ring buffer would have scrolled most of it away. Print the TAIL
+	 * below the summary at 2x so it can be read off the panel without a
+	 * camera; if that boot panicked, hold it for transcription first.
 	 */
+	/* How long a panicked previous boot's log is held on screen for
+	 * transcription before the jump to XNU (seconds). */
+	#ifndef PLOG_HOLD_SECONDS
+	#define PLOG_HOLD_SECONDS	120
+	#endif
+	
+	int prev_rows = 0;
 	{
 		uint64_t ps_base = 0, ps_size = 0;
-		if (adt_get_chosen_u64x2(adt_pa, "sweet-pstore", &ps_base, &ps_size)) {
-			int n = plog_dump(ps_base, ps_size, 768);
-			if (n)
-				con_hex("PREVLOG", (uint64_t)n);
-		}
+		if (adt_get_chosen_u64x2(adt_pa, "sweet-pstore", &ps_base, &ps_size))
+			prev_rows = plog_dump(ps_base, ps_size, 800);
 	}
 
 	/*
@@ -531,16 +536,37 @@ const char *loader_boot(uintptr_t dtb)
 	 *   bands partly eaten   -> we can see exactly which rows XNU wrote
 	 * This is the only way to tell "XNU died before the console" from
 	 * "XNU's console is up but its output goes somewhere else".
+	 *
+	 * Skipped when the previous boot's log is on screen: the bands start at
+	 * y=800 and would paint over exactly the text we want read.
 	 */
-	{
+	if (!prev_rows) {
 		static const uint32_t cols[8] = {
 			0xff00ff00, 0xff00ffff, 0xffff0000, 0xff0000ff,
 			0xffffff00, 0xff00ff00, 0xff0000ff, 0xffffffff
 		};
 		for (int i = 0; i < 24; i++)
 			con_block(0, 800 + i * 64, FB_W, 64, cols[i & 7]);
+		con_block(FB_W - 64, FB_H - 64, 64, 64, MAGENTA);
 	}
-	con_block(FB_W - 64, FB_H - 64, 64, 64, MAGENTA);
+
+	/*
+	 * The previous boot panicked and its log is on screen: hold it there for
+	 * PLOG_HOLD_SECONDS so it can be transcribed (the panel is the only
+	 * output channel and a photo is not always possible). Power-cycling
+	 * restarts the hold; once it expires the boot continues and, if the
+	 * fault repeats, panics again with the same log back in the pstore zone
+	 * for the next boot.
+	 */
+	if (prev_rows && plog_had_panic()) {
+		uint64_t t0, t;
+		__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t0));
+		for (;;) {
+			__asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(t));
+			if ((t - t0) >= (uint64_t)TIMEBASE_HZ * PLOG_HOLD_SECONDS)
+				break;
+		}
+	}
 
 	/*
 	 * DIAG (bring-up): keep the shim diagnostics on screen so they can be

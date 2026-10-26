@@ -83,18 +83,24 @@ def payload_data(payload, va, size):
     raise ValueError(f'VA {va:#x}+{size:#x} not in initialized payload segments')
 
 
-def decode_screen(raw, font):
-    """Exact glyph matching for pe_serial.c's 2x, white-on-black fbcon."""
+def decode_screen(raw, font, scale=2):
+    """Exact glyph matching for pe_serial.c's white-on-black fbcon.
+
+    The fbcon's glyph scale is a compile-time constant in the kernel
+    (FBCON_SCALE; 0083e drops it to 1 so the whole log fits on the panel),
+    so the scale is a parameter and the caller can try both."""
     glyphs = {font[c * 16:(c + 1) * 16]: chr(c) for c in range(32, 127)}
+    ch = 8 * scale          # cell width in pixels
+    chh = 16 * scale         # cell height in pixels
     rows, unknown = [], 0
-    for row in range(FB_H // 32):
+    for row in range(FB_H // chh):
         chars = []
-        for col in range(FB_W // 16):
+        for col in range(FB_W // ch):
             glyph = bytearray(16)
             for y in range(16):
-                offset = (row * 32 + y * 2) * FB_STRIDE + col * 16 * 4
+                offset = (row * chh + y * scale) * FB_STRIDE + col * ch * 4
                 for x in range(8):
-                    if raw[offset + x * 8:offset + x * 8 + 4] == b'\xff' * 4:
+                    if raw[offset + x * scale * 4:offset + x * scale * 4 + 4] == b'\xff' * 4:
                         glyph[y] |= 1 << x
             key = bytes(glyph)
             char = glyphs.get(key, '?')
@@ -102,6 +108,16 @@ def decode_screen(raw, font):
             chars.append(char)
         rows.append(''.join(chars).rstrip())
     return '\n'.join(rows).rstrip() + '\n', unknown
+
+
+def decode_best(raw, font):
+    """Decode at every plausible glyph scale and keep the best (fewest '?')."""
+    best = None
+    for scale in (1, 2):
+        screen, unknown = decode_screen(raw, font, scale)
+        if best is None or unknown < best[1]:
+            best = (screen, unknown, scale)
+    return best
 
 
 def screen_result(screen, unknown):
@@ -221,9 +237,10 @@ def main():
         write_png(f'{out}/fb.png', raw)
         result = {'status': 'not_decoded'}
         if font is not None:
-            screen, unknown = decode_screen(raw, font)
+            screen, unknown, scale = decode_best(raw, font)
             open(f'{out}/fb.txt', 'w').write(screen)
             result = screen_result(screen, unknown)
+            result['fb_scale'] = scale
         if not a.keep_raw:
             os.unlink(f'{out}/fb.raw')
     else:

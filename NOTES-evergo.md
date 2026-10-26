@@ -566,3 +566,146 @@ v11（`build_full_boot.py`）双保险：
 **判定**：这次 loader 应能命中 payload（initrd 明文优先，emb 兜底）→ 打印 `ENTRY/JUMP/XNU
 jumping` 并跳 XNU。若见 XNU 启动但仍卡（苹果 logo / 无画面），就是下一个 blocker：
 iOS 根文件系统未刷（rd=ufsroot0）或 XNU 早期驱动。
+
+
+## 2026-10-25 (23:20) — v12：launchd 被 CS_KILLED（namespace 9 code 0xe）根因与修复
+
+**现象**：root 版镜像刷机后 panic：
+`SWEET EARLY PANIC: unexpected SIGKILL of launchd (CS_KILLED) with reason - namespace 9 code 0xe`
+（kern_sig.c:2069 psignal_internal：initproc 收到带 reason 的 SIGKILL 就 panic）。
+
+**根因（不是签名损坏，是平台检查）**：
+- namespace 9 = OS_REASON_EXEC，code 0xe = 14 = `EXEC_EXIT_REASON_WRONG_PLATFORM`（reason.h:257）。
+- 唯一抛出点 kern_exec.c:7451/7466，在 `#if XNU_TARGET_OS_OSX` 块里（7431-7474）——
+  **这个块在 sweet 内核里是编进去的**（内核里有 "Allowing spawn of iOS binary" 字符串可证）。
+- 触发链：launchd 的 Mach-O 带 LC_BUILD_VERSION platform=PLATFORM_IOS →
+  kern_exec.c:1368 `proc_setplatformdata(p, PLATFORM_IOS, ...)` → process_signature 里
+  `proc_platform(p) == PLATFORM_IOS` 为真；load_init_program 用裸 execve（无 posix_spawnattr）
+  ⇒ `ip_px_sa == NULL` ⇒ 无 no-sandbox entitlement ⇒ EACCES + SIGKILL(launchd)。
+- 为什么以前没卡这：0089e 的早退（kern_exec.c:7384， enforcement 双关全关时直接 return 0）
+  本来就在这个平台检查**前面**，但前提是 `cs_enforcement_disable=1` 被兑现——
+  而旧镜像 boot-args 里没有这个参数 ⇒ 强制开着 ⇒ 先撞 WRONG_PLATFORM。
+
+**修复**：boot-args 加 `cs_enforcement_disable=1`（build_evergo_zig.py 的 EXTRA_BOOTARGS
+就是为它准备的，脚本注释里的示例正是这个值）。
+兑现前提逐条已核实：
+1. `PE_i_can_has_debugger()` 在 arm 上只认 **DT /chosen/debug-enabled**（pexpert/arm/pe_init.c:453-470），
+   不是 debug= boot-arg。mkadt_evergo.py:125 已写 `debug-enabled = u32(1)`，
+   且 shim 把 payload 里的 ADT 原装设为 boot_args.deviceTreeP（loader.c:467），
+   ADT 范围 [adt_off, adt_off+adt_size) 内确有 debug-enabled（payload+16601656）。✔
+2. `!SECURE_KERNEL`（kern_cs.c:165）：内核里有 `cs_enforcement_disable` 字符串（k+801606）⇒ 编入了。✔
+3. cs_init 是 __startup_func，晚于 PE_init_platform 读 DT。✔
+生效后：cs_system/cs_process enforcement 双 0 ⇒ 0089e 早退跳过整套签名 kill 网
+（WRONG_PLATFORM / SECURITY_POLICY / TASKGATED_OTHER / MACHINE_THREAD / launch-constraints /
+proc_process_signature），0088e+0089e 撕掉 CS_HARD|CS_KILL|CS_ENFORCEMENT，mach_loader
+忽略 LC_ENCRYPTION_INFO。**无需改内核、无需重编，只改 boot-args。**
+
+**重建**（一条命令，EXTRA_BOOTARGS 会透传给 build_evergo_zig.py）：
+    cd E:////iOS && EXTRA_BOOTARGS="cs_enforcement_disable=1" python rebuild_images.py
+产物（已装进刷机包目录 E:////iOS////ios16-redmi-note-11-5g////）：
+- shim-boot-full.img        boot-args `debug=0xc keepsyms=1 -noprogress serial=1 cs_enforcement_disable=1`
+  sha256 041757385ec998ea96eebc92c6d7da1387209cadc05ed64c964e9734e67bc009
+- shim-boot-full-root.img   boot-args 同上 + `rd=ufsroot0`
+  sha256 6d377eff725d68eff2a31375e9ffdd97858e89e0ead0e4f7a09008e4b32dedcf
+校验：payload 头部 version=1/nseg=10、cmdline 含新参数、0081e(0x7d006000)/0089e 字符串都在、
+SWEETXNU 在 ramdisk 区可扫、.sha256 与文件一致。
+
+**下次开机判据**：日志出现
+`SWEET exec: launchd: enforcement disabled, signature checks skipped (mac_return .., cs_error ..)`
+= 修复兑现。之后每个 exec 都会打这行。再往后可能的 blocker（按顺序猜）：
+dyld 共享缓存映射、HFS+ journal 重放（0086e/0087e）、launchd 的沙箱/XPC、
+kextd 想加载驱动（本内核无 kext 加载路径）。用 read_sweetlog.py 读 pstore 日志定位。
+
+**教训**：arm 上 PE_i_can_has_debugger 只认 DT 属性；"debug=0xc 就够" 是错的认知，
+这次能修好是因为 mkadt 早就白送了 debug-enabled=1。
+
+
+## v12 收尾：镜像被"无参重建"静默刷掉一次（已修复 + 已加固，10-26 早）
+
+- **事件**：07:34 发布目录两个镜像被一次**未带 EXTRA_BOOTARGS** 的 `rebuild_images.py` 重建替换，
+  boot-args 丢掉 `cs_enforcement_disable=1`（sha256 `04175738…`/`6d377eff…` → `d19a396a…`/`6f6941ea…`）。
+  触发者未能定位：无相关自动化（唯一一个是暂停的资讯总结）、无残留进程、bash/PowerShell 历史无线索；
+  疑为外部手动触发或上会话遗留后台任务。**教训：发布镜像可能被任何来源的无参重建打回原型。**
+- **修复**：带参重建恢复；随后**加固** `build_evergo_zig.py`——把 `cs_enforcement_disable=1`
+  烧进默认 `CMDLINE_KERNEL`（该内核含 0089e，没有此参数根本起不到 launchd，
+  所以它是必需项不是可选项）。裸跑 `rebuild_images.py` 实测已验证自带该参数。
+- **新增自检工具** `E:\iOS\verify_image_kernel.py`（已复制进发布目录）：一条命令端到端校验
+  boot-args / 内核逐段身份 / 0081e+0089e 在位性 / ADT debug-enabled / DTB / AVB / .sha256，
+  输出 `总体: ALL PASS` 才允许刷机。**刷机前必跑。**
+- **最终镜像**（加固后产物，ALL PASS）：`shim-boot-full.img` sha256 `88d4614582446a3991a9ee3a0fd64974e0d0f259169e5a4e746865f1359d41f7`；
+  `shim-boot-full-root.img` `a83c760790ab5952f74a7365819e80e9e1e92e73c2d7bb8637c64f6f262ffee8`
+  （root 的 boot-args 顺序变为 `… serial=1 cs_enforcement_disable=1 rd=ufsroot0`，无害）。
+- **内核身份验证法（本次定案，可复用）**：镜像内嵌内核 == `kern_tmp/kernel.development.sweet`
+  （sha `3ab62dd6…`），**按 payload 段表逐段比 10/10 全中**。整文件 sha **必然不同**——
+  mkpayload 丢 `vmsize=0` 的段（`__CTF` 606208 字节）+ 段间 16 字节对齐填充。
+  ADT `firmware-version=evergo-shim-k3ab62dd6` 可交叉互证。以后别用整文件 sha 判断内核身份。
+
+
+## v13：mount[3] exit status 1 定位 + 大字日志 + 上游 boot-args 补齐（10-26）
+
+- **现象**：CS_KILL 修好后 launchd 跑起来了，panic 变成
+  `SWEET EARLY PANIC: mount[3] exited -- no exit reason available -- (signal 0, exit status 1)`。
+- **退出码 1 的来源（反汇编定案）**：`/sbin/mount` 的 errx 路径全部走
+  `sysexit_code(errno,-1)`（0x100004bd4），退出码**恒 ≥ 64**；`-e` 才切原始 errno
+  模式（全局 0x10000c050），launchd 只传 `-P 1|2` 所以是 sysexits 模式。
+  唯一产出 1 的路径是 `mountfs()`（0x1000058c4）fork/exec `mount_<fstype>` 后
+  `ubfx w8,w8,#8,#8` 取 WEXITSTATUS **原样传播**（打印 `"%s failed with %d"`），
+  main 的 `bl mountfs; bl _exit` 直接放大成进程退出码。
+  ⇒ exit 1 = `mount_hfs` 退 1。
+- **根因**：根卷只读。上游 0036hr（只读启动）同款链条（NOTES.md:141）：
+  `mount_hfs update of /` → `mount() EROFS` → `mount: / failed with 1`。
+  **evergo 缺 `ufsrw=1 rootrw=1`**——这正是上游从 0031w 起的"通过配置"。
+  两个补丁都在内核里（字符串 `ufsrw` @0x865fa、`rootrw` @0x899a9）。
+- **修复**：`build_evergo_zig.py` 的 `CMDLINE_KERNEL` 烧入上游已知可用集合
+  （去掉 SM7150 专有项和 sweetfb_noconsole）：
+  `… cs_enforcement_disable=1 unentitled_ios_sim_launch=1 ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin wdt=-1 [rd=ufsroot0]`。
+  后三个是**预防性**的：`launchd_cache_loader` 的 `Unable to find AMFI`
+  （NOTES.md:132）、watchdogd 的 `_os_crash`（128/149）各要一次刷机才能撞上，
+  先一步加掉。
+- **大字日志（用户拍不了照的对策）**：shim `plog.c` 以 `PLOG_SCALE=2`（16x32 单元）
+  把 pstore 里**上一轮**的完整内核日志尾部画到屏幕下半部（约 49 行 x 67 列），
+  标题 `== prev boot PANICKED - held for reading ==` 或 `== previous boot log (tail, 2x) ==`；
+  `loader.c` 在 `plog_had_panic()` 为真时用 `PLOG_HOLD_SECONDS=120` **停留 120 秒**
+  再继续启动（掉电重启会重新计时）。判据：panic 行和它上面的报错就在这一屏尾部。
+- **产物（v14，ALL PASS）**：`shim-boot-full.img` sha256 `71f2f965…`；
+  `shim-boot-full-root.img` sha256 `5d933914…`。发布目录 README.txt / flash_root.bat
+  已同步（GBK+CRLF，含大字日志判读清单）。
+- **副作用（要记住）**：根卷从这一版开始**可写**，panic/掉电会改坏 userdata 上的
+  HFS+ 卷；恢复源 `E:\iOS\ios16-root.img`（sha `15ef1a87…`），
+  `flash_root.bat userdata` 重刷（约十几分钟）。
+- **方法论**：上游 `NOTES.md` 是本项目最值钱的情报源——它按 boot 编号记录了
+  "哪个参数解决哪个 panic"。本机遇到新的用户态 panic 时，**先去 NOTES.md 搜
+  panic 串/进程名**，多半能直接找到对应的 boot-arg 或补丁号，比自己反汇编快得多。
+
+
+## v14 首次开机结果（10-26 晚）：过了 mount，launchd 进 main 后自杀
+
+刷 v14（`ufsrw=1 rootrw=1` + 上游其余参数）后的现象：
+
+1. **mount[3] panic 消失**（ufsrw/rootrw 对策成立，和上游 0036hr→0031w 完全一致）。
+2. 新 panic：`initproc exited -- exit reason namespace 2 subcode 0x5 description none`
+   - `kern_exit.c:1806-1812`：p==initproc 时，`initproc_spawned` 为真才用
+     `"initproc exited"`，否则是 `"initproc failed to start"`。
+     **`initproc_spawned` 由 launchd 自己通过 sysctl `kern.initproc_spawned` 置 1
+     （kern_exit.c:1306-1320）⇒ launchd 确实进了 main()。这是实打实的进展。**
+   - `bsd/sys/reason.h:89` OS_REASON_SIGNAL = 2 ⇒ namespace 2 = 信号，
+     subcode 0x5 = **SIGTRAP** = launchd 主动 `_os_crash()`（和上游 watchdogd
+     "namespace 2 subcode 5 (SIGTRAP = its _os_crash)" 同款，NOTES.md:130）。
+3. 另一条：`coalition.c:1031 assertion failed: tas->coaition[COALITION_TYPE_JETSAM]==coal`
+   - 源码 `osfmk/kern/coalition.c:1031` = `i_coal_jetsam_set_taskrole()` 里的
+     `assert(task->coalition[COALITION_TYPE_JETSAM] == coal)`（上游源码里成员名
+     就是拼错的 `coaition`）。给任务设 JETSAM coalition 角色时发现记录不匹配。
+4. 用户反馈"每重启一次多一次 bug"。
+
+**已排除的嫌疑：UFS 写路径写出垃圾。** 逐条核对 `bsd/dev/sweet_ufs.c`：
+   - `ufs_write_blocks()` 发 WRITE(10) 前重查分区边界（越界直接 EPERM，sweet_ufs.c:281-286）；
+   - `ufs_scsi()` 方向正确：`ucd->cmd[1] = write ? 0x20 : 0x40`（data out/in），
+     `utrd->dw0` 的 DD 位 `write ? 1 : 2`（内存→设备 / 设备→内存）；
+   - DMA 缓存：`dma_sync()` = `flush_dcache64`（arm64 上是 clean+invalidate，
+     写前会把脏行写回），`dma_clean()` = `clean_dcache64`；`su.cache=0` 分支对
+     写也是 flush，不会丢脏数据。
+   - MTK 路径（`sweet_ufs_mtk_prepare`）复用 LK 已拉起的控制器，读写走同一条 `ufs_scsi`。
+
+**下一步（待用户执行）**：重刷干净 root（`flash_root.bat userdata`）再开机一次，
+区分两种可能：① 根卷被反复非正常掉电写坏（累积性损坏，需每次重刷）；
+② 其实在往前走，每次撞到下一个 blocker（journaled HFS+ 有日志重放，未必会坏）。

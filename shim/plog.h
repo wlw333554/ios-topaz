@@ -14,10 +14,15 @@
 #endif
 
 /* Print the zone's content (the PREVIOUS boot's kernel log) with the 8x16
- * font at 1:1, below y_px. Returns the number of lines printed. This is a
- * READER: the shim never writes to the zone, so the kernel's log (written by
- * patch 0083e) survives untouched. */
+ * font at 2x, below y_px, showing only the TAIL of the log (the panic and
+ * its cause are at the end). Returns the number of rows printed, or -1 for
+ * a valid but empty zone. This is a READER: the shim never writes to the
+ * zone, so the kernel's log (written by patch 0083e) survives untouched. */
 int plog_dump(uint64_t base, uint64_t size, int y_px);
+
+/* 1 if the dump just taken mentions a panic (loader.c holds the screen for
+ * transcription in that case). Only meaningful right after plog_dump(). */
+int plog_had_panic(void);
 
 #if HAS_PSTORE
 void plog_init(void);
