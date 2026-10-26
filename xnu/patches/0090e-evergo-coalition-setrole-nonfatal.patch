@@ -44,17 +44,17 @@ diff --git a/osfmk/kern/coalition.c b/osfmk/kern/coalition.c
 +	 */
 +	if (task->coalition[COALITION_TYPE_JETSAM] != coal) {
 +		printf("coalition: set_taskrole: pid %d is not in jetsam "
-+		    "coalition id:%lld, skipping role %d\n", task_pid(task),
++		    "coalition id:%llu, skipping role %d\n", task_pid(task),
 +		    coal->id, role);
 +		return KERN_SUCCESS;
 +	}
  
  	cj = &coal->j;
  
-@@ -1853,6 +1870,18 @@
- 	}
- }
- 
+@@ -1870,10 +1887,30 @@
+ 		if (!coalitions[i]) {
+ 			continue;
+ 		}
 +		/*
 +		 * evergo (0090e): only set a role in a coalition this task
 +		 * actually joined.  task_create_internal() may have failed to
@@ -63,14 +63,10 @@ diff --git a/osfmk/kern/coalition.c b/osfmk/kern/coalition.c
 +		 */
 +		if (task->coalition[i] != coalitions[i]) {
 +			printf("coalitions_set_roles: pid %d not a member of %s "
-+			    "coalition id:%lld, skipping\n", task_pid(task),
++			    "coalition id:%llu, skipping\n", task_pid(task),
 +			    coal_type_str(i), coalitions[i]->id);
 +			continue;
 +		}
- /*
-  * coalitions_set_roles
-  * for each type of coalition, if the task is a member of a coalition of
-@@ -1873,7 +1902,15 @@
  		coalition_lock(coalitions[i]);
  		kr = coal_call(coalitions[i], set_taskrole, task, roles[i]);
  		coalition_unlock(coalitions[i]);
@@ -81,7 +77,7 @@ diff --git a/osfmk/kern/coalition.c b/osfmk/kern/coalition.c
 +		 */
 +		if (kr != KERN_SUCCESS) {
 +			printf("coalitions_set_roles: pid %d set_taskrole failed "
-+			    "for %s coalition id:%lld (kr %d)\n", task_pid(task),
++			    "for %s coalition id:%llu (kr %d)\n", task_pid(task),
 +			    coal_type_str(i), coalitions[i]->id, kr);
 +		}
  	}

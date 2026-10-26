@@ -795,3 +795,25 @@ task_create_internal -> `coalitions_adopt_task` 失败（reaped/terminated，
 - VirtualAudio.plugin -> HAL.disabled（mediaserverd 崩）
 - MediaToolbox `StartRecorderServer=false`
 
+
+## v15 补记：设备树决定哪些 launchd job 加载（回答"无基带会卡住吗"时查出）
+
+532 个 LaunchDaemons 里只有 5 个带设备树约束（`_LimitLoadTo/FromDeviceTree`）：
+
+    To:   hilo        -> com.apple.SepUpdateTimer
+          pearl-sep   -> com.apple.biometrickitd.pearl
+          baseband    -> com.apple.CommCenter          (cellular)
+          [wlan,marconi-wifi] -> com.apple.wifid
+          [hilo,twodbl]       -> com.apple.iomfb_bics_daemon
+    From: baseband    -> com.apple.CommCenter          (-noncellular)
+
+我们的 ADT 里这些节点一个都没有（mkadt.py:118 "no SEP, no baseband here"），所以：
+
+- iOS 侧永远无基带（XNU 没有 MTK modem 驱动），与安卓侧蜂窝无关。
+- cellular CommCenter 压根不加载；会跑的只有 -noncellular 版，而它不在
+  7 个 `_PanicOnCrash` 之列 ⇒ 崩了只自己重启，不会 panic。
+  **所以在 launchd 存活这个阶段，无基带不会卡住。**
+- 但 Setup 会卡在 CoreTelephony XPC（sweet-root-tweaks.py:13 注释原文），
+  所以仍必须同时跳过 Setup。
+- **`com.apple.wifid` 不加载 ⇒ 当前没有 WiFi**；将来要 WiFi 需先在 ADT 补 `wlan`。
+- SepUpdateTimer / biometrickitd.pearl 不加载（无 SEP、无面容），符合预期。
