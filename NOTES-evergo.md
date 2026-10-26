@@ -709,3 +709,89 @@ kextd 想加载驱动（本内核无 kext 加载路径）。用 read_sweetlog.py
 **下一步（待用户执行）**：重刷干净 root（`flash_root.bat userdata`）再开机一次，
 区分两种可能：① 根卷被反复非正常掉电写坏（累积性损坏，需每次重刷）；
 ② 其实在往前走，每次撞到下一个 blocker（journaled HFS+ 有日志重放，未必会坏）。
+
+## v15 (2026-10-26 晚): root 镜像漏了 sweet-root-tweaks.py —— 两条 panic 同根
+
+用户报的两条 panic:
+
+```
+SWEET EARLY PANIC: initproc exited -- exit reason namespace 2 subcode 0x5 description none
+coalition.c:1031 assertion failed: tas->coaition[COALITION_TYPE_JETSAM]==coal
+```
+
+**namespace 2 / subcode 0x5 = SIGTRAP**（bsd/sys/reason.h: OS_REASON_JETSAM=1、
+SIGNAL=2、EXEC=9）。panic 串是 "initproc exited" 而不是 "initproc failed to start"
+（kern_exit.c:1806-1813），说明 `initproc_spawned` 为真，而该标志由 launchd 自己
+通过 sysctl 置位 ⇒ **launchd 进了 main()**，不是 exec 阶段被杀。
+
+### 找到的真凶
+
+直接从 16 GiB HFS+ 镜像里把 `/System/Library/xpc/launchd.plist` 读出来
+（1,456,980 字节，extent [1966687, 356]，BS=4096；用 hfs_walk2.py 的 catalog dump
+定位，自己写了个 bplist 解析器，因为 plistlib 报 Invalid file —— 顺带记住
+Apple 的 bplist 标记是 **0xA0=Array / 0xD0=Dict**，不是 0x8/0xA）：
+
+| 检查项 | 跑过 tweaks 应为 | 实际 |
+|---|---|---|
+| `_PanicOnCrasX` | 7 | **0** |
+| `_PanicOnCrash` | 0 | **7** |
+| `HAL.disabled/` | 存在 | 不存在 |
+| `VirtualAudio.plugin` 原位 | 已移走 | 仍在原位 |
+| `/private/var/containers/Bundle` | 存在 | 不存在 |
+| `/private/var/keybags/systembag.kb` | 存在 | 存在 |
+
+⇒ 镜像只跑了 `tools/mkiosroot.sh`，**`tools/sweet-root-tweaks.py` 这一步漏了**。
+
+7 个带活 `_PanicOnCrash` 的 job（每个的 `PanicOnConsecutiveCrash=False`，
+即**崩一次就 panic**）：watchdogd、containermanagerd、usermanagerd、trustd、
+lockdownd、remoted、remotepairingdeviced。
+
+**这解释了一直困惑的"每重启一次多一次 bug"**：不是累积损坏，也不是每次都
+前进——每轮开机 launchd 往前推一点，撞上下一个必然崩溃的 daemon（这台机器
+没有基带 / GPU 驱动 / SEP），崩一个就整机 panic，所以每次都是新的进程名、
+看起来像新 bug。同一个根因的不同位置。
+
+### 修复 A（已写进镜像）
+
+`_PanicOnCrash` -> `_PanicOnCrasX` 等长，直接在数据块上改 7 个字节：
+offset 8055549952 (=1966687*4096)，命中 636639/708912/797318/839625/
+863885/891772/905115，每处只把末尾 'h'(0x68) 改成 'X'(0x58)。
+文件大小、catalog、extents 全不动。回读校验 `_PanicOnCrash=0`、
+`_PanicOnCrasX=7`、仍能解析出 532 个 LaunchDaemons。
+
+脚本：`E:\iOS\_patch_root_launchd.py`（幂等）。
+镜像 sha256 `15ef1a87...` -> `c62b33f4e57aa0bc...`。
+
+### 修复 B（补丁 0090e，要 CI 重编）
+
+`posix_spawn`(coalition 属性) -> kern_exec.c:3727 解析 cid -> fork1 ->
+task_create_internal -> `coalitions_adopt_task` 失败（reaped/terminated，
+或任务已有同类 coalition）-> 回到 kern_exec.c:3782 `coalitions_set_roles`
+-> `i_coal_jetsam_set_taskrole` 的断言炸。kern_exec.c:3756 注释原文：
+"also the call to coalitions_set_roles will panic"。
+
+0090e 把 `coalitions_set_roles()` 改成跳过任务未加入的类型、
+`i_coal_jetsam_set_taskrole()` 改成打印后返回 KERN_SUCCESS、
+`assert(kr == KERN_SUCCESS)` 改成打印。已在 `E:\iOS\_bt10\xnu` 上
+`git apply --check` / `apply` / `apply -R` 全部验证。已 commit c1d8e49，
+**需 push 触发 CI 才会进 boot 镜像**。
+
+### 方法论（值得记住）
+
+1. 遇用户态 panic，先查**上游 NOTES.md**（这次没有 coalition 记录 ⇒ 是
+   evergo 特有，得自己挖），再查 **root 镜像的配置**——upstream 的
+   `tools/sweet-root-tweaks.py` 是镜像的必备工序，漏了就会一直撞"随机 panic"。
+2. 16 GiB HFS+ 镜像可以直接用 Python 读（`_files.json` + extents），
+   **等长改内容 = 零风险原地补丁**，不用挂载、不用 Linux。
+3. 改镜像内容前先确认刷机脚本用的是哪个文件：flash_root.bat 第 48 行
+   优先 `E:/iOS/ios16-root.img`，`.7z` 只是后备。
+
+### 还没做的 tweaks（都要动 catalog，等长覆写做不到）
+
+- 删 5 个 CommCenter job（无基带，crash-loop 卡 Setup）
+- 建 `/private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}`
+- 写 purplebuddy/migration/springboard 偏好（跳过 Setup；不跳过
+  DataMigration 会跑一小时）
+- VirtualAudio.plugin -> HAL.disabled（mediaserverd 崩）
+- MediaToolbox `StartRecorderServer=false`
+
