@@ -165,6 +165,68 @@ Notes:
   Qualcomm input/USB drivers — **do not** use it on evergo.
 
 
+## Testing in QEMU with a RAM-disk root (the pre-flash gate)
+
+**Rule: never hand over a phone image that has not first booted in QEMU.**
+`qemu_check.py` is the gate; `qemu_check.py --install` only rebuilds and installs
+the phone images when it passes.
+
+Without a root, QEMU only exercises the kernel and stops at
+`Waiting on ... Apple_HFS`. To get past that the root image is loaded into
+**guest RAM** and mounted with `rd=ufsroot0` (patch 0091e).
+
+### Why it has to live in RAM
+
+- There is no UFS in QEMU, and the xnu tree has **no virtio** at all, so a
+  disk-backed root would mean porting a driver.
+- This QEMU build has **only `memory-backend-ram`, no `memory-backend-file`**
+  (`-object help`), so the sparse-file trick cannot be used: **guest RAM is
+  committed host memory**. Whatever the guest asks for, the host must have free.
+- The dyld shared cache is **3.11 GiB** and cannot be trimmed, so it is the floor
+  for any root that can start launchd.
+
+### Getting a root that fits
+
+`tools/mk_trimmed_root_manifest.py` + `tools/build_trimmed_root.py` build a
+trimmed HFS+ root. The trick is that the dyld cache already contains every
+framework binary, so the duplicate on-disk copies are dropped (only
+`Info.plist` + tiny metadata are kept), along with `Applications/`, the audio
+stack and most fonts: **5.55 GiB -> 3.73 GiB** (dyld 3.11 + rest 0.62), i.e. a
+~4.0 GiB image.
+
+Build it on CI (`ios16-root image` workflow), then:
+
+```
+cat trimmed-root.img.part* > trimmed-root.img
+```
+
+### Running the gate
+
+Free **>= 6 GiB** of host RAM first (close the browser and other heavy apps),
+then:
+
+```
+python qemu_check.py --root-img trimmed-root.img --secs 75
+```
+
+Guest RAM is derived from `PHYS_BASE + MEM_SIZE + image size`, and the image has
+to sit above the DRAM the kernel manages. With the default 2 GiB `MEM_SIZE` that
+works out to `-m 7G`, which this host cannot back; `qemu_check.py` therefore
+sets `QEMU_MEMSIZE=1 GiB` so the image lands at `0xC0000000` and the guest is
+`-m 6G` (~6144 MiB of host memory).
+
+### Reading a spinlock panic
+
+With patch 0092e, `lck_spin_verify()` prints its caller before it panics:
+
+```
+SWEET SPIN: <how> spinlock 0x... from 0x... 0x..., thread 0x.../NNN
+```
+
+Resolve the return addresses against the kernel's symbols offline to find which
+lock is bad. Boot with `ignore_bad_spin=1` to downgrade it to a report, so one
+boot shows every bad lock instead of stopping at the first.
+
 ## Debugging the boot (early console + pstore)
 
 **Status 2026-10-25:** the shim side is proven on the real device — the panel

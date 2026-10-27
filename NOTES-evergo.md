@@ -817,3 +817,135 @@ task_create_internal -> `coalitions_adopt_task` 失败（reaped/terminated，
   所以仍必须同时跳过 Setup。
 - **`com.apple.wifid` 不加载 ⇒ 当前没有 WiFi**；将来要 WiFi 需先在 ADT 补 `wlan`。
 - SepUpdateTimer / biometrickitd.pearl 不加载（无 SEP、无面容），符合预期。
+
+
+## v16：0090e 内核进 boot 镜像（2026-10-27，只刷 boot 不用重刷 userdata）
+
+### CI #15 先失败了一次：0090e 第二处 hunk 落进 file scope
+
+日志（xnu #15，4m47s，1 error）尾部被截断，只剩 `hfs_catalog.c` 的一堆
+`implicit conversion loses integer precision` —— 那是补丁 0026（sweet-builtin-hfs
+第三方代码）自带的**老噪声，不是新错误**，定位时只看 `error:`。
+
+真因在生成脚本 `_gen_0090e.py`：三处编辑都往同一个 list 里**往前插**并手算偏移
+补偿，第二处漏算了第一处新增的 16 行 ⇒ 成员检查那段被插到上一个函数结束之后、
+`coalitions_set_roles` 之前 = **file scope**，语句落在函数外，编译必错。
+
+修法：`new[i_kr_assert:...]` → `new[i_lock:...]` → `new[i_assert:...]` **倒序插入**，
+前面的索引就永远不用补偿。顺手把 `%lld` 改 `%llu`（`struct coalition.id` 是 uint64_t）。
+
+**暴露的验证盲区**：之前跑过 `git apply --check` / `apply` / `apply -R` 全过就判定
+"最强验证"，但这套只能证明**能贴上、能还原**，证明不了**代码落在对的位置**。
+已把"必须 apply 后读一遍目标函数 + 查括号平衡"补进 MEMORY.md。
+
+### CI #16 成功（commit 7af5bda）
+
+- 新内核 17206016 字节 `f80e83e1acf8...`（旧 17206112 `3ab62dd61497...`）。
+- **验证方式：在二进制里找那三条 printf 字符串**（0x4a231 / 0x49df7 / 0x49e44）
+  全部 FOUND；0081e 的帧缓冲 0x7d006000 仍在、旧值 0x9c000000 为 0 次。
+- `verify_image_kernel.py` 加了 0090e 三条字符串检查，两个镜像 `总体: ALL PASS`（12 项）。
+- 成品：`shim-boot-full.img` `4a7c477ce87ef5ac...` /
+  `shim-boot-full-root.img` `f959da299667b81b...`。
+- **root 镜像这轮没动 ⇒ 只刷 boot 即可。**
+- 坑：README.txt / flash_root.bat 必须保持 **GBK + CRLF**；脚本要先把 CRLF 统一
+  成 LF 再改、写完再统一下去，否则多行 replace 会因换行符不匹配**静默失败**。
+
+
+## v17：QEMU RAM-disk root 门禁（2026-10-27~28）
+
+目标是把"**先放 QEMU 测、真没问题了再给手机镜像**"这条规矩真正落地。
+在此之前 QEMU 只能验内核（到 `Waiting on ... Apple_HFS` 就停，因为没有 root）。
+
+### 为什么必须做 RAM-disk root
+
+- 真机 UFS 路径在 QEMU 里不存在；ios-topaz 的 xnu 树**完全没有 virtio**
+  （grep "virtio" 全树无命中）⇒ 磁盘后端 root 要移植驱动，工作量大。
+- 所以 root 只能整体放进客 RAM（补丁 0091e 的 memdisk / `rd=ufsroot0`）。
+
+### 内存是硬约束（这一步推翻了之前的误判）
+
+- 宿主 15.7 GiB 总、**仅 ~3 GiB 空闲**（WorkBuddy 自身 ~5 GiB）。用户关掉
+  Chrome/QQ/ABDownload/Steam++ 后约 6.6 GiB。
+- **QEMU 11.1.0 只有 `memory-backend-ram`、没有 `memory-backend-file`**
+  （`-object help` 亲自查过）⇒ HakiOS 那个"sparse-file 把整盘 map 进客 RAM"
+  的 trick 用不了，**客 RAM = 宿主提交内存**。
+- dyld 共享缓存 **3.11 GiB** 是硬下限（单体不可裁，必须整块常驻客 RAM）。
+
+### 裁剪规则：5.55 → 3.73 GiB
+
+`tools/mk_trimmed_root_manifest.py`（HakiOS select-system.py 的移植）+ 新建的
+`tools/build_trimmed_root.py`。关键思路：**dyld 缓存已经提供了所有 framework
+二进制**，于是把磁盘上重复的那份删掉：
+
+- `System/Library/{Frameworks,PrivateFrameworks}` 只留 `Info.plist` 和 ≤8 KiB
+  元数据（保留 plist 是为了让 dyld 仍能校验缓存条目）；
+- 整个 `Applications/`、音频栈、多余字体（只留 2 个 `TRIMMED_FONTS`）全丢。
+
+结果：**dyld 3.11 + 其余 0.62 = 3.73 GiB**（52838 个文件），镜像约 4074 MiB。
+
+### 修掉的三个 bug（都会让 QEMU 测试必败）
+
+1. **`qemu_check.py` 的 root 镜像会盖住内核**：`--root-addr` 默认 `0x90000000`
+   **低于**内核 `phys_base`，还无条件传给 qemu-sweet.py ⇒ ~4G 镜像直接覆盖内核。
+   改成默认 `None`，由 qemu-sweet 放到 `phys_base + mem_size` 之上。
+2. **顶层符号链接全丢**：`etc`/`tmp`/`var` 是 depth-1 符号链接（→ `private/…`），
+   原筛选只认 `WHOLE`/`DYLD_PREFIX` 前缀，三者都不匹配 ⇒ 被丢掉，裁剪根与手机
+   不一致、userland 起不来。改成 depth-1 符号链接无条件保留。
+3. **镜像大小在 umount 之后才统计**：`total` 恒为 0 ⇒ 镜像被锁死在 `--min-mib`
+   平顶。改成在遍历时边走边累加。
+
+### 客机内存修正（差点整个方案不成立）
+
+之前用"内核 phys_base=0xb0000000"估算的 6G **是错的**。实际常量
+`PHYS_BASE = 0x80000000`、`MEM_SIZE = 0x80000000`（2 GiB），而 RAM-disk root
+必须落在内核管理的 DRAM **之上** ⇒ 镜像起点 4 GiB，加上 ~3.98 GiB 镜像
+⇒ **客机 `-m 7G`（7168 MiB）> 宿主可用 6758 MiB ⇒ 必 OOM**。
+
+修法：新增 `QEMU_MEMSIZE`（仅 QEMU，手机默认不变），`qemu_check.py --root-img`
+时设 1 GiB ⇒ 镜像起点降到 `0xC0000000` ⇒ **客机 `-m 6G`（6144 MiB），留 ~600 MiB
+余量**。已用脚本复算两种取值确认。
+
+### 补丁 0091e / 0092e
+
+- **0091e（ufs memdisk root）**：sweet_ufs 认设备树 `memdisk` 属性或 boot-arg
+  `ufsmemdisk`，把节点的 reg 当映像直接映射、注册 `ufsroot0`、读写改 `memcpy`
+  不发 UFS 命令、跳过缓存同步。
+- **0092e（spinlock 诊断）**：`lck_spin_verify()` 在 panic 前打印 caller
+  （`__builtin_return_address(0/1)`），可离线用内核符号定位是哪把锁；
+  `ignore_bad_spin=1` 降级为只报告，一次开机能看全所有坏锁。
+
+### CI #17 又失败一次：0092e 两个 printf 都不可编译
+
+run `40529589145`，build 5m6s，1 error，exit 2。
+
+- `ignore_bad_spin` 那条写成 `printf("SWEET SPIN: "ignored" spinlock %p ...", "ignored", ...)`
+  ⇒ 字符串 + **裸标识符** + 字符串，中间无运算符 ⇒ **语法错误**（就是那个 1 error），
+  且该词还被当成多余参数传了一次。
+- panic 路径那条把 `how` **写死**在格式串里（该写 `%s`）⇒ 7 个占位符对 8 个参数，
+  `how`/`lck` 及之后全部错位（就算编过，打出来的锁地址也是错的）。
+
+两处都改成 `%s` + 配一个参数（行数不变，hunk 计数不受影响）。**三重验证**：
+zig 编复刻片段（`-Wall -Wformat=2`）rc=0；两个补丁对 `_bt10/xnu`
+`git apply --check/apply/-R` 全 rc=0；**apply 后读落位**确认都在函数体内。
+
+⇒ 这是"git apply 全绿 ≠ 代码合法"的**第二次实例**（第一次是 0090e 落进 file scope）。
+已把"补丁里新写的 C 要单独 zig 编译验证"补进 MEMORY.md。
+
+**注**：GitHub MCP **读不了 workflow run**（只有 issue/PR/branch 那几个工具，
+`ui_get` 也不支持 runs）；WebFetch 能拿到状态/时长/artifacts 但拿不到错误正文。
+
+### CI 侧：iosroot.yml 可以直接吃预置的 ios16-root.img
+
+新增 `root_img_url` / `root_img_tag` 输入。给了预置镜像就**跳过 DMG 下载 +
+mkiosroot.sh**（省 ~10 分钟）。更关键的是**避开 v15 那个坑**：`mkiosroot.sh`
+**不跑** `sweet-root-tweaks.py`，从 DMG 重建出来的根带着 7 个活的 `_PanicOnCrash`。
+（裁剪那步自己会跑 tweaks，所以两条路出来的裁剪根都是对的。）
+
+### 当前状态
+
+**待 push 的 4 个 commit**：`d7005f1`（门禁全套 + 0091e/0092e）、`1c2abca`
+（工作流吃预置镜像）、`142cf4c`（QEMU DRAM 尺寸）、`fba7388`（修 0092e printf）。
+
+之后：给 CI 16G 源 → 取 `trimmed-root-img-parts`（约 4G）`cat` 重组 →
+宿主空闲堆到 ≥6GiB → `qemu_check.py --root-img trimmed-root.img --secs 75`
+复现 spinlock panic，读 `SWEET SPIN` 的 caller 地址离线符号化。
