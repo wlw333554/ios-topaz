@@ -42,7 +42,7 @@ diff --git a/osfmk/arm/locks_arm.c b/osfmk/arm/locks_arm.c
  	}
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+		printf("SWEET SPIN: how spinlock %p <0x%016lx 0x%016lx> from %p %p, thread %p/%llu\n",
++		printf("SWEET SPIN: %s spinlock %p <0x%016lx 0x%016lx> from %p %p, thread %p/%llu\n",
 +		    how, lck, lck->lck_spin_data, lck->type,
 +		    __builtin_return_address(0), __builtin_return_address(1),
 +		    current_thread(), (unsigned long long)thread_tid(current_thread()));
@@ -57,7 +57,7 @@ diff --git a/osfmk/arm/locks_arm.c b/osfmk/arm/locks_arm.c
  	    lck->lck_spin_data == LCK_SPIN_TAG_DESTROYED) {
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +		if (sweet_ignore_bad_spin()) {
-+		printf("SWEET SPIN: "ignored" spinlock %p <0x%016lx 0x%016lx> from %p %p, thread %p/%llu\n",
++		printf("SWEET SPIN: %s spinlock %p <0x%016lx 0x%016lx> from %p %p, thread %p/%llu\n",
 +		    "ignored", lck, lck->lck_spin_data, lck->type,
 +		    __builtin_return_address(0), __builtin_return_address(1),
 +		    current_thread(), (unsigned long long)thread_tid(current_thread()));
