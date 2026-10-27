@@ -109,7 +109,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False):
+def build(seed=None, qemu=False, highmem=False, native=False, memdisk=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
@@ -253,12 +253,23 @@ def build(seed=None, qemu=False, highmem=False, native=False):
 
     # bsd/dev/sweet_ufs.c: the UFS host the bootloader leaves running (absolute
     # physical reg). MTK ufshci needs its own driver (EVERGO.md); the node is
-    # here for it.
-    ufs = node('sweet-ufs', [
-        ph(),
-        ('compatible', cstr('mediatek,ufshci')),
-        ('reg', u64(UFS, UFS_SIZE)),
-    ])
+    # here for it. With --memdisk (QEMU, no UFS hardware anywhere) reg is the
+    # RAM-disk image itself and a `memdisk` property flips sweet_ufs into
+    # RAM-disk root mode (patch 0091e): rd=ufsroot0 then mounts it as root.
+    if memdisk is not None:
+        maddr, msize = memdisk
+        ufs = node('sweet-ufs', [
+            ph(),
+            ('compatible', cstr('mediatek,ufshci')),
+            ('memdisk', u32(1)),
+            ('reg', u64(maddr, msize)),
+        ])
+    else:
+        ufs = node('sweet-ufs', [
+            ph(),
+            ('compatible', cstr('mediatek,ufshci')),
+            ('reg', u64(UFS, UFS_SIZE)),
+        ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -296,12 +307,21 @@ def build(seed=None, qemu=False, highmem=False, native=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product
+       + ([ufs] if (not qemu or memdisk is not None) else []))
 
 
 if __name__ == '__main__':
+    memdisk = None
+    if '--memdisk' in sys.argv:
+        i = sys.argv.index('--memdisk')
+        try:
+            maddr, msize = sys.argv[i + 1].split(',')
+            memdisk = (int(maddr, 0), int(msize, 0))
+        except (IndexError, ValueError):
+            raise SystemExit('--memdisk needs addr,size (e.g. 0x100000000,0x80000000)')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv)
+                 native='--native' in sys.argv, memdisk=memdisk)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

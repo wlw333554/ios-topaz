@@ -177,6 +177,38 @@ jobs:
             dmgs/OS.dmg dmgs/SystemOS.dmg dmgs/AppOS.dmg \
             ios16-root.img "${{ inputs.size }}"
 
+      # ---------------------------------------------------------------------------
+      # Trimmed, RAM-loadable root for QEMU (patch 0091e, rd=ufsroot0)
+      #
+      # The full 16 GiB image cannot be loaded into guest RAM on the test host
+      # (only ~3 GiB free, and the dyld shared cache alone is 3.12 GiB).  This step
+      # copies ONLY the files selected by the HakiOS trimming rules (see
+      # tools/mk_trimmed_root_manifest.py) out of the full image into a fresh,
+      # smaller HFS+ image, then applies the same launchd/container/audio/prefs
+      # tweaks (tools/sweet-root-tweaks.py) the phone images get.  The result is
+      # what qemu_check.py --root-img loads for the "test in QEMU before phone"
+      # gate.  Needs the hfsplus module (ensured by Preflight) + loop mount.
+      # ---------------------------------------------------------------------------
+      - name: Build trimmed root image (QEMU RAM-disk)
+        run: |
+          # --min-mib 0: the RAM-disk root must be as small as it can be; the
+          # 4096 MiB floor would otherwise pin it at exactly 4 GiB.
+          sudo python3 tools/build_trimmed_root.py ios16-root.img trimmed-root.img --min-mib 0 --min-mib 0
+
+      - name: Split trimmed output (artifact files are capped at 2 GiB)
+        run: |
+          mkdir -p trimmed_parts
+          split -b 1900M -d trimmed-root.img trimmed_parts/trimmed-root.img.part
+          ls -la trimmed_parts
+          echo "Reassemble locally with: cat trimmed-root.img.part* > trimmed-root.img"
+
+      - name: Upload trimmed parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trimmed-root-img-parts
+          path: trimmed_parts/*
+          retention-days: 7
+
       - name: Split output (GitHub artifact files are capped at 2 GiB)
         run: |
           mkdir -p out_parts

@@ -1,0 +1,98 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -109,6 +109,7 @@
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool memdisk;                           /* reg is the image itself, in RAM: issue no UFS command */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -471,6 +472,17 @@
+ 	}
+ 	if (buf_map(bp, &vaddr)) {
+ 		error = EIO;
++		goto done;
++	}
++
++	if (su.memdisk) {
++		if (rd) {
++			memcpy(vaddr, (const char *)su.regs + off, count);
++		} else {
++			memcpy((char *)su.regs + off, vaddr, count);
++		}
++		buf_setresid(bp, 0);
++		buf_unmap(bp);
+ 		goto done;
+ 	}
+ 
+@@ -544,7 +556,7 @@
+ 		return 0;
+ 	case DKIOCSYNCHRONIZE:
+ 	case DKIOCSYNCHRONIZECACHE: {
+-		if (!su.writable) {
++		if (!su.writable || su.memdisk) {
+ 			return 0;
+ 		}
+ 		lck_mtx_lock(&sweet_ufs_lock);
+@@ -664,6 +676,8 @@
+ 	DTEntry node;
+ 	uintptr_t const *reg = NULL;
+ 	unsigned int size = 0;
++	void const *reg_prop = NULL;
++	unsigned int prop_size = 0;
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+@@ -681,6 +695,50 @@
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++
++	/*
++	 * RAM-disk root (QEMU, no UFS anywhere): the node's reg is not a host
++	 * controller but the image itself, memory the booter already filled and
++	 * that behaves as one partition from block 0. Everything below talks to
++	 * this one mapping, so no UFS command is issued and no other driver is
++	 * started. See tools/mkadt_evergo.py --memdisk.
++	 */
++	uint32_t memdisk = 0;
++	if (SecureDTGetProperty(node, "memdisk", (void const **)&reg_prop, &prop_size) == kSuccess) {
++		memdisk = 1;
++	}
++	PE_parse_boot_argn("ufsmemdisk", &memdisk, sizeof(memdisk));
++	if (memdisk != 0) {
++		su.memdisk = true;
++		su.regs = ml_io_map(reg[0], reg[1]);
++		if (!su.regs) {
++			printf("SWEET UFS: cannot map the RAM disk at 0x%llx (%llu bytes)\n",
++			    (uint64_t)reg[0], (uint64_t)reg[1]);
++			return ENOMEM;
++		}
++		su.lun = 0;
++		su.secsize = DEV_BSIZE;
++		su.first_block = 0;
++		su.nblocks = reg[1] / UFS_BLOCK;
++
++		su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
++		if (su.bmajor < 0) {
++			return ENXIO;
++		}
++		su.cmajor = cdevsw_add_with_bdev(-1, &sweet_ufs_cdevsw, su.bmajor);
++		if (su.cmajor < 0) {
++			return ENXIO;
++		}
++		su.bdev = makedev(su.bmajor, 0);
++		devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
++		devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
++		su.writable = (rw != 0);
++		su.ready = true;
++		printf("SWEET UFS: RAM disk root at 0x%llx: %llu MiB, %s, %u-byte sectors\n",
++		    (uint64_t)reg[0], reg[1] >> 20, su.writable ? "read-write" : "read-only",
++		    su.secsize);
++		return 0;
++	}
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,

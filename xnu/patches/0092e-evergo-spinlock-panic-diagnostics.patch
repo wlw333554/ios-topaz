@@ -1,0 +1,69 @@
+diff --git a/osfmk/arm/locks_arm.c b/osfmk/arm/locks_arm.c
+--- a/osfmk/arm/locks_arm.c
++++ b/osfmk/arm/locks_arm.c
+@@ -724,6 +724,35 @@
+ 
+ #else /* !LCK_SPIN_IS_TICKET_LOCK */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * evergo: development builds panic the moment they meet a spinlock they do not
++ * recognize, and used to print nothing but the lock. Say where we came from
++ * instead: lck_spin_verify() below is static inline, so return address 0 names
++ * the caller itself and the kernel's symbols turn it into a function off-line.
++ * A lock that reads as all zeros was never initialized at all (a destroyed one
++ * keeps LCK_SPIN_TAG_DESTROYED in its data word), so the words in front of it
++ * belong to whatever structure was supposed to hold it. The console also goes
++ * into the partition's sweetlog ring, so the line survives the reboot.
++ *
++ * With boot-arg ignore_bad_spin=1 the check only reports: an all-zero
++ * lck_spin_t behaves as an unlocked one, so the boot carries on and shows what
++ * comes next rather than stopping at the first bad lock.
++ */
++static inline bool
++sweet_ignore_bad_spin(void)
++{
++	static int allow = -1;
++
++	if (allow < 0) {
++		uint32_t v = 0;
++		(void)PE_parse_boot_argn("ignore_bad_spin", &v, sizeof(v));
++		allow = (v != 0) ? 1 : 0;
++	}
++	return allow != 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ #if DEVELOPMENT || DEBUG
+ __abortlike
+ static void
+@@ -736,6 +765,13 @@
+ 		how = "Destroyed";
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET SPIN: how spinlock %p <0x%016lx 0x%016lx> from %p %p, thread %p/%llu\n",
++		    how, lck, lck->lck_spin_data, lck->type,
++		    __builtin_return_address(0), __builtin_return_address(1),
++		    current_thread(), (unsigned long long)thread_tid(current_thread()));
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 	panic("%s spinlock %p: <0x%016lx 0x%16lx>",
+ 	    how, lck, lck->lck_spin_data, lck->type);
+ }
+@@ -745,6 +781,15 @@
+ {
+ 	if (lck->type != LCK_SPIN_TYPE ||
+ 	    lck->lck_spin_data == LCK_SPIN_TAG_DESTROYED) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_ignore_bad_spin()) {
++		printf("SWEET SPIN: "ignored" spinlock %p <0x%016lx 0x%016lx> from %p %p, thread %p/%llu\n",
++		    "ignored", lck, lck->lck_spin_data, lck->type,
++		    __builtin_return_address(0), __builtin_return_address(1),
++		    current_thread(), (unsigned long long)thread_tid(current_thread()));
++			return;
++		}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 		__lck_spin_invalid_panic(lck);
+ 	}
+ }

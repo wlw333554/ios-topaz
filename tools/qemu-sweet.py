@@ -182,6 +182,9 @@ def main():
                     help='VA of _iso_font: take the font from the payload (no llvm-nm needed)')
     ap.add_argument('--keep-raw', action='store_true', help='keep fb.raw')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
+    ap.add_argument('--root-img', help='raw root image (HFS+/APFS) loaded into guest RAM as a RAM disk; pair with rd=ufsroot0 (patch 0091e)')
+    ap.add_argument('--root-addr', type=lambda s: int(s, 0), help='guest physical addr for --root-img (default: just above the loaded kernel payload)')
+    ap.add_argument('--root-size', type=lambda s: int(s, 0), help='size of --root-img in bytes (default: file size)')
     a = ap.parse_args()
     FB_BASE = a.fb_base
     if a.fail_on_panic and not a.kernel:
@@ -211,12 +214,26 @@ def main():
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
+
+    # Optional RAM-disk root (patch 0091e's rd=ufsroot0 path): load a raw image
+    # into guest RAM at root_addr and let the kernel mount it. The whole image is
+    # resident in guest RAM, so it must be small -- on a 5.6 GiB host a ~2 GiB
+    # trimmed root is the practical ceiling (see qemu_check.py --root-img).
+    if a.root_img:
+        root_size = a.root_size or os.path.getsize(a.root_img)
+        root_addr = a.root_addr or (phys_base + mem_size)
+        ram_top_needed = root_addr + root_size
+        ram_gib = max(ram_gib, -(-(ram_top_needed - 0x40000000) // (1 << 30)))
+
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'tcp:127.0.0.1:{QMP_PORT},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    if a.root_img:
+        cmd += ['-device', f'loader,file={os.path.abspath(a.root_img)},addr={root_addr:#x},force-raw=on']
+        print(f'root-img={a.root_img} at {root_addr:#x} size={root_size:#x} (guest RAM {ram_gib}G)', file=sys.stderr)
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
