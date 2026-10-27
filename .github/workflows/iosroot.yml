@@ -1,10 +1,17 @@
 name: ios16-root image
 
 # Build the iOS 16 root filesystem image (ios16-root.img) that the evergo shim
-# kernel mounts as BSD root (rd=ufsroot0). Runs on Linux because mkiosroot.sh
-# needs apfs-fuse + hfsprogs + a FUSE mount + sudo.
+# kernel mounts as BSD root (rd=ufsroot0), and a trimmed RAM-loadable copy of it
+# for the QEMU gate (trimmed-root.img). Runs on Linux because mkiosroot.sh needs
+# apfs-fuse + hfsprogs + a FUSE mount + sudo.
 #
 # INPUTS
+#   -- provide the 16 GiB root image itself (RECOMMENDED) --
+#   root_img_tag  GitHub Release tag holding split parts (ios16-root.img.partNN)
+#   root_img_url  optional direct URL to a single plain ios16-root.img
+#                 (wins over root_img_tag when set)
+#
+#   -- or let CI build it from the IPSW DMGs --
 #   size          root image size passed to mkiosroot.sh (default 16G)
 #   dmgs_tag      GitHub Release tag holding split DMG parts (OS.dmg.part00 ...)
 #   dmgs_base_url optional base URL where the three plain DMGs are hosted
@@ -13,18 +20,31 @@ name: ios16-root image
 #   os_url / systemos_url / appos_url  optional three explicit direct URLs
 #   local_dmgs_dir (self-hosted only) local dir holding the three DMGs
 #
-# Acquisition priority: local_dmgs_dir > archive_url > os_url > dmgs_base_url
-#                       > dmgs_tag (split parts from a Release)
+# Acquisition priority: root_img_url > root_img_tag > local_dmgs_dir >
+#                       archive_url > os_url > dmgs_base_url > dmgs_tag
 #
-# The three DMGs (OS.dmg ~4.7G, SystemOS.dmg ~2.7G, AppOS.dmg ~10M) exceed
-# GitHub's 2 GiB per-file cap, so when using dmgs_tag they MUST be split into
-# <2 GiB parts first (see tools/split_dmgs.sh). The 16 GiB output is likewise
-# split before upload; reassemble locally with:
-#   cat ios16-root.img.part* > ios16-root.img
+# When a prebuilt root image is supplied the DMG download and mkiosroot.sh are
+# skipped entirely (~10 min saved) and CI goes straight to the trimmed build.
+# This is also the SAFEST path: mkiosroot.sh alone does NOT run
+# tools/sweet-root-tweaks.py, so a root rebuilt from the DMGs comes out with the
+# 7 live _PanicOnCrash launchd jobs that panic the box on the first daemon crash
+# (see NOTES-evergo.md v15). Supplying the image you already patched avoids that.
+#
+# The 16 GiB file exceeds GitHub's 2 GiB per-file cap, so it MUST be split into
+# <2 GiB parts first (see tools/split_dmgs.sh). Outputs are likewise split before
+# upload; reassemble locally with:
+#   cat ios16-root.img.part*      > ios16-root.img
+#   cat trimmed-root.img.part*    > trimmed-root.img
 
 on:
   workflow_dispatch:
     inputs:
+      root_img_url:
+        description: "Optional: direct URL to a single plain ios16-root.img (16G)"
+        default: ""
+      root_img_tag:
+        description: "Optional: Release tag holding split ios16-root.img.partNN parts"
+        default: ""
       size:
         description: "Root image size (mkiosroot.sh SIZE argument)"
         default: "16G"
@@ -121,7 +141,42 @@ jobs:
           echo "FUSE device OK"
           echo "apfs-fuse=$(command -v apfs-fuse) mkfs.hfsplus=$(command -v mkfs.hfsplus)"
 
+      # ---------------------------------------------------------------------
+      # Preferred: the 16 GiB root image already exists locally (v15+, i.e. the
+      # one that has been through sweet-root-tweaks.py). Upload it to a Release
+      # split into <2 GiB parts, point root_img_tag at it, and CI skips the DMG
+      # download + mkiosroot.sh entirely.
+      # ---------------------------------------------------------------------
+      - name: Acquire prebuilt root image
+        id: acquire
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p in
+          if [ -n "${{ inputs.root_img_url }}" ]; then
+            echo "downloading prebuilt root image from ${{ inputs.root_img_url }}"
+            curl -fL --retry 5 --retry-delay 5 -o ios16-root.img "${{ inputs.root_img_url }}"
+          elif [ -n "${{ inputs.root_img_tag }}" ]; then
+            echo "downloading prebuilt root image parts from release ${{ inputs.root_img_tag }}"
+            gh release download "${{ inputs.root_img_tag }}" -D in --repo "${{ github.repository }}"
+            if ls in/ios16-root.img.part* >/dev/null 2>&1; then
+              echo "reassembling ios16-root.img from parts"
+              cat in/ios16-root.img.part* > ios16-root.img
+            fi
+          fi
+          sz=$(stat -c%s ios16-root.img 2>/dev/null || echo 0)
+          echo "ios16-root.img size=$sz"
+          if [ "$sz" -gt 1073741824 ]; then
+            echo "have_root=true" >> "$GITHUB_OUTPUT"
+            echo "using the prebuilt root image (skipping DMG download + mkiosroot.sh)"
+          else
+            rm -f ios16-root.img
+            echo "have_root=false" >> "$GITHUB_OUTPUT"
+            echo "no usable prebuilt root image -> building it from the DMGs"
+          fi
+
       - name: Acquire DMGs
+        if: steps.acquire.outputs.have_root != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -172,6 +227,7 @@ jobs:
           ls -la dmgs
 
       - name: Build root image
+        if: steps.acquire.outputs.have_root != 'true'
         run: |
           sudo bash tools/mkiosroot.sh \
             dmgs/OS.dmg dmgs/SystemOS.dmg dmgs/AppOS.dmg \
@@ -181,19 +237,23 @@ jobs:
       # Trimmed, RAM-loadable root for QEMU (patch 0091e, rd=ufsroot0)
       #
       # The full 16 GiB image cannot be loaded into guest RAM on the test host
-      # (only ~3 GiB free, and the dyld shared cache alone is 3.12 GiB).  This step
+      # (only ~6 GiB free, and the dyld shared cache alone is 3.12 GiB).  This step
       # copies ONLY the files selected by the HakiOS trimming rules (see
       # tools/mk_trimmed_root_manifest.py) out of the full image into a fresh,
       # smaller HFS+ image, then applies the same launchd/container/audio/prefs
       # tweaks (tools/sweet-root-tweaks.py) the phone images get.  The result is
       # what qemu_check.py --root-img loads for the "test in QEMU before phone"
       # gate.  Needs the hfsplus module (ensured by Preflight) + loop mount.
+      #
+      # NOTE: the tweaks are applied by the trimmed build itself, so this is safe
+      # even when the source ios16-root.img was rebuilt from the DMGs by
+      # mkiosroot.sh (which does NOT run the tweaks).
       # ---------------------------------------------------------------------------
       - name: Build trimmed root image (QEMU RAM-disk)
         run: |
           # --min-mib 0: the RAM-disk root must be as small as it can be; the
           # 4096 MiB floor would otherwise pin it at exactly 4 GiB.
-          sudo python3 tools/build_trimmed_root.py ios16-root.img trimmed-root.img --min-mib 0 --min-mib 0
+          sudo python3 tools/build_trimmed_root.py ios16-root.img trimmed-root.img --min-mib 0
 
       - name: Split trimmed output (artifact files are capped at 2 GiB)
         run: |
