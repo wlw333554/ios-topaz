@@ -249,6 +249,24 @@ jobs:
       # even when the source ios16-root.img was rebuilt from the DMGs by
       # mkiosroot.sh (which does NOT run the tweaks).
       # ---------------------------------------------------------------------------
+      # ---------------------------------------------------------------------
+      # sweet-root-tweaks.py on the FULL root. mkiosroot.sh does not run it, and
+      # without it the root keeps the 7 live _PanicOnCrash launchd jobs (any
+      # daemon crashing once panics the box -- NOTES-evergo.md v15) and is
+      # missing the containers, the Setup-skip (purplebuddy/migration) prefs,
+      # the VirtualAudio disable and StartRecorderServer=false. Those all need
+      # HFS+ catalog writes, which is why the local byte-level patch could only
+      # do the _PanicOnCrash rename. Safe to re-run on an already tweaked image.
+      # ---------------------------------------------------------------------
+      - name: Apply sweet-root-tweaks.py to the full root
+        run: |
+          sudo mkdir -p /mnt/evergo_root
+          sudo umount /mnt/evergo_root 2>/dev/null || true
+          sudo mount -t hfsplus -oloop,rw,force ios16-root.img /mnt/evergo_root
+          sudo python3 tools/sweet-root-tweaks.py /mnt/evergo_root
+          sudo umount /mnt/evergo_root
+          sudo fsck.hfsplus -fy ios16-root.img
+
       - name: Build trimmed root image (QEMU RAM-disk)
         run: |
           # --min-mib 0: the RAM-disk root must be as small as it can be; the
