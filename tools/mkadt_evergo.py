@@ -112,6 +112,14 @@ def node(name, props=(), children=()):
 def build(seed=None, qemu=False, highmem=False, native=False, memdisk=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
+    if qemu and not highmem:
+        # QEMU only. A RAM-disk root (--memdisk / patch 0091e) has to sit ABOVE
+        # the DRAM the kernel manages, so a 2 GiB dram-size puts the image at
+        # 4 GiB and forces the guest to -m 7G -- more than this host can back
+        # (QEMU has no memory-backend-file, so guest RAM is committed host
+        # memory). qemu_check.py lowers this to 1 GiB when it boots with
+        # --root-img, which moves the image to 3 GiB and the guest to -m 6G.
+        mem_size = int(os.environ.get("QEMU_MEMSIZE", hex(mem_size)), 16)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
