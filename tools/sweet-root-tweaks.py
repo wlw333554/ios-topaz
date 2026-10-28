@@ -39,10 +39,33 @@ def load(path):
 
 
 def save(path, data, uid, gid, mode, fmt=plistlib.FMT_BINARY):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'wb') as f:
         plistlib.dump(data, f, fmt=fmt)
     os.chown(path, uid, gid)
     os.chmod(path, mode)
+
+
+def ensure_mobile_tree(path):
+    """Create the parent dirs of PATH and hand the /private/var/mobile part to
+    mobile. A trimmed root has no mobile home at all, so without this the plist
+    is written as root and SpringBoard (running as mobile) cannot read it."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    flat = d.replace('\\', '/')
+    i = flat.find('private/var/mobile')
+    if i < 0:
+        return
+    base = flat[:i + len('private/var/mobile')]
+    cur = flat
+    while len(cur) >= len(base):
+        try:
+            os.chown(cur, MOBILE, MOBILE)
+        except OSError:
+            pass
+        if cur == base:
+            break
+        cur = os.path.dirname(cur).replace('\\', '/')
 
 
 def merge_pref(root, name, values):
@@ -50,6 +73,7 @@ def merge_pref(root, name, values):
     path = os.path.join(root, 'private/var/mobile/Library/Preferences', name + '.plist')
     data = load(path) if os.path.exists(path) else {}
     data.update(values)
+    ensure_mobile_tree(path)
     save(path, data, MOBILE, MOBILE, 0o600)
     print('pref', name, sorted(values))
 

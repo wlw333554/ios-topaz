@@ -46,9 +46,40 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import mk_trimmed_root_manifest as M   # WHOLE / SKIP_* / wanted_file / DYLD_PREFIX
 
+# Where the dyld shared cache lives when it is stored as ORDINARY FILES (a root
+# rebuilt from the IPSW DMGs) rather than as HFS+ private-data specials. The
+# Linux hfsplus driver does not expose those specials at all, so HakiOS'
+# DYLD_PREFIX ("HFS+ Private Data/") silently contributed 0 bytes on CI -- run
+# 9's selection totalled 0.62 GiB instead of ~3.7 GiB. Without the cache nothing
+# under /usr/lib or any framework can launch, so keep this tree unconditionally.
+DYLD_CACHE_PREFIXES = ('System/Library/Caches/com.apple.dyld/',
+                       'System/Library/dyld/')
+
 
 def log(*a):
     print("[build_trimmed_root]", *a, flush=True)
+
+
+def report_dyld_locations(src):
+    """Log where the dyld shared cache actually lives on this source mount.
+
+    Without this the cache can be dropped silently and the run still "succeeds",
+    producing a small root that cannot boot at all -- so make it visible.
+    """
+    for p in (M.DYLD_PREFIX.rstrip('/'),) + tuple(x.rstrip('/') for x in DYLD_CACHE_PREFIXES):
+        full = os.path.join(src, p)
+        if not os.path.isdir(full):
+            log("dyld cache location MISSING:", p)
+            continue
+        tot = cnt = 0
+        for dirpath, _dirs, files in os.walk(full):
+            for fn in files:
+                try:
+                    tot += os.stat(os.path.join(dirpath, fn)).st_size
+                    cnt += 1
+                except OSError:
+                    pass
+        log(f"dyld cache location {p}: {cnt} files, {tot / 2 ** 30:.2f} GiB")
 
 
 def select_from_source(src_root):
@@ -96,7 +127,9 @@ def select_from_source(src_root):
                     # Linux HFS+ mount. Skip the entry instead of aborting the build.
                     log("stat skip", rel, se)
                     continue
-                if rel.startswith(M.DYLD_PREFIX) or M.wanted_file(rel, size):
+                if (rel.startswith(M.DYLD_PREFIX)
+                        or any(rel.startswith(p) for p in DYLD_CACHE_PREFIXES)
+                        or M.wanted_file(rel, size)):
                     reg.add(rel)
                     add_ancestors(rel)
                     total += size
@@ -149,16 +182,21 @@ def main():
     # /mnt/evergo_src. Unmounting it right after selection (as this used to do)
     # made every readlink()/copy2() fail with ENOENT -- CI run 8 died on the very
     # first symlink, /Library/Keychains. It is unmounted only after the copy.
+    report_dyld_locations(src)
     reg, syms, dirs, total = select_from_source(src)
 
     log(f"kept bytes = {total/1024**3:.2f} GiB")
     if a.size_mib:
         size_mib = a.size_mib
     else:
-        # minimal slack: a freshly built HFS+ needs ~5% headroom for the
-        # catalog/extents/journal + a little room for sweet-root-tweaks to write
-        # plists. Kept tight so the image stays RAM-loadable under QEMU.
-        size_mib = max(a.min_mib, int(total / (1024 * 1024) * 1.05) + 64)
+        # Sizing = content + worst-case 4 KiB block rounding per file + room for
+        # the catalog/extents/journal and for sweet-root-tweaks to write plists.
+        # The old "+64 MiB" ignored block rounding entirely: with 52791 files that
+        # is ~200 MiB of slack, and CI run 9 ran out of space (ENOSPC) with 741
+        # files left uncopied. Kept as tight as is safe so the image still fits
+        # in guest RAM.
+        blocks_mib = len(reg) * 4 // 1024
+        size_mib = max(a.min_mib, int(total / (1024 * 1024) * 1.05) + blocks_mib + 256)
     log(f"output image size = {size_mib} MiB")
 
     # 1) size the output file and make an empty HFS+
@@ -222,11 +260,14 @@ def main():
             if n % 2000 == 0:
                 log(f"  copied {n}/{len(reg)}")
         log(f"copied {n} regular files ({skipped} skipped)")
-        # Sanity: zero copies out of a non-empty selection means the source was
-        # not readable (e.g. unmounted). Fail loudly rather than ship an image
-        # that looks fine but boots to nothing.
-        if reg and n == 0:
-            raise SystemExit(f"FATAL: 0 of {len(reg)} files copied; source unreadable?")
+        # Any skipped file means an INCOMPLETE image. CI run 9 hit ENOSPC and
+        # quietly dropped 741 of 52791 files yet still reached this point; a
+        # partial root looks fine on disk and then fails somewhere unrelated, so
+        # fail here instead where the cause is obvious.
+        if skipped or (reg and n == 0):
+            raise SystemExit(
+                f"FATAL: {skipped} of {len(reg)} selected files could not be copied "
+                f"(copied {n}); the image would be incomplete")
     finally:
         subprocess.run(['umount', tgt], stderr=subprocess.DEVNULL)
 
