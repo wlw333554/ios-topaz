@@ -941,11 +941,46 @@ mkiosroot.sh**（省 ~10 分钟）。更关键的是**避开 v15 那个坑**：`
 **不跑** `sweet-root-tweaks.py`，从 DMG 重建出来的根带着 7 个活的 `_PanicOnCrash`。
 （裁剪那步自己会跑 tweaks，所以两条路出来的裁剪根都是对的。）
 
-### 当前状态
+### v18：spinlock panic 深挖（locks_arm.c:740）
 
-**待 push 的 4 个 commit**：`d7005f1`（门禁全套 + 0091e/0092e）、`1c2abca`
-（工作流吃预置镜像）、`142cf4c`（QEMU DRAM 尺寸）、`fba7388`（修 0092e printf）。
+原始 panic：`invalid spinlock 0xfffffe1b3b00c4d0 @ locks_arm.c:740`。
 
-之后：给 CI 16G 源 → 取 `trimmed-root-img-parts`（约 4G）`cat` 重组 →
-宿主空闲堆到 ≥6GiB → `qemu_check.py --root-img trimmed-root.img --secs 75`
-复现 spinlock panic，读 `SWEET SPIN` 的 caller 地址离线符号化。
+- **0092e 是活的**：`osfmk/arm/locks.h:34 #define LCK_SPIN_IS_TICKET_LOCK 0`
+  ⇒ 编译的是 `!LCK_SPIN_IS_TICKET_LOCK` 分支（locks_arm.c 725–824），即经典
+  `lck_spin_lock → lck_spin_verify → __lck_spin_invalid_panic`。0092e 往这条路径
+  插的 `SWEET SPIN` 诊断**会**真正执行（不是死代码）。曾担心 ticket-lock 分支会
+  让 0092e 失效，已排除。
+- **格式串不一致**：当前 `_bt12` 源码 line 740 是
+  `panic("%s spinlock %p: <0x%016lx 0x%16lx>", ...)`（how∈{Invalid,Destroyed}），
+  与用户贴的 `invalid spinlock %p @ %s:%d` 不同 ⇒ 手机那版是**更旧的 locks_arm.c
+  修订**，别被旧格式串误导；要的是 0092e 新加的 `SWEET SPIN: ... from %p %p` 行。
+- **锁在 kmap 动态区**：`0xfffffe1b3b00c4d0` 落在 `0xfffffe1b...`，远高于静态内核
+  文本（`_lck_spin_lock` 在 `0xfffffe0007486dac`）。静态符号表解析不到它 ⇒ 是**动态
+  kalloc 出来的结构里的锁**。
+- **how=Invalid（非 Destroyed）** ⇒ `lck->type != LCK_SPIN_TYPE` 且 data 不是
+  `LCK_SPIN_TAG_DESTROYED` ⇒ 锁的 type 字段被清零 ⇒ 结构是**未初始化或已释放后被
+  复用（use-after-free）**。定位靠 `SWEET SPIN` 的 caller PC（在静态文本里，可符号化）。
+- 离线符号化工具已就绪：`E:/iOS/sym_kernel.py`（解析 development 内核 Mach-O 符号表，
+  把 PC 还原成 `symbol+offset`）。已用 `_lck_spin_lock` 自解析验证可用。
+
+### 当前状态（2026-10-26）
+
+**待 push 的 2 个 commit**（前 4 个 `d7005f1`/`1c2abca`/`142cf4c`/`fba7388` 用户已在本机
+push，只剩这两个）：`794fcf7`（docs v16/v17）、`3360e9e`（iosroot.yml 跑 tweaks）。
+工作树 clean，分支 `evergo` 领先 `origin/evergo` 2 个。
+
+**QEMU 门禁当前被两道墙挡住**：
+1. 本地 `kern_tmp/kernel.development.sweet` 是**旧内核**，二进制里搜不到 `SWEET SPIN` /
+   `ignore_bad_spin` ⇒ 没有 0092e。要拿带诊断的内核**必须先 push + CI 重编**。
+2. 宿主空闲内存仅 **2.79 GiB**（Chrome/QQ 等没关），连无 root 的 4G 虚机都 OOM，
+   更别说 6G。要跑门禁得把空闲堆到 **≥6GiB**。
+
+**之后流程**：push 2 commit → 给 CI 16G 源（或预置 `ios16-root.img`，用
+`root_img_tag` 入口触发 `iosroot.yml`）→ 取 `trimmed-root-img-parts`（约 4G）`cat`
+重组出 `trimmed-root.img` → 宿主空闲 ≥6GiB → `qemu_check.py --root-img
+trimmed-root.img --secs 75`（如需全看坏锁加 `ignore_bad_spin=1` 进 boot-args）→
+从 `SWEET SPIN` 行取 caller PC → `sym_kernel.py` 离线符号化定位是哪把锁。
+
+**捷径（若用户有手机端完整 panic 日志）**：xnu `panic()` 会打 backtrace（一串 PC）。
+若有当时的寄存器/回溯 dump，可**直接**用现有 `kernel.development.sweet` 的符号表
+（`sym_kernel.py`）符号化，省掉整个 QEMU+CI 等待。

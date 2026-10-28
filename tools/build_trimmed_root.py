@@ -88,13 +88,21 @@ def select_from_source(src_root):
                     stack.append(e.path)
                     continue
                 # regular file
-                size = e.stat(follow_symlinks=False).st_size
+                try:
+                    size = e.stat(follow_symlinks=False).st_size
+                except OSError as se:
+                    # Non-ASCII / encoding-broken names (e.g. a Thai-localized
+                    # .shortcut under WorkflowKit th.lproj) can fail to stat on the
+                    # Linux HFS+ mount. Skip the entry instead of aborting the build.
+                    log("stat skip", rel, se)
+                    continue
                 if rel.startswith(M.DYLD_PREFIX) or M.wanted_file(rel, size):
                     reg.add(rel)
                     add_ancestors(rel)
                     total += size
             except OSError as e:
-                log("stat skip", e.path, e)
+                # is_symlink()/is_dir() can also throw on a broken entry; skip it.
+                log("entry skip", rel, getattr(e, 'filename', None), e)
     log(f"keep: {len(reg)} regular files, {len(syms)} symlinks, {len(dirs)} dirs, {total/1073741824:.2f} GiB")
     return reg, syms, dirs, total
 

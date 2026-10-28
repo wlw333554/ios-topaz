@@ -213,7 +213,10 @@ def main():
     mon = f'tcp:127.0.0.1:{QMP_PORT}'
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
-    ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
+    # floor lowered from 4 -> 2 so a small-DRAM QEMU boot fits a memory-tight
+    # host (the root-gate path recomputes ram_gib from root_addr+root_size and
+    # is unaffected). TODO: restore to 4 once the host has >=6 GiB free.
+    ram_gib = max(2, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
 
     # Optional RAM-disk root (patch 0091e's rd=ufsroot0 path): load a raw image
     # into guest RAM at root_addr and let the kernel mount it. The whole image is

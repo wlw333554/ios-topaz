@@ -5,11 +5,11 @@ name: ios16-root image
 # for the QEMU gate (trimmed-root.img). Runs on Linux because mkiosroot.sh needs
 # apfs-fuse + hfsprogs + a FUSE mount + sudo.
 #
-# INPUTS
-#   -- provide the 16 GiB root image itself (RECOMMENDED) --
-#   root_img_tag  GitHub Release tag holding split parts (ios16-root.img.partNN)
-#   root_img_url  optional direct URL to a single plain ios16-root.img
+# INPUTS  (CURRENT METHOD: give a download link to the prebuilt, already
+#          tweaked 16 GiB root image -- CI trims it, it does NOT rebuild DMGs)
+#   root_img_url  direct URL to a single plain ios16-root.img  <<< preferred/current
 #                 (wins over root_img_tag when set)
+#   root_img_tag  GitHub Release tag holding split parts (ios16-root.img.partNN)
 #
 #   -- or let CI build it from the IPSW DMGs --
 #   size          root image size passed to mkiosroot.sh (default 16G)
@@ -142,10 +142,11 @@ jobs:
           echo "apfs-fuse=$(command -v apfs-fuse) mkfs.hfsplus=$(command -v mkfs.hfsplus)"
 
       # ---------------------------------------------------------------------
-      # Preferred: the 16 GiB root image already exists locally (v15+, i.e. the
-      # one that has been through sweet-root-tweaks.py). Upload it to a Release
-      # split into <2 GiB parts, point root_img_tag at it, and CI skips the DMG
-      # download + mkiosroot.sh entirely.
+      # CURRENT METHOD (user direction 2026-10-28): supply a download link to
+      # the prebuilt, already-tweaked 16 GiB root image via `root_img_url`
+      # (direct URL). CI then applies the current tools/sweet-root-tweaks.py
+      # (idempotent) and trims it for the QEMU RAM-disk gate -- it does NOT
+      # rebuild from the DMGs. The DMG-rebuild path below is only a fallback.
       # ---------------------------------------------------------------------
       - name: Acquire prebuilt root image
         id: acquire
