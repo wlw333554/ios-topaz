@@ -140,13 +140,16 @@ def main():
         log("WARNING: not root; loop mount will fail. Run under sudo.")
 
     src = ensure_mount(a.src_img, a.src_mount, ro=True)
-    try:
-        # total MUST be accumulated while the source is mounted -- once the source
-        # is unmounted every stat() fails and the size would silently collapse to 0,
-        # pinning the output image at --min-mib.
-        reg, syms, dirs, total = select_from_source(src)
-    finally:
-        subprocess.run(['umount', src], stderr=subprocess.DEVNULL)
+    # total MUST be accumulated while the source is mounted -- once the source
+    # is unmounted every stat() fails and the size would silently collapse to 0,
+    # pinning the output image at --min-mib.
+    #
+    # The source must ALSO stay mounted for the copy phase further down: the
+    # symlink and regular-file steps read their bytes straight off
+    # /mnt/evergo_src. Unmounting it right after selection (as this used to do)
+    # made every readlink()/copy2() fail with ENOENT -- CI run 8 died on the very
+    # first symlink, /Library/Keychains. It is unmounted only after the copy.
+    reg, syms, dirs, total = select_from_source(src)
 
     log(f"kept bytes = {total/1024**3:.2f} GiB")
     if a.size_mib:
@@ -219,8 +222,16 @@ def main():
             if n % 2000 == 0:
                 log(f"  copied {n}/{len(reg)}")
         log(f"copied {n} regular files ({skipped} skipped)")
+        # Sanity: zero copies out of a non-empty selection means the source was
+        # not readable (e.g. unmounted). Fail loudly rather than ship an image
+        # that looks fine but boots to nothing.
+        if reg and n == 0:
+            raise SystemExit(f"FATAL: 0 of {len(reg)} files copied; source unreadable?")
     finally:
         subprocess.run(['umount', tgt], stderr=subprocess.DEVNULL)
+
+    # Only now is the source expendable -- every step above read from it.
+    subprocess.run(['umount', src], stderr=subprocess.DEVNULL)
 
     # 5) tweaks
     if not a.no_tweaks and os.path.exists(a.tweaks):
