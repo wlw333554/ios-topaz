@@ -981,6 +981,101 @@ push，只剩这两个）：`794fcf7`（docs v16/v17）、`3360e9e`（iosroot.ym
 trimmed-root.img --secs 75`（如需全看坏锁加 `ignore_bad_spin=1` 进 boot-args）→
 从 `SWEET SPIN` 行取 caller PC → `sym_kernel.py` 离线符号化定位是哪把锁。
 
+## v19：spinlock 诊断模块深挖（2026-10-29 凌晨）
+
+v18 只确定了「0092e 是活代码、锁在 kmap 动态区」。这一轮把 `osfmk/arm/locks_arm.c`
+这个模块本身拆开看，补上四件之前不知道的事。
+
+### 1. panic 只可能发生在「加锁」路径上
+
+`lck_spin_verify()` 全文件共 10 个调用点，**没有一个在 unlock 路径**：
+
+`lck_spin_lock`、`lck_spin_lock_grp`、`lck_spin_lock_nopreempt`、
+`lck_spin_lock_nopreempt_grp`、`lck_spin_try_lock`、`lck_spin_try_lock_grp`、
+`lck_spin_try_lock_nopreempt`、`lck_spin_try_lock_nopreempt_grp`（820–875），
+外加 882 / 889 / 896 三处。
+
+⇒ panic 的语义是「**有人试图获取一把 type 字段不对的锁**」，而不是「解锁时才发现坏了」。
+排查方向因此是「谁拿到了这个（未初始化 / 已释放的）结构的指针并去加锁」，
+而不是「谁把它改坏了」。
+
+### 2. 结构体布局与常量（用来解读打印出来的两个 word）
+
+```c
+/* osfmk/arm/locks.h:70，!LCK_SPIN_IS_TICKET_LOCK 分支 */
+typedef struct {
+        struct hslock   hwlock;   /* offset 0: { uintptr_t lock_data; }  8B */
+        unsigned long   type;     /* offset 8 */
+} lck_spin_t;                     /* 共 16 字节 */
+#define lck_spin_data hwlock.lock_data
+```
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `LCK_SPIN_TYPE` | `0x00000011` | 合法初始化的自旋锁 |
+| `LCK_SPIN_TYPE_DESTROYED` | `0x000000ee` | 已销毁 |
+| `LCK_SPIN_TAG_DESTROYED` | `0xdead` | data 字上的销毁标记 |
+
+- `lck_spin_data`（第一个 word）= **持有者的 thread 指针**，未锁时为 0
+  （locks_arm.c:916 正是用 `data != 0` 判断是否已上锁）。
+- 坏锁 `0xfffffe1b3b00c4d0` **16 字节对齐**，与 `lck_spin_alloc_init()` 走的
+  `zalloc(KT_LCK_SPIN)` zone 元素尺寸吻合 ⇒ 确认是**动态分配**出来的锁，
+  不是静态变量、也不是嵌在全局结构里的那种。
+- `how=Invalid` ⇒ type 既不是 `0x11` 也不是 `0xee`、data 也不是 `0xdead`；
+  最常见就是 **type 为 0**：结构从未初始化，或释放后内存被复用 / 清零（UAF）。
+
+### 3. ★ 两个 printf 的 `return_address(0/1)` 含义不一样（最容易读错）
+
+0092e 插了**两处** `SWEET SPIN`，它们的栈帧并不相同：
+
+| 打印位置 | how 字段 | RA(0) | RA(1) |
+|---|---|---|---|
+| `__lck_spin_invalid_panic()`（真函数，`__abortlike`） | `Invalid` / `Destroyed` | 锁操作函数（`lck_spin_lock` 等） | **真凶** |
+| `lck_spin_verify()` 的 ignore 分支（`static inline`） | `ignored` | **真凶** | 真凶的调用者 |
+
+判定办法：两个地址**都**喂给 `sym_kernel.py`，
+**落在上面那 10 个 lock-op 名字里的那个是「锁操作函数」，另一个才是真凶**。
+若 RA(0) 符号化出来是 `lck_spin_verify` 本身（说明该调用点没被内联），
+真凶就还在更外一层，只能看 panic 自带的 backtrace。
+
+### 4. ★ 0092e 没盖住的口子：`lck_spin_assert()`
+
+`locks_arm.c:798` 还有一处：
+
+```c
+if (lock->type != LCK_SPIN_TYPE) {
+        panic("Invalid spinlock %p", lock);   /* ← 0092e 没动这里 */
+}
+```
+
+0092e 的三个 hunk 只覆盖 `sweet_ignore_bad_spin()`、`__lck_spin_invalid_panic()`
+和 `lck_spin_verify()`，**没有覆盖 `lck_spin_assert()`**。
+万一真凶从 assert 路径进来，就**永远等不到 SWEET SPIN 行**。
+⇒ 若带 0092e 的内核一次都没打出 SWEET SPIN 却照样 panic，先怀疑这里，
+需要再补一个 0093e 给它加上同样的打印。
+
+### 5. 那一行怎么读
+
+```
+SWEET SPIN: <how> spinlock <addr> <<data> <type>> from <pc0> <pc1>, thread <t>/<tid>
+```
+
+- `how`：`Invalid` / `Destroyed` / `ignored`（`ignore_bad_spin=1` 时）
+- `data`：非 0 即持有者 thread 指针（可再看是谁正拿着它）
+- `type`：**必须是 `0x11`**；为 0 ⇒ 未初始化或 UAF
+- `pc0/pc1`：按第 3 节那张表取真凶，交给 `sym_kernel.py`
+- 加 `ignore_bad_spin=1` 只报告不 panic，一次开机能把**所有**坏锁一次性看全
+
+### 当前状态（2026-10-29 00:10）
+
+- 内核：`kern_tmp/kernel.development.sweet`（CI run 40600859540，含修好的 0092e，
+  sha256 `2d29a773…`），二进制里 `SWEET SPIN` / `sweet_ignore_bad_spin` 已确认存在。
+- 无 root 的 QEMU 启动已跑过：**全程干净，无 SWEET SPIN、无 panic**
+  ⇒ 坏锁在 root 挂载 / 早期用户态 / launchd 之后，必须挂 root 才复现。
+- 卡点仍是 root：CI `ios16-root image` 一连修了 5 个 bug（#6–#9，见
+  `.workbuddy/memory/2026-10-28.md`），#10（run 40722516918）在跑；
+  出 `trimmed-root.img` 后才能上 QEMU 门禁，宿主仍需 **≥6 GiB** 空闲。
+
 **捷径（若用户有手机端完整 panic 日志）**：xnu `panic()` 会打 backtrace（一串 PC）。
 若有当时的寄存器/回溯 dump，可**直接**用现有 `kernel.development.sweet` 的符号表
 （`sym_kernel.py`）符号化，省掉整个 QEMU+CI 等待。
