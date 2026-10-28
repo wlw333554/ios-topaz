@@ -187,18 +187,38 @@ def main():
                     os.rmdir(sp)
                 except OSError:
                     pass
-            os.symlink(os.readlink(srcp), sp)
+            # readlink() is a path lookup on the SOURCE mount, so it hits the
+            # exact same HFS+ encoding hazard as stat() did during selection:
+            # a symlink whose name cannot be looked up (non-ASCII / decomposed)
+            # raises FileNotFoundError. Skip it rather than killing the build.
+            try:
+                link_target = os.readlink(srcp)
+            except OSError as e:
+                log("readlink skip", s, getattr(e, 'filename', None), e)
+                continue
+            os.symlink(link_target, sp)
         # 4) regular files (incl. dyld cache under HFS+ Private Data/)
         n = 0
+        skipped = 0
         for f in sorted(reg):
             sp = os.path.join(a.src_mount, f)
             dp = os.path.join(tgt, f)
             os.makedirs(os.path.dirname(dp), exist_ok=True)
-            shutil.copy2(sp, dp)
+            # Same class of failure as readlink/stat: a source path that cannot
+            # be opened on the HFS+ mount. Log and move on instead of aborting a
+            # 14-minute CI job -- the skip count is reported so a large number
+            # of skips (i.e. something actually wrong) is visible.
+            try:
+                shutil.copy2(sp, dp)
+            except OSError as e:
+                skipped += 1
+                if skipped <= 20:
+                    log("copy skip", f, getattr(e, 'filename', None), e)
+                continue
             n += 1
             if n % 2000 == 0:
                 log(f"  copied {n}/{len(reg)}")
-        log(f"copied {n} regular files")
+        log(f"copied {n} regular files ({skipped} skipped)")
     finally:
         subprocess.run(['umount', tgt], stderr=subprocess.DEVNULL)
 
