@@ -69,6 +69,10 @@ on:
       appos_url:
         description: "Optional: direct URL to AppOS.dmg"
         default: ""
+      no_dyld:
+        description: "Drop the dyld shared cache from the trimmed QEMU RAM-disk root so it fits the ~2 GiB ml_io_map() ceiling. launchd cannot start, so only kernel-path (pre-dyld) panics reproduce."
+        type: boolean
+        default: false
 
 concurrency:
   group: iosroot-${{ github.ref }}
@@ -272,7 +276,16 @@ jobs:
         run: |
           # --min-mib 0: the RAM-disk root must be as small as it can be; the
           # 4096 MiB floor would otherwise pin it at exactly 4 GiB.
-          sudo python3 tools/build_trimmed_root.py ios16-root.img trimmed-root.img --min-mib 0
+          #
+          # --no-dyld (when inputs.no_dyld): drop the 3.11 GiB dyld shared cache
+          # so the trimmed root fits inside the ~2 GiB ml_io_map() ceiling
+          # (patch 0091e) that the QEMU RAM-disk gate can actually map into
+          # guest RAM. launchd cannot start without the dyld cache, so this only
+          # reproduces spinlocks that fire BEFORE dyld/launchd (kernel root mount
+          # + IOKit matching).
+          ARGS="--min-mib 0"
+          if [ "${{ inputs.no_dyld }}" = "true" ]; then ARGS="$ARGS --no-dyld"; fi
+          sudo python3 tools/build_trimmed_root.py ios16-root.img trimmed-root.img $ARGS
 
       - name: Split trimmed output (artifact files are capped at 2 GiB)
         run: |

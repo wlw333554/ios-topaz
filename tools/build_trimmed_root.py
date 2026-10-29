@@ -82,8 +82,14 @@ def report_dyld_locations(src):
         log(f"dyld cache location {p}: {cnt} files, {tot / 2 ** 30:.2f} GiB")
 
 
-def select_from_source(src_root):
-    """Walk the mounted source; return (reg, syms, dirs, total_bytes) of paths to keep."""
+def select_from_source(src_root, keep_dyld=True):
+    """Walk the mounted source; return (reg, syms, dirs, total_bytes) of paths to keep.
+
+    keep_dyld=False drops the dyld shared cache (3+ GiB) so the result fits a
+    small QEMU RAM-disk root (the ml_io_map ceiling is ~2 GiB). Without dyld,
+    launchd cannot start, so this is only for catching kernel-path panics that
+    fire before dyld is needed.
+    """
     reg, syms, dirs = set(), set(), set()
     total = 0
 
@@ -111,7 +117,7 @@ def select_from_source(src_root):
                     # iOS) unconditionally: they are boot-critical, carry no data,
                     # and nothing is recorded under their own name, so there is no
                     # real-dir conflict. Nested symlinks keep the HakiOS rules.
-                    if rel.count('/') == 0 or any(rel.startswith(p) for p in M.WHOLE) or rel.startswith(M.DYLD_PREFIX):
+                    if rel.count('/') == 0 or any(rel.startswith(p) for p in M.WHOLE) or (keep_dyld and rel.startswith(M.DYLD_PREFIX)):
                         syms.add(rel)
                         add_ancestors(rel)
                     continue
@@ -127,9 +133,9 @@ def select_from_source(src_root):
                     # Linux HFS+ mount. Skip the entry instead of aborting the build.
                     log("stat skip", rel, se)
                     continue
-                if (rel.startswith(M.DYLD_PREFIX)
-                        or any(rel.startswith(p) for p in DYLD_CACHE_PREFIXES)
-                        or M.wanted_file(rel, size)):
+                if ((rel.startswith(M.DYLD_PREFIX)
+                        or any(rel.startswith(p) for p in DYLD_CACHE_PREFIXES))
+                        and keep_dyld) or M.wanted_file(rel, size):
                     reg.add(rel)
                     add_ancestors(rel)
                     total += size
@@ -167,6 +173,8 @@ def main():
     ap.add_argument('--no-tweaks', action='store_true')
     ap.add_argument('--src-mount', default='/mnt/evergo_src')
     ap.add_argument('--tgt-mount', default='/mnt/evergo_tgt')
+    ap.add_argument('--no-dyld', action='store_true',
+                    help='drop the dyld shared cache (3+ GiB) so the result fits a small QEMU RAM-disk root; launchd will not start')
     a = ap.parse_args()
 
     if os.geteuid() != 0:
@@ -183,7 +191,9 @@ def main():
     # made every readlink()/copy2() fail with ENOENT -- CI run 8 died on the very
     # first symlink, /Library/Keychains. It is unmounted only after the copy.
     report_dyld_locations(src)
-    reg, syms, dirs, total = select_from_source(src)
+    if a.no_dyld:
+        log("NOTE: --no-dyld set: the dyld shared cache is EXCLUDED; the root will be small enough for the QEMU RAM-disk gate but launchd cannot start")
+    reg, syms, dirs, total = select_from_source(src, keep_dyld=not a.no_dyld)
 
     log(f"kept bytes = {total/1024**3:.2f} GiB")
     if a.size_mib:
