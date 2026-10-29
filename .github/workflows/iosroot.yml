@@ -9,6 +9,10 @@ name: ios16-root image
 #          tweaked 16 GiB root image -- CI trims it, it does NOT rebuild DMGs)
 #   root_img_url  direct URL to a single plain ios16-root.img  <<< preferred/current
 #                 (wins over root_img_tag when set)
+#   root_img_archive_url  direct URL to ONE .7z/.zip holding the prebuilt root
+#                 .img (trimmed-root.img). CI extracts it. Use when a plain
+#                 4 GiB file upload times out but a compressed archive is OK.
+#                 NOTE: contains an .img, NOT the DMGs -- different from archive_url.
 #   root_img_tag  GitHub Release tag holding split parts (ios16-root.img.partNN)
 #
 #   -- or let CI build it from the IPSW DMGs --
@@ -20,8 +24,8 @@ name: ios16-root image
 #   os_url / systemos_url / appos_url  optional three explicit direct URLs
 #   local_dmgs_dir (self-hosted only) local dir holding the three DMGs
 #
-# Acquisition priority: root_img_url > root_img_tag > local_dmgs_dir >
-#                       archive_url > os_url > dmgs_base_url > dmgs_tag
+# Acquisition priority: root_img_url > root_img_archive_url > root_img_tag >
+#                       local_dmgs_dir > archive_url > os_url > dmgs_base_url > dmgs_tag
 #
 # When a prebuilt root image is supplied the DMG download and mkiosroot.sh are
 # skipped entirely (~10 min saved) and CI goes straight to the trimmed build.
@@ -73,6 +77,9 @@ on:
         description: "Drop the dyld shared cache from the trimmed QEMU RAM-disk root so it fits the ~2 GiB ml_io_map() ceiling. launchd cannot start, so only kernel-path (pre-dyld) panics reproduce."
         type: boolean
         default: false
+      root_img_archive_url:
+        description: "Direct URL to ONE .7z/.zip containing the prebuilt, already-tweaked root image (trimmed-root.img / ios16-root.img, ~4.36 GiB). CI downloads it, extracts the .img and uses it as the prebuilt root -- skips DMG download + mkiosroot.sh. Use this when a plain 4 GiB upload times out but a compressed archive works."
+        default: ""
 
 concurrency:
   group: iosroot-${{ github.ref }}
@@ -161,6 +168,21 @@ jobs:
           if [ -n "${{ inputs.root_img_url }}" ]; then
             echo "downloading prebuilt root image from ${{ inputs.root_img_url }}"
             curl -fL --retry 5 --retry-delay 5 -o ios16-root.img "${{ inputs.root_img_url }}"
+          elif [ -n "${{ inputs.root_img_archive_url }}" ]; then
+            echo "downloading root image ARCHIVE"
+            curl -fL --retry 5 --retry-delay 5 -o in/root_archive.pkg "${{ inputs.root_img_archive_url }}"
+            echo "archive size=$(stat -c%s in/root_archive.pkg)"
+            rm -rf in/root_extract && mkdir -p in/root_extract
+            7z x -y in/root_archive.pkg -oin/root_extract
+            rm -f in/root_archive.pkg
+            img=$(find in/root_extract -type f -name '*.img' | head -n1)
+            if [ -z "$img" ]; then
+              echo "ERROR: no *.img found inside the archive -- contents:"
+              find in/root_extract -maxdepth 3 -type f
+              exit 1
+            fi
+            echo "extracted root image: $img ($(stat -c%s "$img") bytes)"
+            mv "$img" ios16-root.img
           elif [ -n "${{ inputs.root_img_tag }}" ]; then
             echo "downloading prebuilt root image parts from release ${{ inputs.root_img_tag }}"
             gh release download "${{ inputs.root_img_tag }}" -D in --repo "${{ github.repository }}"
