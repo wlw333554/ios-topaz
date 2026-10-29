@@ -45,7 +45,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	char want[64] = "userdata";
  	int error;
  
-@@ -681,6 +695,50 @@
+@@ -681,6 +695,66 @@
  	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
  	su.cache = (cache == 1);
  	su.wait = (wait == 1);
@@ -64,7 +64,23 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	PE_parse_boot_argn("ufsmemdisk", &memdisk, sizeof(memdisk));
 +	if (memdisk != 0) {
 +		su.memdisk = true;
-+		su.regs = ml_io_map(reg[0], reg[1]);
++		/*
++		 * ml_io_map() only hands out addresses from an 8 MiB io_submap
++		 * (it exists for device registers), so a GiB-sized image can
++		 * never be mapped with it -- that is why the very first
++		 * mount attempt died inside kmem_alloc().
++		 *
++		 * ml_io_map_unmappable() allocates from kernel_map instead,
++		 * which is large enough for the whole image, and it lets us
++		 * choose the attributes: the RAM disk is ordinary memory, so
++		 * map it cached/ordinary (VM_WIMG_DEFAULT) rather than as
++		 * device space -- memcpy() on device memory faults on the
++		 * unaligned head/tail bytes.
++		 */
++		extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr,
++		    vm_size_t size, unsigned int flags);
++		su.regs = ml_io_map_unmappable((vm_offset_t)reg[0],
++		    (vm_size_t)reg[1], VM_WIMG_DEFAULT);
 +		if (!su.regs) {
 +			printf("SWEET UFS: cannot map the RAM disk at 0x%llx (%llu bytes)\n",
 +			    (uint64_t)reg[0], (uint64_t)reg[1]);
