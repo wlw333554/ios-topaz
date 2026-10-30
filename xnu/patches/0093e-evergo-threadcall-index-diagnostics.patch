@@ -1,0 +1,162 @@
+diff --git a/osfmk/kern/thread_call.c b/osfmk/kern/thread_call.c
+index 5235e40..9264279 100644
+--- a/osfmk/kern/thread_call.c
++++ b/osfmk/kern/thread_call.c
+@@ -53,6 +53,12 @@
+ #endif
+ #include <machine/machine_routines.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <libkern/kernel_mach_header.h>
++#include <pexpert/pexpert.h>
++#include <kern/misc_protos.h>
++#endif
++
+ static KALLOC_TYPE_DEFINE(thread_call_zone, thread_call_data_t,
+     KT_PRIV_ACCT | KT_NOSHARED);
+ 
+@@ -244,6 +250,109 @@ enable_ints_and_unlock(thread_call_group_t group, spl_t s)
+ 	splx(s);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * evergo: an out-of-range tc_index means whoever called us handed over a thread
++ * call that was never armed, or one whose storage is already gone. Upstream
++ * panics naming only the thread call and the function it carries, which says
++ * nothing about which caller was there -- and on this port the answer has to
++ * come off-line, from whatever the console managed to keep.
++ *
++ * Resolve a return address to "symbol+offset" from the kernel's own LC_SYMTAB,
++ * the way panic_print_symbol_name() does on x86_64; on arm that helper is an
++ * empty stub, so the lookup rides here instead. The table is read defensively:
++ * a missing __LINKEDIT, or a symbol count that cannot be right, leaves the
++ * plain address in the line instead of touching memory we cannot trust.
++ *
++ * With boot-arg ignore_bad_threadcall=1 the thread call is repaired onto the
++ * user group and the boot carries on, so whatever comes after it shows up on
++ * the console too rather than stopping at the first bad index.
++ */
++static int
++evergo_bad_threadcall_ignored(void)
++{
++	static int allow = -1;
++
++	if (allow < 0) {
++		uint32_t v = 0;
++
++		(void)PE_parse_boot_argn("ignore_bad_threadcall", &v, sizeof(v));
++		allow = (v != 0) ? 1 : 0;
++	}
++	return allow;
++}
++
++static void
++evergo_symbol_snprintf(char *buf, size_t buflen, void *addr)
++{
++	kernel_mach_header_t   *mh = &_mh_execute_header;
++	struct load_command    *cmd;
++	kernel_segment_command_t *text = NULL;
++	kernel_segment_command_t *linkedit = NULL;
++	struct symtab_command  *st = NULL;
++	kernel_nlist_t         *syms;
++	const char             *strings;
++	const char             *bestname = NULL;
++	uintptr_t               slide, target, best = 0;
++	uint32_t                i;
++
++	buf[0] = '\0';
++	if (addr == NULL) {
++		return;
++	}
++
++	cmd = (struct load_command *)(void *)(mh + 1);
++	for (i = 0; i < mh->ncmds; i++) {
++		if (cmd->cmd == LC_SEGMENT_KERNEL) {
++			kernel_segment_command_t *sg = (kernel_segment_command_t *)(void *)cmd;
++
++			if (strncmp(sg->segname, "__TEXT", sizeof(sg->segname)) == 0) {
++				text = sg;
++			} else if (strncmp(sg->segname, "__LINKEDIT", sizeof(sg->segname)) == 0) {
++				linkedit = sg;
++			}
++		} else if (cmd->cmd == LC_SYMTAB) {
++			st = (struct symtab_command *)(void *)cmd;
++		}
++		cmd = (struct load_command *)(void *)((uintptr_t)cmd + cmd->cmdsize);
++	}
++
++	if (text == NULL || linkedit == NULL || st == NULL) {
++		return;
++	}
++	if (st->nsyms == 0 || st->nsyms > (1U << 20) || st->stroff == 0) {
++		return;
++	}
++
++	slide = (uintptr_t)mh - (uintptr_t)text->vmaddr;
++	syms = (kernel_nlist_t *)(uintptr_t)(linkedit->vmaddr + slide + st->symoff - linkedit->fileoff);
++	strings = (const char *)(uintptr_t)(linkedit->vmaddr + slide + st->stroff - linkedit->fileoff);
++	target = (uintptr_t)addr - slide;
++
++	for (i = 0; i < st->nsyms; i++) {
++		uintptr_t value = (uintptr_t)syms[i].n_value;
++
++		if ((syms[i].n_type & N_STAB) != 0 || value == 0) {
++			continue;
++		}
++		if (value > target || value <= best) {
++			continue;
++		}
++		best = value;
++		bestname = strings + syms[i].n_un.n_strx;
++	}
++
++	if (bestname == NULL || bestname[0] == '\0') {
++		return;
++	}
++	if (bestname[0] == '_') {
++		bestname++;
++	}
++	(void)snprintf(buf, buflen, "%s+0x%llx", bestname,
++	    (unsigned long long)(target - best));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static thread_call_group_t
+ thread_call_get_group(thread_call_t call)
+ {
+@@ -252,7 +361,34 @@ thread_call_get_group(thread_call_t call)
+ 	thread_call_func_t  func  = call->tc_func;
+ 
+ 	if (index == THREAD_CALL_INDEX_INVALID || index >= THREAD_CALL_INDEX_MAX) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * __builtin_return_address(1) here is whoever called
++		 * thread_call_get_group(), which is the caller worth naming.
++		 */
++		char caller[64];
++
++		evergo_symbol_snprintf(caller, sizeof(caller),
++		    __builtin_return_address(1));
++
++		printf("SWEET TCALL: bad thread call %p func %p index %u, caller %s (%p)\n",
++		    call, func, (unsigned)index,
++		    caller[0] != '\0' ? caller : "<none>",
++		    __builtin_return_address(1));
++		printf("SWEET TCALL: thread %p/%llu, words %08x %08x %08x %08x\n",
++		    current_thread(), (unsigned long long)thread_tid(current_thread()),
++		    ((const uint32_t *)(void *)call)[0], ((const uint32_t *)(void *)call)[1],
++		    ((const uint32_t *)(void *)call)[2], ((const uint32_t *)(void *)call)[3]);
++
++		if (evergo_bad_threadcall_ignored()) {
++			call->tc_index = THREAD_CALL_INDEX_USER;
++			index = THREAD_CALL_INDEX_USER;
++		} else {
++			panic("(%p %p) invalid thread call index: %d", call, func, index);
++		}
++#else
+ 		panic("(%p %p) invalid thread call index: %d", call, func, index);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 	}
+ 
+ 	if (func == NULL || !(flags & THREAD_CALL_INITIALIZED)) {
