@@ -1,0 +1,168 @@
+diff --git a/osfmk/kern/bsd_kern.c b/osfmk/kern/bsd_kern.c
+index 8d6fc13..dc7c26b 100644
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -55,6 +55,13 @@
+ #include <machine/limits.h>
+ #include <sys/codesign.h> /* CS_CDHASH_LEN */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
++#include <libkern/kernel_mach_header.h>
++#include <mach-o/loader.h>
++#include <mach-o/nlist.h>
++#include <pexpert/pexpert.h>
++#endif
++
+ #undef thread_should_halt
+ 
+ /* BSD KERN COMPONENT INTERFACE */
+@@ -139,6 +146,121 @@ __thread_ro_circularity_panic(thread_t th, thread_ro_t tro)
+ 	panic("tro %p points back to %p instead of %p", tro, tro->tro_owner, th);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
++/*
++ * evergo (0095e): a thread whose struct was freed and zone-zeroed comes back
++ * with t_tro == 0, and get_thread_ro() then panics inside zone_require_ro()
++ * - an __abortlike helper that cannot name its caller. On this port userland
++ * crashes take kernel threads down with them, and the panic hides who is
++ * touching the dead thread.
++ *
++ * Resolve the return address to "symbol+offset" from the kernel's own
++ * LC_SYMTAB, the same lookup the 0093e/0094e copies in thread_call.c and
++ * thread.c do; it cannot be shared because every copy is file-static.
++ *
++ * With boot-arg ignore_bad_threadro=1 hand the caller a fresh thread_ro
++ * instead of panicking: the owner is repaired, every diversified pointer
++ * stays NULL, and th->t_tro is updated so later calls on the same thread do
++ * not allocate again. The semantic content of the dead thread's ro is gone
++ * either way - this only keeps the log running past the crash.
++ */
++static int
++evergo_bad_threadro_ignored(void)
++{
++	static int allow = -1;
++
++	if (allow < 0) {
++		uint32_t v = 0;
++
++		(void)PE_parse_boot_argn("ignore_bad_threadro", &v, sizeof(v));
++		allow = (v != 0) ? 1 : 0;
++	}
++	return allow;
++}
++
++static void
++evergo_symbol_snprintf(char *buf, size_t buflen, void *addr)
++{
++	kernel_mach_header_t     *mh = &_mh_execute_header;
++	struct load_command      *cmd;
++	kernel_segment_command_t *text = NULL;
++	kernel_segment_command_t *linkedit = NULL;
++	struct symtab_command    *st = NULL;
++	kernel_nlist_t           *syms;
++	const char               *strings;
++	const char               *bestname = NULL;
++	uintptr_t                 slide, target, best = 0;
++	uint32_t                  i;
++
++	buf[0] = '\0';
++	if (addr == NULL) {
++		return;
++	}
++
++	cmd = (struct load_command *)(void *)(mh + 1);
++	for (i = 0; i < mh->ncmds; i++) {
++		if (cmd->cmd == LC_SEGMENT_KERNEL) {
++			kernel_segment_command_t *sg = (kernel_segment_command_t *)(void *)cmd;
++
++			if (strncmp(sg->segname, "__TEXT", sizeof(sg->segname)) == 0) {
++				text = sg;
++			} else if (strncmp(sg->segname, "__LINKEDIT", sizeof(sg->segname)) == 0) {
++				linkedit = sg;
++			}
++		} else if (cmd->cmd == LC_SYMTAB) {
++			st = (struct symtab_command *)(void *)cmd;
++		}
++		cmd = (struct load_command *)(void *)((uintptr_t)cmd + cmd->cmdsize);
++	}
++
++	if (text == NULL || linkedit == NULL || st == NULL) {
++		return;
++	}
++	if (st->nsyms == 0 || st->nsyms > (1U << 20) || st->stroff == 0) {
++		return;
++	}
++
++	slide = (uintptr_t)mh - (uintptr_t)text->vmaddr;
++	syms = (kernel_nlist_t *)(uintptr_t)(linkedit->vmaddr + slide + st->symoff - linkedit->fileoff);
++	strings = (const char *)(uintptr_t)(linkedit->vmaddr + slide + st->stroff - linkedit->fileoff);
++	target = (uintptr_t)addr - slide;
++
++	for (i = 0; i < st->nsyms; i++) {
++		uintptr_t value = (uintptr_t)syms[i].n_value;
++
++		if ((syms[i].n_type & N_STAB) != 0 || value == 0) {
++			continue;
++		}
++		if (value > target || value <= best) {
++			continue;
++		}
++		best = value;
++		bestname = strings + syms[i].n_un.n_strx;
++	}
++
++	if (bestname == NULL || bestname[0] == '\0') {
++		return;
++	}
++	if (bestname[0] == '_') {
++		bestname++;
++	}
++	(void)snprintf(buf, buflen, "%s+0x%llx", bestname,
++	    (unsigned long long)(target - best));
++}
++
++static thread_ro_t
++evergo_thread_ro_recover(thread_t th)
++{
++	thread_ro_t tro = zalloc_ro(ZONE_ID_THREAD_RO, Z_WAITOK | Z_ZERO);
++
++	if (tro != NULL) {
++		tro->tro_owner = th;
++		th->t_tro = tro;
++	}
++	return tro;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && MACH_ASSERT */
++
+ __attribute__((always_inline))
+ thread_ro_t
+ get_thread_ro_unchecked(thread_t th)
+@@ -151,6 +273,27 @@ get_thread_ro(thread_t th)
+ {
+ 	thread_ro_t tro = th->t_tro;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
++	if (tro == NULL) {
++		char caller[64];
++
++		evergo_symbol_snprintf(caller, sizeof(caller),
++		    __builtin_return_address(0));
++		printf("SWEET TRO: thread %p has t_tro == 0 "
++		    "(freed thread, zone-zeroed?), caller %s (%p)\n",
++		    th, caller[0] != '\0' ? caller : "?",
++		    __builtin_return_address(0));
++
++		if (evergo_bad_threadro_ignored()) {
++			tro = evergo_thread_ro_recover(th);
++			if (tro != NULL) {
++				return tro;
++			}
++			panic("SWEET TRO: thread_ro recovery alloc failed "
++			    "for thread %p", th);
++		}
++	}
++#endif
+ 	zone_require_ro(ZONE_ID_THREAD_RO, sizeof(struct thread_ro), tro);
+ 	if (tro->tro_owner != th) {
+ 		__thread_ro_circularity_panic(th, tro);

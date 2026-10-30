@@ -1,0 +1,66 @@
+diff --git a/bsd/vm/vnode_pager.c b/bsd/vm/vnode_pager.c
+index 2f6fc5a..aed8641 100644
+--- a/bsd/vm/vnode_pager.c
++++ b/bsd/vm/vnode_pager.c
+@@ -564,6 +564,25 @@ out:
+ 	return result;
+ }
+ 
++/*
++ * evergo (0096e): a failed VNOP_PAGEIN surfaces in userland as a SIGBUS on a
++ * perfectly mapped page, with no trace of why the read failed. Log the first
++ * failures (vnode, file offset, size, errno) so the boot log carries the
++ * filesystem's answer; cap the count to keep a flood from drowning it.
++ */
++static void
++evergo_pagein_fail_print(struct vnode *vp, vm_object_offset_t f_offset,
++    upl_size_t size, int error)
++{
++	static unsigned int evergo_pagein_fails = 0;
++
++	if (evergo_pagein_fails < 32) {
++		evergo_pagein_fails++;
++		printf("SWEET PAGEIN: vp %p off 0x%llx size 0x%x error %d\n",
++		    vp, (uint64_t)f_offset, size, error);
++	}
++}
++
+ 
+ pager_return_t
+ vnode_pagein(
+@@ -648,6 +667,7 @@ vnode_pagein(
+ 			if ((error = VNOP_PAGEIN(vp, NULL, upl_offset, (off_t)f_offset,
+ 			    size, flags, vfs_context_current()))) {
+ 				set_thread_pagein_error(current_thread(), error);
++				evergo_pagein_fail_print(vp, f_offset, size, error);
+ 				result = PAGER_ERROR;
+ 				error  = PAGER_ERROR;
+ 				ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_VM_VNODEPAGEIN_FSPAGEIN_FAIL), 0 /* arg */);
+@@ -794,6 +814,7 @@ vnode_pagein(
+ 					}
+ 				}
+ 				set_thread_pagein_error(current_thread(), error);
++				evergo_pagein_fail_print(vp, f_offset + xoff, xsize, error);
+ 				result = PAGER_ERROR;
+ 				error  = PAGER_ERROR;
+ 				ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_VM_VNODEPAGEIN_FSPAGEIN_FAIL), 0 /* arg */);
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..83fd3af 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -891,6 +891,15 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 			entry = entry->vme_next;
+ 		}
+ 		vm_map_unlock_read(map);
++
++		/*
++		 * evergo (0096e): vm_fault() stashes the VNOP_PAGEIN errno of the
++		 * faulting thread in t_pagein_error (cleared at fault entry, see
++		 * vm_fault.c). A SIGBUS on a mapped R-X page is a failed page-in,
++		 * and this number is the filesystem's answer - print it with the
++		 * crash so the next boot says why the page could not be read.
++		 */
++		printf("CRASH %s pagein_error %d\n", name, thread->t_pagein_error);
+ 	}
+ 	if (sig == 6 || sig == 5) {
+ 		sweet_crash_strings(name);
