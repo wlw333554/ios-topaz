@@ -143,6 +143,11 @@ def select_from_source(src_root, keep_dyld=True):
                 # is_symlink()/is_dir() can also throw on a broken entry; skip it.
                 log("entry skip", rel, getattr(e, 'filename', None), e)
     log(f"keep: {len(reg)} regular files, {len(syms)} symlinks, {len(dirs)} dirs, {total/1073741824:.2f} GiB")
+    # /dev is empty on disk (devfs populates it at boot) so it is never an
+    # ancestor of a kept file and never a kept symlink -> it would be dropped,
+    # leaving no mountpoint for devfs_kernel_mount -> ENOENT -> launchd cannot
+    # open /dev/null. Force it to exist in the output image.
+    dirs.add('dev')
     return reg, syms, dirs, total
 
 
