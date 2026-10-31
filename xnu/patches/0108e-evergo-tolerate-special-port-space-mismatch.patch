@@ -1,8 +1,8 @@
 diff --git a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
-index 31698ad..773cc2c 100644
+index 31698ad..917bff5 100644
 --- a/osfmk/ipc/ipc_port.c
 +++ b/osfmk/ipc/ipc_port.c
-@@ -3129,7 +3129,27 @@ ipc_port_dealloc_special_and_unlock(
+@@ -3129,7 +3129,26 @@ ipc_port_dealloc_special_and_unlock(
  {
  	require_ip_active(port);
  //	assert(port->ip_receiver_name != MACH_PORT_NULL);
@@ -21,8 +21,7 @@ index 31698ad..773cc2c 100644
 +		static uint32_t evergo_ipspace_fails;
 +		if (evergo_ipspace_fails < 8) {
 +			evergo_ipspace_fails++;
-+			printf("SWEET IPS: dealloc space mismatch port %p
-+", port);
++			printf("SWEET IPS: dealloc space mismatch port %p\n", port);
 +		}
 +		extern void evergo_anom_record(int, void *, void *);
 +		evergo_anom_record(6, port, __builtin_return_address(0));
