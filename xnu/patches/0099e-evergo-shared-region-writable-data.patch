@@ -1,0 +1,40 @@
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index d3b45a6..f9d1ba1 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -1442,6 +1442,7 @@ vm_shared_region_map_file_setup(
+ 	vm_object_size_t        obj_size;
+ 	vm_map_offset_t         lowest_unnestable_addr = 0;
+ 	vm_map_kernel_flags_t   vmk_flags;
++	vm_prot_t               evergo_max_prot;
+ 	mach_vm_offset_t        sfm_end;
+ 	uint32_t                mappings_count;
+ 	struct shared_file_mapping_slide_np *mappings;
+@@ -1750,6 +1751,18 @@ vm_shared_region_map_file_setup(
+ 				*sfm_max_address = sfm_end;
+ 			}
+ 
++			/*
++			 * evergo (0099e): allow writes to shared region mappings.
++			 * dyld4 remaps the cache's __DATA ranges into the task as
++			 * private COW copies so processes can write cache globals;
++			 * the copies inherit the source entry's max_prot, and on this
++			 * port that comes in as R-X (SRSUM map0 max 0x5, crash map
++			 * entries prot 5/5) - so the first global write dies with
++			 * SIGBUS (KERN_PROTECTION_FAILURE). Raise max to include
++			 * WRITE; init stays exactly what dyld asked for.
++			 */
++			evergo_max_prot = (mappings[i].sms_max_prot | VM_PROT_WRITE) & VM_PROT_ALL;
++
+ 			if (mappings[i].sms_init_prot & VM_PROT_ZF) {
+ 				/* zero-filled memory */
+ 				map_port = MACH_PORT_NULL;
+@@ -1829,7 +1842,7 @@ vm_shared_region_map_file_setup(
+ 					mappings[i].sms_file_offset,
+ 					TRUE,
+ 					mappings[i].sms_init_prot & VM_PROT_ALL,
+-					mappings[i].sms_max_prot & VM_PROT_ALL,
++					evergo_max_prot,
+ 					VM_INHERIT_DEFAULT);
+ 			}
+ 
