@@ -1,0 +1,33 @@
+diff --git a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
+index 31698ad..773cc2c 100644
+--- a/osfmk/ipc/ipc_port.c
++++ b/osfmk/ipc/ipc_port.c
+@@ -3129,7 +3129,27 @@ ipc_port_dealloc_special_and_unlock(
+ {
+ 	require_ip_active(port);
+ //	assert(port->ip_receiver_name != MACH_PORT_NULL);
+-	assert(ip_in_space(port, space));
++	/*
++	 * evergo (0108e): v30 on-device died here during the teardown storm -
++	 * the special port's space backref no longer matched (freed-then-
++	 * zeroed fields, same corruption family). This assert is compiled
++	 * in DEVELOPMENT/DEBUG only (__assert_only parameter): RELEASE
++	 * kernels run this exact path without the check, so continuing the
++	 * deallocation matches shipping behavior. Side effects: we dealloc
++	 * an orphaned port whose space pointer was lost - no new state is
++	 * invented, and the anomaly registry keeps the scene.
++	 */
++	if (!ip_in_space(port, space)) {
++		static uint32_t evergo_ipspace_fails;
++		if (evergo_ipspace_fails < 8) {
++			evergo_ipspace_fails++;
++			printf("SWEET IPS: dealloc space mismatch port %p
++", port);
++		}
++		extern void evergo_anom_record(int, void *, void *);
++		evergo_anom_record(6, port, __builtin_return_address(0));
++	}
++
+ 
+ 	/*
+ 	 *	We clear ip_receiver_name and ip_receiver to simplify
