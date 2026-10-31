@@ -162,10 +162,10 @@ index 8d6fc13..5738ac0 100644
  	if (tro->tro_owner != th) {
  		__thread_ro_circularity_panic(th, tro);
 diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
-index 3b33b66..4ba271a 100644
+index 3b33b66..fa3f938 100644
 --- a/osfmk/kern/thread.c
 +++ b/osfmk/kern/thread.c
-@@ -854,6 +854,27 @@ evergo_symbol_snprintf(char *buf, size_t buflen, void *addr)
+@@ -854,6 +854,32 @@ evergo_symbol_snprintf(char *buf, size_t buflen, void *addr)
  	(void)snprintf(buf, buflen, "%s+0x%llx", bestname,
  	    (unsigned long long)(target - best));
  }
@@ -176,13 +176,18 @@ index 3b33b66..4ba271a 100644
 + * ZONE_DEFINE_ID(ZONE_ID_THREAD_RO) makes the typed zalloc_ro() symbols
 + * visible only in this translation unit; bsd_kern.c calls it through an
 + * extern declaration. Owner repaired, diversified pointers stay NULL.
++ *
++ * Z_NOWAIT, not Z_WAITOK: get_thread_ro() is reachable under spinlocks (v18
++ * on-device died printing from an interrupt-disabled context on this very
++ * path), so the allocation must never block. When the zone is momentarily
++ * empty the recovery gives up and the caller panics with a named reason.
 + */
 +thread_ro_t evergo_thread_ro_alloc(thread_t th);
 +
 +thread_ro_t
 +evergo_thread_ro_alloc(thread_t th)
 +{
-+	thread_ro_t tro = zalloc_ro(ZONE_ID_THREAD_RO, Z_WAITOK | Z_ZERO);
++	thread_ro_t tro = zalloc_ro(ZONE_ID_THREAD_RO, Z_NOWAIT | Z_ZERO);
 +
 +	if (tro != NULL) {
 +		tro->tro_owner = th;
