@@ -1,0 +1,50 @@
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index f9d1ba1..c351ee1 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -1443,6 +1443,7 @@ vm_shared_region_map_file_setup(
+ 	vm_map_offset_t         lowest_unnestable_addr = 0;
+ 	vm_map_kernel_flags_t   vmk_flags;
+ 	vm_prot_t               evergo_max_prot;
++	vm_prot_t               evergo_init_prot;
+ 	mach_vm_offset_t        sfm_end;
+ 	uint32_t                mappings_count;
+ 	struct shared_file_mapping_slide_np *mappings;
+@@ -1647,8 +1648,8 @@ vm_shared_region_map_file_setup(
+ 				object,
+ 				0,
+ 				TRUE,
+-				mappings[0].sms_init_prot & VM_PROT_ALL,
+-				mappings[0].sms_max_prot & VM_PROT_ALL,
++				(mappings[0].sms_init_prot | VM_PROT_WRITE) & VM_PROT_ALL,
++				(mappings[0].sms_max_prot | VM_PROT_WRITE) & VM_PROT_ALL,
+ 				VM_INHERIT_DEFAULT);
+ 			if (kr != KERN_SUCCESS) {
+ 				printf("%s(): for fd==-1 vm_map_enter() in SR failed\n", __func__);
+@@ -1760,8 +1761,17 @@ vm_shared_region_map_file_setup(
+ 			 * entries prot 5/5) - so the first global write dies with
+ 			 * SIGBUS (KERN_PROTECTION_FAILURE). Raise max to include
+ 			 * WRITE; init stays exactly what dyld asked for.
++			 *
++			 * evergo (0100e): v22 on-device showed entries at prot 5/7
++			 * still taking SIGBUS - the write path checks the current
++			 * protection and faults before any COW logic runs, and the
++			 * remap that would raise it had not landed yet. Start the
++			 * mappings writable too: a write then COWs the page into a
++			 * private copy (text pages are never written, so sharing
++			 * stays intact), which removes the whole fault class.
+ 			 */
+ 			evergo_max_prot = (mappings[i].sms_max_prot | VM_PROT_WRITE) & VM_PROT_ALL;
++			evergo_init_prot = (mappings[i].sms_init_prot | VM_PROT_WRITE) & VM_PROT_ALL;
+ 
+ 			if (mappings[i].sms_init_prot & VM_PROT_ZF) {
+ 				/* zero-filled memory */
+@@ -1841,7 +1851,7 @@ vm_shared_region_map_file_setup(
+ 					map_port,
+ 					mappings[i].sms_file_offset,
+ 					TRUE,
+-					mappings[i].sms_init_prot & VM_PROT_ALL,
++					evergo_init_prot,
+ 					evergo_max_prot,
+ 					VM_INHERIT_DEFAULT);
+ 			}
