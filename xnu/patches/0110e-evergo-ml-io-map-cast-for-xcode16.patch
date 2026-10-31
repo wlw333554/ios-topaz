@@ -1,0 +1,13 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index e24b08e..468dfa7 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -795,7 +795,7 @@ pstore_console_init(void)
+ 	pstore_base = reg[0];
+ 	pstore_size = reg[1];
+ 	/* map it like the framebuffer: Normal-NC, uncached */
+-	void *va = ml_io_map_wcomb(pstore_base, pstore_size);
++	void *va = (void *)(uintptr_t)ml_io_map_wcomb(pstore_base, pstore_size);
+ 	if (va == NULL) {
+ 		pstore_base = 0;
+ 		return;
