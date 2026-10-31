@@ -1,5 +1,5 @@
 diff --git a/osfmk/kern/bsd_kern.c b/osfmk/kern/bsd_kern.c
-index 8d6fc13..dc7c26b 100644
+index 8d6fc13..5738ac0 100644
 --- a/osfmk/kern/bsd_kern.c
 +++ b/osfmk/kern/bsd_kern.c
 @@ -55,6 +55,13 @@
@@ -16,7 +16,7 @@ index 8d6fc13..dc7c26b 100644
  #undef thread_should_halt
  
  /* BSD KERN COMPONENT INTERFACE */
-@@ -139,6 +146,121 @@ __thread_ro_circularity_panic(thread_t th, thread_ro_t tro)
+@@ -139,6 +146,116 @@ __thread_ro_circularity_panic(thread_t th, thread_ro_t tro)
  	panic("tro %p points back to %p instead of %p", tro, tro->tro_owner, th);
  }
  
@@ -122,23 +122,18 @@ index 8d6fc13..dc7c26b 100644
 +	    (unsigned long long)(target - best));
 +}
 +
-+static thread_ro_t
-+evergo_thread_ro_recover(thread_t th)
-+{
-+	thread_ro_t tro = zalloc_ro(ZONE_ID_THREAD_RO, Z_WAITOK | Z_ZERO);
-+
-+	if (tro != NULL) {
-+		tro->tro_owner = th;
-+		th->t_tro = tro;
-+	}
-+	return tro;
-+}
++/*
++ * evergo (0095e): the replacement thread_ro is allocated in thread.c (the
++ * typed zalloc_ro() for ZONE_ID_THREAD_RO is only visible where the zone is
++ * defined); see evergo_thread_ro_alloc() there.
++ */
++extern thread_ro_t evergo_thread_ro_alloc(thread_t th);
 +#endif /* ARM64_BOARD_CONFIG_SWEET && MACH_ASSERT */
 +
  __attribute__((always_inline))
  thread_ro_t
  get_thread_ro_unchecked(thread_t th)
-@@ -151,6 +273,27 @@ get_thread_ro(thread_t th)
+@@ -151,6 +268,27 @@ get_thread_ro(thread_t th)
  {
  	thread_ro_t tro = th->t_tro;
  
@@ -154,7 +149,7 @@ index 8d6fc13..dc7c26b 100644
 +		    __builtin_return_address(0));
 +
 +		if (evergo_bad_threadro_ignored()) {
-+			tro = evergo_thread_ro_recover(th);
++			tro = evergo_thread_ro_alloc(th);
 +			if (tro != NULL) {
 +				return tro;
 +			}
@@ -166,3 +161,35 @@ index 8d6fc13..dc7c26b 100644
  	zone_require_ro(ZONE_ID_THREAD_RO, sizeof(struct thread_ro), tro);
  	if (tro->tro_owner != th) {
  		__thread_ro_circularity_panic(th, tro);
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 3b33b66..4ba271a 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -854,6 +854,27 @@ evergo_symbol_snprintf(char *buf, size_t buflen, void *addr)
+ 	(void)snprintf(buf, buflen, "%s+0x%llx", bestname,
+ 	    (unsigned long long)(target - best));
+ }
++
++/*
++ * evergo (0095e): allocate a replacement thread_ro for a thread whose struct
++ * was freed and zone-zeroed (t_tro reads as 0). Lives here because
++ * ZONE_DEFINE_ID(ZONE_ID_THREAD_RO) makes the typed zalloc_ro() symbols
++ * visible only in this translation unit; bsd_kern.c calls it through an
++ * extern declaration. Owner repaired, diversified pointers stay NULL.
++ */
++thread_ro_t evergo_thread_ro_alloc(thread_t th);
++
++thread_ro_t
++evergo_thread_ro_alloc(thread_t th)
++{
++	thread_ro_t tro = zalloc_ro(ZONE_ID_THREAD_RO, Z_WAITOK | Z_ZERO);
++
++	if (tro != NULL) {
++		tro->tro_owner = th;
++		th->t_tro = tro;
++	}
++	return tro;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET && MACH_ASSERT */
+ 
+ static bool
