@@ -1,0 +1,28 @@
+diff --git a/osfmk/ipc/ipc_right.c b/osfmk/ipc/ipc_right.c
+index 0d1ebf9..5896ca2 100644
+--- a/osfmk/ipc/ipc_right.c
++++ b/osfmk/ipc/ipc_right.c
+@@ -2355,7 +2355,23 @@ ipc_right_copyin(
+ 		assert(IE_BITS_UREFS(bits) > 0);
+ 
+ 		port = ip_object_to_port(entry->ie_object);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * evergo (0103e): v25 on-device died here during the teardown
++		 * storm - an ipc entry claimed SEND rights while its object was
++		 * already gone (freed-then-zeroed space, same corruption family
++		 * as the thread/task/label NULLs). Asserting kills the whole
++		 * machine mid-storm; treating the entry as an invalid right
++		 * returns an error to the sender and keeps the boot alive.
++		 */
++		if (__improbable(port == IP_NULL)) {
++			printf("SWEET IPC: COPY_SEND on NULL port, entry %p name %u\n",
++			    entry, name);
++			goto invalid_right;
++		}
++#else
+ 		assert(port != IP_NULL);
++#endif
+ 
+ 		if (ipc_right_check(space, port, name, entry, IPC_OBJECT_COPYIN_FLAGS_NONE)) {
+ 			bits = entry->ie_bits;
