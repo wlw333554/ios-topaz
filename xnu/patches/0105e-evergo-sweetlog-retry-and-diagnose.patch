@@ -1,0 +1,106 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 3cfb1f1..02df9e7 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -822,25 +822,29 @@ sweet_log_position(void)
+ 	return os_atomic_load(&sweet_log_total, relaxed);
+ }
+ 
+-struct sweet_log_header {
+-	char magic[8];
+-	uint32_t version, size;
+-	uint64_t total, seq;
++struct sweet_log_thread_state {
++	uint64_t base;
++	uint64_t flushed;
++	uint64_t seq;
+ };
+ 
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+-	uint64_t flushed = 0, seq = 0;
++	struct sweet_log_thread_state st = {};
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+-	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+-	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++	st.base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++
++	printf("SWEET LOG: console log to the last %u KiB of the partition "
++	    "(block 0x%llx, first_block 0x%llx, nblocks 0x%llx)\n",
++	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, st.base, su.first_block,
++	    su.nblocks);
+ 	for (;;) {
+-		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+ 		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++		uint64_t flushed = st.flushed;
+ 		if (total == flushed) {
++			(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+ 			continue;
+ 		}
+ 		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+@@ -854,27 +858,56 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+ 			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+ 			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
++			error = ufs_write_blocks(st.base + 1 + blk, n);
++			if (error) {
++				/*
++				 * evergo (0105e): name the failing write instead of
++				 * dying silently - the ring is the only full-boot log
++				 * we have, and the panic screen tail keeps showing
++				 * these lines so the failure is diagnosable.
++				 */
++				printf("SWEET LOG: write failed (%d) at base 0x%llx "
++				    "blk %u n %u first_block 0x%llx nblocks 0x%llx\n",
++				    error, st.base, blk, n, su.first_block,
++				    su.nblocks);
++			}
+ 			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+ 		}
+ 		if (!error) {
+ 			struct sweet_log_header h = {
+ 				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
++				.version = 1, .size = SWEET_LOG_SIZE, .total = total,
++				.seq = ++st.seq,
+ 			};
+ 			bzero(bounce, UFS_BLOCK);
+ 			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
++			error = ufs_write_blocks(st.base, 1);
++			if (error) {
++				printf("SWEET LOG: header write failed (%d) at 0x%llx\n",
++				    error, st.base);
++			}
+ 		}
+ 		if (!error) {
+ 			error = ufs_sync_cache();
+ 		}
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		if (error) {
+-			printf("SWEET LOG: write failed (%d), stopping\n", error);
+-			return;
++			/*
++			 * evergo (0105e): keep retrying - the previous build stopped
++			 * the thread on the first failure and the log was lost
++			 * forever. Rate-limit the complaint to keep the tail
++			 * readable.
++			 */
++			static uint32_t evergo_log_fails;
++			if (evergo_log_fails < 40) {
++				evergo_log_fails++;
++				printf("SWEET LOG: flush failed (%d), will retry\n",
++				    error);
++			}
++		} else {
++			st.flushed = total;
+ 		}
+-		flushed = total;
++		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+ 	}
+ }
+ 
