@@ -1,0 +1,79 @@
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index db1d613..c91b829 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -1699,6 +1699,22 @@ vm_shared_region_map_file_setup(
+ 				mappings[i].sms_max_prot,
+ 				mappings[i].sms_init_prot));
+ 
++			/*
++			 * evergo (0097e): dump the prots dyld asks for on the first
++			 * file's mappings - if the data-bearing ranges come in RX
++			 * the data write faults later are explained right here.
++			 */
++			if (srfmp == &sr_file_mappings[0] && i < 8) {
++				printf("SWEET SRMAP[%d]: addr 0x%llx size 0x%llx "
++				    "off 0x%llx max 0x%x init 0x%x\n",
++				    i,
++				    (long long)mappings[i].sms_address,
++				    (long long)mappings[i].sms_size,
++				    (long long)mappings[i].sms_file_offset,
++				    mappings[i].sms_max_prot,
++				    mappings[i].sms_init_prot);
++			}
++
+ 			if (mappings[i].sms_address < *sfm_min_address) {
+ 				*sfm_min_address = mappings[i].sms_address;
+ 			}
+@@ -2602,6 +2618,23 @@ vm_shared_region_slide_mapping(
+ 		goto done;
+ 	}
+ 
++	/*
++	 * evergo (0097e): one line per slid mapping - which slide info version
++	 * and page size the cache carries, and the range being slid. The 16K
++	 * cache pages vs the 4K PAGE_SIZE_FOR_SR_SLIDE pairing is the prime
++	 * suspect for the deterministic mis-slid pages on this port.
++	 */
++	{
++		vm_shared_region_slide_info_entry_t evergo_se =
++		    (vm_shared_region_slide_info_entry_t)slide_info_entry;
++
++		printf("SWEET SRSLIDE: ver %u page_size %u slide 0x%x "
++		    "range [0x%llx,0x%llx) slid_base 0x%llx\n",
++		    evergo_se->version, evergo_se->v3.page_size, slide,
++		    (uint64_t)start, (uint64_t)(start + size),
++		    (uint64_t)(slid_mapping + sr->sr_base_address));
++	}
++
+ 	/*
+ 	 * Allocate and fill in a vm_shared_region_slide_info.
+ 	 * This will either be used by a new pager, or used to find
+diff --git a/osfmk/vm/vm_shared_region_pager.c b/osfmk/vm/vm_shared_region_pager.c
+index 43d7d09..0a682c0 100644
+--- a/osfmk/vm/vm_shared_region_pager.c
++++ b/osfmk/vm/vm_shared_region_pager.c
+@@ -750,6 +750,23 @@ retry_src_fault:
+ 				    kr);
+ 			}
+ 			if (kr != KERN_SUCCESS) {
++				/*
++				 * evergo (0097e): a page whose chain walk fails is
++				 * delivered as KERN_MEMORY_ERROR and kills the faulting
++				 * process with SIGBUS; the v3 walker prints its reason
++				 * separately, this names the page index so the dumped
++				 * boot log pins the bad pages down.
++				 */
++				static unsigned int evergo_srpage_errs = 0;
++
++				if (evergo_srpage_errs < 8) {
++					evergo_srpage_errs++;
++					printf("SWEET SRPAGE: slide_page failed idx %u "
++					    "chunk 0x%llx kr 0x%x\n",
++					    (uint32_t) (offset_in_sliding_range /
++					    PAGE_SIZE_FOR_SR_SLIDE),
++					    (uint64_t) chunk_offset, kr);
++				}
+ 				ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_SHARED_REGION, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_SHARED_REGION_SLIDE_ERROR), 0 /* arg */);
+ 				shared_region_pager_slid_error++;
+ 				retval = KERN_MEMORY_ERROR;
