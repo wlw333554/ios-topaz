@@ -1,0 +1,38 @@
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 09925ef..cdc1def 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -92,10 +92,10 @@
+  * of every anomaly kind here and let the panic path print the registry, so
+  * one photograph carries the original crime scene.
+  */
+-#define EVERGO_ANOM_KINDS       5
++#define EVERGO_ANOM_KINDS       6
+ 
+ static const char *evergo_anom_names[EVERGO_ANOM_KINDS] = {
+-	"tro", "nsr", "maclabel", "ipc", "procro",
++	"tro", "nsr", "maclabel", "ipc", "procro", "zroro",
+ };
+ 
+ static struct {
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 182b44a..bae1bbb 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -7071,6 +7071,16 @@ __abortlike
+ static void
+ zone_id_require_ro_panic(zone_id_t zid, void *addr)
+ {
++	/*
++	 * evergo (0107e): record who required an invalid ro element before
++	 * panicking - the return address is the real caller (this helper is
++	 * reached through always-inline zone_require_ro). The anomaly registry
++	 * is printed at panic entry, naming the unchecked-accessor user that
++	 * fed us a freed-then-zeroed element.
++	 */
++	extern void evergo_anom_record(int, void *, void *);
++	evergo_anom_record(5, addr, __builtin_return_address(0));
++
+ 	struct zone_size_params p = zone_ro_size_params[zid];
+ 	vm_offset_t elem = (vm_offset_t)addr;
+ 	uint32_t zindex;
