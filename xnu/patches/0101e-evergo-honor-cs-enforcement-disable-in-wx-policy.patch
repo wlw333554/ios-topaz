@@ -1,0 +1,62 @@
+diff --git a/osfmk/vm/vm_map.c b/osfmk/vm/vm_map.c
+index e5a6f9f..db56b94 100644
+--- a/osfmk/vm/vm_map.c
++++ b/osfmk/vm/vm_map.c
+@@ -125,6 +125,29 @@
+ 
+ #include <libkern/section_keywords.h>
+ 
++/*
++ * evergo (0101e): the W+X policy below fails mappings whose initial
++ * protection carries both WRITE and EXECUTE - which is exactly what the
++ * shared region mappings look like once 0100e starts them writable
++ * (dyld4 then writes the cache's __DATA through them). On Apple hardware
++ * this check is part of code signing enforcement, and this port boots
++ * with cs_enforcement_disable=1; make the policy honor that boot-arg
++ * instead of failing unconditionally.
++ */
++static bool
++evergo_cs_enforcement_disabled(void)
++{
++	static int cached = -1;
++
++	if (cached < 0) {
++		code_signing_config_t config = 0;
++
++		code_signing_configuration(NULL, &config);
++		cached = (config & CS_CONFIG_ENFORCEMENT_DISABLED) ? 1 : 0;
++	}
++	return cached == 1;
++}
++
+ #if DEVELOPMENT || DEBUG
+ extern int proc_selfcsflags(void);
+ int vm_log_xnu_user_debug = 0;
+@@ -2502,6 +2525,7 @@ vm_map_enter(
+ #endif
+ 	    (VM_MAP_POLICY_WX_FAIL(map) ||
+ 	    VM_MAP_POLICY_WX_STRIP_X(map)) &&
++	    !evergo_cs_enforcement_disabled() &&
+ 	    !entry_for_jit) {
+ 		boolean_t vm_protect_wx_fail = VM_MAP_POLICY_WX_FAIL(map);
+ 
+@@ -5822,7 +5846,8 @@ vm_map_protect(
+ 		    || !VM_MAP_IS_EXOTIC(map)
+ #endif /* XNU_TARGET_OS_OSX && __arm64__ */
+ 		    ) &&
+-		    VM_MAP_POLICY_WX_FAIL(map)) {
++		    VM_MAP_POLICY_WX_FAIL(map) &&
++		    !evergo_cs_enforcement_disabled()) {
+ 			DTRACE_VM3(cs_wx,
+ 			    uint64_t, (uint64_t) start,
+ 			    uint64_t, (uint64_t) end,
+@@ -14184,7 +14209,8 @@ RetrySubMap:
+ 			    (csm_address_space_exempt(map->pmap) != KERN_SUCCESS) &&
+ #endif
+ 			    !(entry->used_for_jit) &&
+-			    VM_MAP_POLICY_WX_STRIP_X(map)) {
++			    VM_MAP_POLICY_WX_STRIP_X(map) &&
++			    !evergo_cs_enforcement_disabled()) {
+ 				DTRACE_VM3(cs_wx,
+ 				    uint64_t, (uint64_t)entry->vme_start,
+ 				    uint64_t, (uint64_t)entry->vme_end,
