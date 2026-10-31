@@ -1,0 +1,132 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 83fd3af..df19764 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -900,6 +900,33 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 		 * crash so the next boot says why the page could not be read.
+ 		 */
+ 		printf("CRASH %s pagein_error %d\n", name, thread->t_pagein_error);
++
++		/*
++		 * evergo (0098e): shared region diagnostics summary. The per-event
++		 * lines from 0097e print at first exec and are long gone from the
++		 * fbcon ring by panic time; the crash reporter prints the cached
++		 * parameters where the panic screen actually shows them.
++		 */
++		{
++			extern int evergo_sr_have;
++			extern uint32_t evergo_sr_ver, evergo_sr_pagesize;
++			extern uint32_t evergo_sr_slide;
++			extern uint32_t evergo_sr_maxprot, evergo_sr_initprot;
++			extern uint32_t evergo_srpage_errs, evergo_srpage_first_idx;
++
++			if (evergo_sr_have) {
++				printf("CRASH %s SRSUM: slide ver %u psz %u slide 0x%x "
++				    "map0 max 0x%x init 0x%x srpage_errs %u "
++				    "first_idx %u\n",
++				    name, evergo_sr_ver, evergo_sr_pagesize,
++				    evergo_sr_slide, evergo_sr_maxprot,
++				    evergo_sr_initprot, evergo_srpage_errs,
++				    evergo_srpage_first_idx);
++			} else {
++				printf("CRASH %s SRSUM: shared region not slid yet\n",
++				    name);
++			}
++		}
+ 	}
+ 	if (sig == 6 || sig == 5) {
+ 		sweet_crash_strings(name);
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index c91b829..d3b45a6 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -216,6 +216,19 @@ static kern_return_t vm_shared_region_slide_mapping(
+ 	memory_object_control_t,
+ 	vm_prot_t          prot); /* forward */
+ 
++/*
++ * evergo (0098e): shared region diagnostics cached for the crash reporter -
++ * the panic screen only shows the console tail, so the per-mapping diag
++ * lines from 0097e (printed at first exec) are long gone by the time a
++ * process crash reaches the screen. The crash reporter prints these instead.
++ */
++uint32_t evergo_sr_ver;
++uint32_t evergo_sr_pagesize;
++uint32_t evergo_sr_slide;
++uint32_t evergo_sr_maxprot;
++uint32_t evergo_sr_initprot;
++int evergo_sr_have;
++
+ static int __commpage_setup = 0;
+ #if XNU_TARGET_OS_OSX
+ static int __system_power_source = 1;   /* init to extrnal power source */
+@@ -1714,6 +1727,10 @@ vm_shared_region_map_file_setup(
+ 				    mappings[i].sms_max_prot,
+ 				    mappings[i].sms_init_prot);
+ 			}
++			if (srfmp == &sr_file_mappings[0] && i == 0) {
++				evergo_sr_maxprot = mappings[0].sms_max_prot;
++				evergo_sr_initprot = mappings[0].sms_init_prot;
++			}
+ 
+ 			if (mappings[i].sms_address < *sfm_min_address) {
+ 				*sfm_min_address = mappings[i].sms_address;
+@@ -2633,6 +2650,17 @@ vm_shared_region_slide_mapping(
+ 		    evergo_se->version, evergo_se->v3.page_size, slide,
+ 		    (uint64_t)start, (uint64_t)(start + size),
+ 		    (uint64_t)(slid_mapping + sr->sr_base_address));
++
++		/*
++		 * evergo (0098e): remember the first mapping's parameters so the
++		 * crash reporter can print them where the panic screen shows.
++		 */
++		if (evergo_sr_have == 0) {
++			evergo_sr_have = 1;
++			evergo_sr_ver = evergo_se->version;
++			evergo_sr_pagesize = evergo_se->v3.page_size;
++			evergo_sr_slide = slide;
++		}
+ 	}
+ 
+ 	/*
+diff --git a/osfmk/vm/vm_shared_region_pager.c b/osfmk/vm/vm_shared_region_pager.c
+index 0a682c0..db0958a 100644
+--- a/osfmk/vm/vm_shared_region_pager.c
++++ b/osfmk/vm/vm_shared_region_pager.c
+@@ -133,6 +133,13 @@ const struct memory_object_pager_ops shared_region_pager_ops = {
+ 	.memory_object_pager_name = "shared_region"
+ };
+ 
++/*
++ * evergo (0098e): page-slide failure counters, printed by the crash
++ * reporter via the summary in exception.c.
++ */
++uint32_t evergo_srpage_errs;
++uint32_t evergo_srpage_first_idx;
++
+ #if __has_feature(ptrauth_calls)
+ /*
+  * Track mappings between shared_region_id and the key used to sign
+@@ -757,16 +764,19 @@ retry_src_fault:
+ 				 * separately, this names the page index so the dumped
+ 				 * boot log pins the bad pages down.
+ 				 */
+-				static unsigned int evergo_srpage_errs = 0;
+-
+ 				if (evergo_srpage_errs < 8) {
+-					evergo_srpage_errs++;
+ 					printf("SWEET SRPAGE: slide_page failed idx %u "
+ 					    "chunk 0x%llx kr 0x%x\n",
+ 					    (uint32_t) (offset_in_sliding_range /
+ 					    PAGE_SIZE_FOR_SR_SLIDE),
+ 					    (uint64_t) chunk_offset, kr);
+ 				}
++				if (evergo_srpage_errs == 0) {
++					evergo_srpage_first_idx = (uint32_t)
++					    (offset_in_sliding_range /
++					    PAGE_SIZE_FOR_SR_SLIDE);
++				}
++				evergo_srpage_errs++;
+ 				ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_SHARED_REGION, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_SHARED_REGION_SLIDE_ERROR), 0 /* arg */);
+ 				shared_region_pager_slid_error++;
+ 				retval = KERN_MEMORY_ERROR;
