@@ -44,7 +44,7 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +69,18 @@ jobs:
           grep -c 'export CC="$CCACHE_WRAP/clang"' dxb/build.sh
           ls dxb/patches
 
+      - name: Install Xcode 15.4 (macos-15 experiment)
+        run: |
+          set -e
+          brew install aria2
+          aria2c -x 8 -s 8 -o xcode154.xip "https://download.developer.apple.com/Developer_Tools/Xcode_15.4/Xcode_15.4.xip" || curl -L -o xcode154.xip "https://download.developer.apple.com/Developer_Tools/Xcode_15.4/Xcode_15.4.xip"
+          ls -lh xcode154.xip
+          xar -xf xcode154.xip || true
+          ls
+          # xip needs xip tool from existing Xcode; try native
+          xip --expand xcode154.xip || true
+          ls -d Xcode*.app 2>/dev/null || true
+
       - name: Deps
         run: |
           brew install jq gum bash cmake ninja ccache
@@ -77,7 +89,8 @@ jobs:
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          # prefer an installed Xcode 15.4 if the experiment step placed it
+          if [ -d "/Applications/Xcode_15.4.app" ]; then XC=/Applications/Xcode_15.4.app; else XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1); fi
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
