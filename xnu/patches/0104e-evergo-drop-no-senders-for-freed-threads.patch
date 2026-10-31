@@ -1,0 +1,32 @@
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index fa3f938..ae3b01f 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -4050,7 +4050,26 @@ thread_port_with_flavor_no_senders(
+ 	assert((IKOT_THREAD_READ == kotype) || (IKOT_THREAD_INSPECT == kotype));
+ 	thread = ipc_kobject_get_locked(port, kotype);
+ 	if (thread != THREAD_NULL) {
+-		thread_reference(thread);
++#if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
++		/*
++		 * evergo (0104e): v26 on-device died in this path - the no-senders
++		 * notification fired for a thread whose struct was already freed
++		 * and zone-zeroed (SWEET TRO fired from the get_thread_ro below,
++		 * and the recovered ro / task pointers led to physmap translation
++		 * faults on pages above 4G). Take the reference only when the
++		 * thread still looks like a thread; otherwise drop the
++		 * notification (the port leaks, the boot survives).
++		 */
++		if (__improbable(thread->thread_magic != THREAD_MAGIC)) {
++			printf("SWEET NSR: no-senders for freed thread %p "
++			    "(magic 0x%llx) - dropping\n",
++			    thread, (unsigned long long)thread->thread_magic);
++			thread = THREAD_NULL;
++		} else
++#endif
++		{
++			thread_reference(thread);
++		}
+ 	}
+ 	ip_mq_unlock(port);
+ 
