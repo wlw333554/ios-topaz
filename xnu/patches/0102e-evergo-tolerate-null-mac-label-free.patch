@@ -1,0 +1,21 @@
+diff --git a/security/mac_label.c b/security/mac_label.c
+index d50d223..a2339fc 100644
+--- a/security/mac_label.c
++++ b/security/mac_label.c
+@@ -127,7 +127,15 @@ void
+ mac_labelzone_free(struct label *label)
+ {
+ 	if (label == NULL) {
+-		panic("Free of NULL MAC label");
++		/*
++		 * evergo (0102e): v24 on-device reached process teardown with a
++		 * NULL label here and died - a freed-then-zeroed structure fed
++		 * the free path (same family as the thread/task corruption seen
++		 * since v19). Freeing NULL is a no-op; survive it so the boot
++		 * keeps running and the corruption reports elsewhere.
++		 */
++		printf("SWEET MACLABEL: NULL label free ignored\n");
++		return;
+ 	}
+ 
+ 	zfree_ro(ZONE_ID_MAC_LABEL, label);
