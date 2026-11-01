@@ -1,0 +1,60 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bcf4939..3165760 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -976,9 +976,6 @@ bsd_init(void)
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
+ 
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-	evergo_probe_dsc();
+-#endif
+ 
+ 	bsd_init_kprintf("calling VFS_ROOT\n");
+ 	/* Get the vnode for '/'.  Set fdp->fd_fd.fd_cdir to reference it. */
+@@ -993,6 +990,16 @@ bsd_init(void)
+ 	lck_rw_unlock_exclusive(&rootvnode_rw_lock);
+ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0128e): probe here, not before VFS_ROOT(). The first attempt
++	 * ran while the mount had no root vnode yet, so every lookup - the
++	 * /var/mobile control path included - came back ENOENT and the numbers
++	 * meant nothing. rootvnode is valid from this point on.
++	 */
++	evergo_probe_dsc();
++#endif
++
+ 
+ 	if (!bsd_rooted_ramdisk()) {
+ 		boolean_t require_rootauth = FALSE;
+@@ -1008,18 +1015,20 @@ bsd_init(void)
+ #endif // XNU_TARGET_OS_OSX && defined(__arm64__)
+ 
+ 		if (require_rootauth) {
+-			/* enforce sealedness */
+-			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/*
+-			 * SWEET has no chain of trust to extend: the kernel itself is
+-			 * booted unsigned and there is no Image4/AMFI, and its HFS root
+-			 * cannot be a sealed volume. Report it instead of panicking.
++			 * evergo (0128e): do not issue FSIOC_KERNEL_ROOTAUTH at all.
++			 * VNOP_IOCTL(rootvnode, ...) takes a kernel data abort inside
++			 * hfs_vnop_ioctl (lck_mtx_lock on a mount pointer that is still
++			 * NULL - far = 0x4b8) and kills the boot before launchd starts.
++			 * SWEET has no chain of trust to extend: the kernel is booted
++			 * unsigned, there is no Image4/AMFI, and the HFS root cannot be a
++			 * sealed volume, so there is nothing to enforce here.
+ 			 */
+-			if (autherr) {
+-				printf("SWEET: root volume is not authenticated (error %d); continuing unsealed\n", autherr);
+-			}
++			printf("SWEET: skipping root volume authentication\n");
+ #else
++			/* enforce sealedness */
++			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
+ 			if (autherr) {
+ 				panic("rootvp not authenticated after mounting");
+ 			}
