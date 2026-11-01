@@ -120,6 +120,38 @@ jobs:
           bash build.sh
           ccache -s
 
+      - name: Verify evergo diagnostics are compiled in
+        # dxb/build.sh only warns when a patch fails to apply, so a silently
+        # skipped diagnostic patch still yields a "successful" kernel. Fail
+        # here instead: every marker below must be present in the binary.
+        run: |
+          set -e
+          K=$(ls dxb/fakeroot/System/Library/Kernels/kernel.* 2>/dev/null | head -1)
+          test -n "$K" || { echo "::error::no kernel produced"; exit 1; }
+          echo "kernel: $K"
+          rc=0
+          while IFS= read -r marker; do
+            [ -n "$marker" ] || continue
+            if strings -a "$K" | grep -qF -- "$marker"; then
+              echo "  ok: $marker"
+            else
+              echo "::error::missing diagnostic string '$marker' (a patch was silently skipped)"
+              rc=1
+            fi
+          done <<'EOF'
+          SWEET ZRORO: zid
+          SWEET ANOM: %s first ptr
+          threadrel
+          lockrw
+          SWEET REMAP: MISMATCH
+          SWEET IPS: dealloc space mismatch
+          SWEET NSR: no-senders for freed thread
+          SWEET SRMAP
+          SWEET TRO: thread
+          SWEET THREAD: double release
+          EOF
+          exit $rc
+
       - name: Package build tree for local compiles
         if: always()
         run: |

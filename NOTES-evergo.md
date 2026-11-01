@@ -1079,3 +1079,55 @@ SWEET SPIN: <how> spinlock <addr> <<data> <type>> from <pc0> <pc1>, thread <t>/<
 **捷径（若用户有手机端完整 panic 日志）**：xnu `panic()` 会打 backtrace（一串 PC）。
 若有当时的寄存器/回溯 dump，可**直接**用现有 `kernel.development.sweet` 的符号表
 （`sym_kernel.py`）符号化，省掉整个 QEMU+CI 等待。
+
+---
+
+## 2026-11-01 — handoff after v41 (supersedes the 2026-10-29 status above)
+
+**Where the project really is:** see `E:\iOS\TASK-INTEGRATION-2026-11-01.md`
+(Chinese, consolidated state + P0/P1/P2) and the daily logs in
+`E:\iOS\.workbuddy\memory\` (2026-10-31 covers v17..v39, 2026-11-01 covers
+the v40/v41 wrap-up). This notes file stopped tracking the day-to-day work
+around v32; those two files are the live record.
+
+**Root cause, as of v39:** a thread is released one time too many during early
+kernel boot (before any userspace exists). `thread_ro_destroy()` then leaves
+`th->t_tro` dangling, the threads_ro element is freed twice, and every later
+"structure was zeroed" crash (thread_ro / proc_ro / MAC label / plimit / task)
+is the allocator aliasing that dead element. 0094e/0095e only stop the first
+impact; 0116e (v39) clears `t_tro` after destroy.
+
+**The step that was blocked:** naming the caller of the extra release. The
+`SWEET THREAD` line prints during early boot and is impossible to photograph.
+0106e records the first occurrence of each anomaly kind and prints the registry
+at panic entry; 0117e adds kind 8 ("threadrel"). Those patches had never been
+compiled into a kernel: dxb/build.sh only *warns* when `git apply` fails, and
+0112e was malformed anyway, so v35..v40 silently shipped without them.
+
+**v41 (commit b9f346a + the kernel from CI run 41276278613):**
+
+- 0109e/0112e/0117e regenerated from the `_regen` base trees with difflib
+  (no heredoc), verified with `git -c core.autocrlf=false apply` round-trips
+  and byte-for-byte comparison against the intended trees;
+- kernel `kernel.development.sweet` 17 206 544 B
+  sha256 `2b6eefe48fde2570a3bc160e41882b7a0dda4804797fb5dc161908976da6dbd9`
+  (binary contains `SWEET ZRORO`, `threadrel`, `lockrw`, `SWEET REMAP`);
+- `shim-boot-full.img` sha256 `b618777132ab23bba8305484e223977a25d5ed56937f55cf8439d4fcae36fe27`
+  `shim-boot-full-root.img` sha256 `c7cfa00188a8ca79159db2f3995cbb70e9653f860c35c80c529ad3afe4029a3d`
+  (`verify_image_kernel.py` ALL PASS, 49 checks per image, now covering
+  0097e..0117e and the maxmem/vm_compressor/ignition boot-args);
+- boot-args unchanged from v39: `... maxmem=3072 vm_compressor=2` plus every
+  ignore_* knob. `remapcheck=1` is *not* in the cmdline, so 0113e/0114e stay
+  dormant unless it is added.
+
+**Next action:** flash only boot (userdata untouched), boot, photograph the
+screen. Expect
+`SWEET ANOM: threadrel first ptr 0x.. caller 0x.. count N`; that caller is
+the over-release site (kernel is not slid, so sym_kernel.py resolves it
+directly). If instead the boot now hangs before userspace, pull the sweetlog
+ring from the last 4 MiB of userdata (`read_sweetlog.py`) - the same SWEET
+THREAD/ANOM lines are there.
+
+**CI hardening (this commit):** xnu.yml now greps the built kernel for the ten
+diagnostic markers and fails the build when one is missing, so a silently
+skipped patch can never ship again.
