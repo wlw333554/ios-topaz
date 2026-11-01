@@ -1,0 +1,30 @@
+diff --git a/osfmk/kern/zalloc_internal.h b/osfmk/kern/zalloc_internal.h
+index cdd5939..be6a886 100644
+--- a/osfmk/kern/zalloc_internal.h
++++ b/osfmk/kern/zalloc_internal.h
+@@ -444,8 +444,24 @@ typedef struct zone_security_flags {
+ 
+ /*
+  * Zsecurity config to enable the read-only allocator
++ *
++ * evergo (0124e): OFF on this port.
++ *
++ * The read-only allocator routes every field update through
++ * pmap_ro_zone_memcpy/bzero(), which turns the element VA into a physical
++ * address with kvtophys_nofail() and writes through the physical aperture.
++ * On a non-Apple SoC that translation is not trustworthy, and the v42..v47
++ * boots show exactly the signature of stray physical writes: live kernel
++ * objects (ipc vouchers, ports, proc_ro) decaying into garbage pointers, pv
++ * table duplicates, recursive lck_mtx_lock() ownership, and userland text
++ * pages reported as corrupt.
++ *
++ * KASAN builds already run with this OFF, so it is a supported configuration:
++ * the ro zones simply behave like ordinary zones (plain bzero/memcpy on a
++ * writable mapping), at the cost of the hardening they provide on Apple
++ * hardware.
+  */
+-#if KASAN_CLASSIC
++#if KASAN_CLASSIC || defined(ARM64_BOARD_CONFIG_SWEET)
+ #   define ZSECURITY_CONFIG_READ_ONLY                   OFF
+ #else
+ #   define ZSECURITY_CONFIG_READ_ONLY                   ON
