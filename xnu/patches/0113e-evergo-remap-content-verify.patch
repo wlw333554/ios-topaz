@@ -1,65 +1,1008 @@
 diff --git a/osfmk/vm/vm_user.c b/osfmk/vm/vm_user.c
-index f7603d9..6d4da9e 100644
+index f7603d9..b391957 100644
 --- a/osfmk/vm/vm_user.c
 +++ b/osfmk/vm/vm_user.c
-@@ -124,6 +124,94 @@
+@@ -124,1210 +124,75 @@
  
  #include <san/kasan.h>
  
-+/*
+-#include <libkern/OSDebug.h>
+-#include <IOKit/IOBSD.h>
+-
+-#if     VM_CPM
+-#include <vm/cpm.h>
+-#endif  /* VM_CPM */
+-
+-static void mach_memory_entry_no_senders(ipc_port_t, mach_port_mscount_t);
+-
+-__attribute__((always_inline))
+-int
+-vm_map_kernel_flags_vmflags(vm_map_kernel_flags_t vmk_flags)
+-{
+-	int flags = vmk_flags.__vm_flags & VM_FLAGS_ANY_MASK;
+-
+-	/* in vmk flags the meaning of fixed/anywhere is inverted */
+-	return flags ^ (VM_FLAGS_FIXED | VM_FLAGS_ANYWHERE);
+-}
+-
+-__attribute__((always_inline, overloadable))
+-void
+-vm_map_kernel_flags_set_vmflags(
+-	vm_map_kernel_flags_t  *vmk_flags,
+-	int                     vm_flags,
+-	vm_tag_t                vm_tag)
+-{
+-	vm_flags ^= (VM_FLAGS_FIXED | VM_FLAGS_ANYWHERE);
+-	vmk_flags->__vm_flags &= ~VM_FLAGS_ANY_MASK;
+-	vmk_flags->__vm_flags |= (vm_flags & VM_FLAGS_ANY_MASK);
+-	vmk_flags->vm_tag = vm_tag;
+-}
+-
+-__attribute__((always_inline, overloadable))
+-void
+-vm_map_kernel_flags_set_vmflags(
+-	vm_map_kernel_flags_t  *vmk_flags,
+-	int                     vm_flags_and_tag)
+-{
+-	vm_flags_and_tag ^= (VM_FLAGS_FIXED | VM_FLAGS_ANYWHERE);
+-	vmk_flags->__vm_flags &= ~VM_FLAGS_ANY_MASK;
+-	vmk_flags->__vm_flags |= (vm_flags_and_tag & VM_FLAGS_ANY_MASK);
+-	VM_GET_FLAGS_ALIAS(vm_flags_and_tag, vmk_flags->vm_tag);
+-}
+-
+-__attribute__((always_inline))
+-void
+-vm_map_kernel_flags_and_vmflags(
+-	vm_map_kernel_flags_t  *vmk_flags,
+-	int                     vm_flags_mask)
+-{
+-	/* this function doesn't handle the inverted FIXED/ANYWHERE */
+-	assert(vm_flags_mask & VM_FLAGS_ANYWHERE);
+-	vmk_flags->__vm_flags &= vm_flags_mask;
+-}
+-
+-bool
+-vm_map_kernel_flags_check_vmflags(
+-	vm_map_kernel_flags_t   vmk_flags,
+-	int                     vm_flags_mask)
+-{
+-	int vmflags = vmk_flags.__vm_flags & VM_FLAGS_ANY_MASK;
+-
+-	/* Note: up to 16 still has good calling conventions */
+-	static_assert(sizeof(vm_map_kernel_flags_t) == 8);
+-
+-#if DEBUG || DEVELOPMENT
+-	/*
+-	 * All of this compiles to nothing if all checks pass.
+-	 */
+-#define check(field, value)  ({ \
+-	vm_map_kernel_flags_t fl = VM_MAP_KERNEL_FLAGS_NONE; \
+-	fl.__vm_flags = (value); \
+-	fl.field = 0; \
+-	assert(fl.__vm_flags == 0); \
+-})
+-
+-	/* bits 0-7 */
+-	check(vmf_fixed, VM_FLAGS_ANYWHERE); // kind of a lie this is inverted
+-	check(vmf_purgeable, VM_FLAGS_PURGABLE);
+-	check(vmf_4gb_chunk, VM_FLAGS_4GB_CHUNK);
+-	check(vmf_random_addr, VM_FLAGS_RANDOM_ADDR);
+-	check(vmf_no_cache, VM_FLAGS_NO_CACHE);
+-	check(vmf_resilient_codesign, VM_FLAGS_RESILIENT_CODESIGN);
+-	check(vmf_resilient_media, VM_FLAGS_RESILIENT_MEDIA);
+-	check(vmf_permanent, VM_FLAGS_PERMANENT);
+-
+-	/* bits 8-15 */
+-	check(vmf_tpro, VM_FLAGS_TPRO);
+-	check(vmf_overwrite, VM_FLAGS_OVERWRITE);
+-
+-	/* bits 16-23 */
+-	check(vmf_superpage_size, VM_FLAGS_SUPERPAGE_MASK);
+-	check(vmf_return_data_addr, VM_FLAGS_RETURN_DATA_ADDR);
+-	check(vmf_return_4k_data_addr, VM_FLAGS_RETURN_4K_DATA_ADDR);
+-
+-	{
+-		vm_map_kernel_flags_t fl = VM_MAP_KERNEL_FLAGS_NONE;
+-
+-		/* check user tags will never clip */
+-		fl.vm_tag = VM_MEMORY_COUNT - 1;
+-		assert(fl.vm_tag == VM_MEMORY_COUNT - 1);
+-
+-		/* check kernel tags will never clip */
+-		fl.vm_tag = VM_MAX_TAG_VALUE - 1;
+-		assert(fl.vm_tag == VM_MAX_TAG_VALUE - 1);
+-	}
+-
+-
+-#undef check
+-#endif /* DEBUG || DEVELOPMENT */
+-
+-	return (vmflags & ~vm_flags_mask) == 0;
+-}
+-
+-kern_return_t
+-vm_purgable_control(
+-	vm_map_t                map,
+-	vm_offset_t             address,
+-	vm_purgable_t           control,
+-	int                     *state);
+-
+-kern_return_t
+-mach_vm_purgable_control(
+-	vm_map_t                map,
+-	mach_vm_offset_t        address,
+-	vm_purgable_t           control,
+-	int                     *state);
+-
+-kern_return_t
+-mach_memory_entry_ownership(
+-	ipc_port_t      entry_port,
+-	task_t          owner,
+-	int             ledger_tag,
+-	int             ledger_flags);
+-
+-IPC_KOBJECT_DEFINE(IKOT_NAMED_ENTRY,
+-    .iko_op_stable     = true,
+-    .iko_op_no_senders = mach_memory_entry_no_senders);
+-
+-/*
+- *	mach_vm_allocate allocates "zero fill" memory in the specfied
+- *	map.
+- */
+-kern_return_t
+-mach_vm_allocate_external(
+-	vm_map_t                map,
+-	mach_vm_offset_t        *addr,
+-	mach_vm_size_t          size,
+-	int                     flags)
+-{
+-	vm_tag_t tag;
+-
+-	VM_GET_FLAGS_ALIAS(flags, tag);
+-	return mach_vm_allocate_kernel(map, addr, size, flags, tag);
+-}
+-
+-kern_return_t
+-mach_vm_allocate_kernel(
+-	vm_map_t                map,
+-	mach_vm_offset_t        *addr,
+-	mach_vm_size_t          size,
+-	int                     flags,
+-	vm_tag_t                tag)
+-{
+-	vm_map_offset_t map_addr;
+-	vm_map_size_t   map_size;
+-	kern_return_t   result;
+-	vm_map_kernel_flags_t vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
+-
+-	/* filter out any kernel-only flags */
+-	if (flags & ~VM_FLAGS_USER_ALLOCATE) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	vm_map_kernel_flags_set_vmflags(&vmk_flags, flags, tag);
+-
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-	if (size == 0) {
+-		*addr = 0;
+-		return KERN_SUCCESS;
+-	}
+-
+-	if (vmk_flags.vmf_fixed) {
+-		map_addr = vm_map_trunc_page(*addr, VM_MAP_PAGE_MASK(map));
+-	} else {
+-		map_addr = 0;
+-	}
+-	map_size = vm_map_round_page(size,
+-	    VM_MAP_PAGE_MASK(map));
+-	if (map_size == 0) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	vm_map_kernel_flags_update_range_id(&vmk_flags, map);
+-
+-	result = vm_map_enter(
+-		map,
+-		&map_addr,
+-		map_size,
+-		(vm_map_offset_t)0,
+-		vmk_flags,
+-		VM_OBJECT_NULL,
+-		(vm_object_offset_t)0,
+-		FALSE,
+-		VM_PROT_DEFAULT,
+-		VM_PROT_ALL,
+-		VM_INHERIT_DEFAULT);
+-
+-#if KASAN
+-	if (result == KERN_SUCCESS && map->pmap == kernel_pmap) {
+-		kasan_notify_address(map_addr, map_size);
+-	}
+-#endif
+-
+-	*addr = map_addr;
+-	return result;
+-}
+-
+-/*
+- *	vm_allocate
+- *	Legacy routine that allocates "zero fill" memory in the specfied
+- *	map (which is limited to the same size as the kernel).
+- */
+-kern_return_t
+-vm_allocate_external(
+-	vm_map_t        map,
+-	vm_offset_t     *addr,
+-	vm_size_t       size,
+-	int             flags)
+-{
+-	vm_map_kernel_flags_t vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
+-	vm_map_offset_t map_addr;
+-	vm_map_size_t   map_size;
+-	kern_return_t   result;
+-
+-	/* filter out any kernel-only flags */
+-	if (flags & ~VM_FLAGS_USER_ALLOCATE) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	vm_map_kernel_flags_set_vmflags(&vmk_flags, flags);
+-
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-	if (size == 0) {
+-		*addr = 0;
+-		return KERN_SUCCESS;
+-	}
+-
+-	if (vmk_flags.vmf_fixed) {
+-		map_addr = vm_map_trunc_page(*addr, VM_MAP_PAGE_MASK(map));
+-	} else {
+-		map_addr = 0;
+-	}
+-	map_size = vm_map_round_page(size,
+-	    VM_MAP_PAGE_MASK(map));
+-	if (map_size == 0) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	vm_map_kernel_flags_update_range_id(&vmk_flags, map);
+-
+-	result = vm_map_enter(
+-		map,
+-		&map_addr,
+-		map_size,
+-		(vm_map_offset_t)0,
+-		vmk_flags,
+-		VM_OBJECT_NULL,
+-		(vm_object_offset_t)0,
+-		FALSE,
+-		VM_PROT_DEFAULT,
+-		VM_PROT_ALL,
+-		VM_INHERIT_DEFAULT);
+-
+-#if KASAN
+-	if (result == KERN_SUCCESS && map->pmap == kernel_pmap) {
+-		kasan_notify_address(map_addr, map_size);
+-	}
+-#endif
+-
+-	*addr = CAST_DOWN(vm_offset_t, map_addr);
+-	return result;
+-}
+-
+-/*
+- *	mach_vm_deallocate -
+- *	deallocates the specified range of addresses in the
+- *	specified address map.
+- */
+-kern_return_t
+-mach_vm_deallocate(
+-	vm_map_t                map,
+-	mach_vm_offset_t        start,
+-	mach_vm_size_t  size)
+-{
+-	if ((map == VM_MAP_NULL) || (start + size < start)) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if (size == (mach_vm_offset_t) 0) {
+-		return KERN_SUCCESS;
+-	}
+-
+-	return vm_map_remove_guard(map,
+-	           vm_map_trunc_page(start,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           vm_map_round_page(start + size,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           VM_MAP_REMOVE_NO_FLAGS,
+-	           KMEM_GUARD_NONE).kmr_return;
+-}
+-
+-/*
+- *	vm_deallocate -
+- *	deallocates the specified range of addresses in the
+- *	specified address map (limited to addresses the same
+- *	size as the kernel).
+- */
+-kern_return_t
+-vm_deallocate(
+-	vm_map_t                map,
+-	vm_offset_t             start,
+-	vm_size_t               size)
+-{
+-	if ((map == VM_MAP_NULL) || (start + size < start)) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if (size == (vm_offset_t) 0) {
+-		return KERN_SUCCESS;
+-	}
+-
+-	return vm_map_remove_guard(map,
+-	           vm_map_trunc_page(start,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           vm_map_round_page(start + size,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           VM_MAP_REMOVE_NO_FLAGS,
+-	           KMEM_GUARD_NONE).kmr_return;
+-}
+-
+-/*
+- *	mach_vm_inherit -
+- *	Sets the inheritance of the specified range in the
+- *	specified map.
+- */
+-kern_return_t
+-mach_vm_inherit(
+-	vm_map_t                map,
+-	mach_vm_offset_t        start,
+-	mach_vm_size_t  size,
+-	vm_inherit_t            new_inheritance)
+-{
+-	if ((map == VM_MAP_NULL) || (start + size < start) ||
+-	    (new_inheritance > VM_INHERIT_LAST_VALID)) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if (size == 0) {
+-		return KERN_SUCCESS;
+-	}
+-
+-	return vm_map_inherit(map,
+-	           vm_map_trunc_page(start,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           vm_map_round_page(start + size,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           new_inheritance);
+-}
+-
+-/*
+- *	vm_inherit -
+- *	Sets the inheritance of the specified range in the
+- *	specified map (range limited to addresses
+- */
+-kern_return_t
+-vm_inherit(
+-	vm_map_t                map,
+-	vm_offset_t             start,
+-	vm_size_t               size,
+-	vm_inherit_t            new_inheritance)
+-{
+-	if ((map == VM_MAP_NULL) || (start + size < start) ||
+-	    (new_inheritance > VM_INHERIT_LAST_VALID)) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if (size == 0) {
+-		return KERN_SUCCESS;
+-	}
+-
+-	return vm_map_inherit(map,
+-	           vm_map_trunc_page(start,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           vm_map_round_page(start + size,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           new_inheritance);
+-}
+-
+-/*
+- *	mach_vm_protect -
+- *	Sets the protection of the specified range in the
+- *	specified map.
+- */
+-
+-kern_return_t
+-mach_vm_protect(
+-	vm_map_t                map,
+-	mach_vm_offset_t        start,
+-	mach_vm_size_t  size,
+-	boolean_t               set_maximum,
+-	vm_prot_t               new_protection)
+-{
+-	if ((map == VM_MAP_NULL) || (start + size < start) ||
+-	    (new_protection & ~(VM_PROT_ALL | VM_PROT_COPY))) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if (size == 0) {
+-		return KERN_SUCCESS;
+-	}
+-
+-	return vm_map_protect(map,
+-	           vm_map_trunc_page(start,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           vm_map_round_page(start + size,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           new_protection,
+-	           set_maximum);
+-}
+-
+-/*
+- *	vm_protect -
+- *	Sets the protection of the specified range in the
+- *	specified map. Addressability of the range limited
+- *	to the same size as the kernel.
+- */
+-
+-kern_return_t
+-vm_protect(
+-	vm_map_t                map,
+-	vm_offset_t             start,
+-	vm_size_t               size,
+-	boolean_t               set_maximum,
+-	vm_prot_t               new_protection)
+-{
+-	if ((map == VM_MAP_NULL) || (start + size < start) ||
+-	    (new_protection & ~VM_VALID_VMPROTECT_FLAGS)
+-#if defined(__x86_64__)
+-	    || ((new_protection & VM_PROT_UEXEC) && !pmap_supported_feature(map->pmap, PMAP_FEAT_UEXEC))
+-#endif
+-	    ) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if (size == 0) {
+-		return KERN_SUCCESS;
+-	}
+-
+-	return vm_map_protect(map,
+-	           vm_map_trunc_page(start,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           vm_map_round_page(start + size,
+-	           VM_MAP_PAGE_MASK(map)),
+-	           new_protection,
+-	           set_maximum);
+-}
+-
+-/*
+- * mach_vm_machine_attributes -
+- * Handle machine-specific attributes for a mapping, such
+- * as cachability, migrability, etc.
+- */
+-kern_return_t
+-mach_vm_machine_attribute(
+-	vm_map_t                        map,
+-	mach_vm_address_t               addr,
+-	mach_vm_size_t          size,
+-	vm_machine_attribute_t  attribute,
+-	vm_machine_attribute_val_t* value)              /* IN/OUT */
+-{
+-	if ((map == VM_MAP_NULL) || (addr + size < addr)) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if (size == 0) {
+-		return KERN_SUCCESS;
+-	}
+-
+-	return vm_map_machine_attribute(
+-		map,
+-		vm_map_trunc_page(addr,
+-		VM_MAP_PAGE_MASK(map)),
+-		vm_map_round_page(addr + size,
+-		VM_MAP_PAGE_MASK(map)),
+-		attribute,
+-		value);
+-}
+-
+-/*
+- * vm_machine_attribute -
+- * Handle machine-specific attributes for a mapping, such
+- * as cachability, migrability, etc. Limited addressability
+- * (same range limits as for the native kernel map).
+- */
+-kern_return_t
+-vm_machine_attribute(
+-	vm_map_t        map,
+-	vm_address_t    addr,
+-	vm_size_t       size,
+-	vm_machine_attribute_t  attribute,
+-	vm_machine_attribute_val_t* value)              /* IN/OUT */
+-{
+-	if ((map == VM_MAP_NULL) || (addr + size < addr)) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if (size == 0) {
+-		return KERN_SUCCESS;
+-	}
+-
+-	return vm_map_machine_attribute(
+-		map,
+-		vm_map_trunc_page(addr,
+-		VM_MAP_PAGE_MASK(map)),
+-		vm_map_round_page(addr + size,
+-		VM_MAP_PAGE_MASK(map)),
+-		attribute,
+-		value);
+-}
+-
+-/*
+- * mach_vm_read -
+- * Read/copy a range from one address space and return it to the caller.
+- *
+- * It is assumed that the address for the returned memory is selected by
+- * the IPC implementation as part of receiving the reply to this call.
+- * If IPC isn't used, the caller must deal with the vm_map_copy_t object
+- * that gets returned.
+- *
+- * JMM - because of mach_msg_type_number_t, this call is limited to a
+- * single 4GB region at this time.
+- *
+- */
+-kern_return_t
+-mach_vm_read(
+-	vm_map_t                map,
+-	mach_vm_address_t       addr,
+-	mach_vm_size_t  size,
+-	pointer_t               *data,
+-	mach_msg_type_number_t  *data_size)
+-{
+-	kern_return_t   error;
+-	vm_map_copy_t   ipc_address;
+-
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if ((mach_msg_type_number_t) size != size) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	error = vm_map_copyin(map,
+-	    (vm_map_address_t)addr,
+-	    (vm_map_size_t)size,
+-	    FALSE,              /* src_destroy */
+-	    &ipc_address);
+-
+-	if (KERN_SUCCESS == error) {
+-		*data = (pointer_t) ipc_address;
+-		*data_size = (mach_msg_type_number_t) size;
+-		assert(*data_size == size);
+-	}
+-	return error;
+-}
+-
+-/*
+- * vm_read -
+- * Read/copy a range from one address space and return it to the caller.
+- * Limited addressability (same range limits as for the native kernel map).
+- *
+- * It is assumed that the address for the returned memory is selected by
+- * the IPC implementation as part of receiving the reply to this call.
+- * If IPC isn't used, the caller must deal with the vm_map_copy_t object
+- * that gets returned.
+- */
+-kern_return_t
+-vm_read(
+-	vm_map_t                map,
+-	vm_address_t            addr,
+-	vm_size_t               size,
+-	pointer_t               *data,
+-	mach_msg_type_number_t  *data_size)
+-{
+-	kern_return_t   error;
+-	vm_map_copy_t   ipc_address;
+-
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	mach_msg_type_number_t dsize;
+-	if (os_convert_overflow(size, &dsize)) {
+-		/*
+-		 * The kernel could handle a 64-bit "size" value, but
+-		 * it could not return the size of the data in "*data_size"
+-		 * without overflowing.
+-		 * Let's reject this "size" as invalid.
+-		 */
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	error = vm_map_copyin(map,
+-	    (vm_map_address_t)addr,
+-	    (vm_map_size_t)size,
+-	    FALSE,              /* src_destroy */
+-	    &ipc_address);
+-
+-	if (KERN_SUCCESS == error) {
+-		*data = (pointer_t) ipc_address;
+-		*data_size = dsize;
+-		assert(*data_size == size);
+-	}
+-	return error;
+-}
+-
+-/*
+- * mach_vm_read_list -
+- * Read/copy a list of address ranges from specified map.
+- *
+- * MIG does not know how to deal with a returned array of
+- * vm_map_copy_t structures, so we have to do the copyout
+- * manually here.
+- */
+-kern_return_t
+-mach_vm_read_list(
+-	vm_map_t                        map,
+-	mach_vm_read_entry_t            data_list,
+-	natural_t                       count)
+-{
+-	mach_msg_type_number_t  i;
+-	kern_return_t   error;
+-	vm_map_copy_t   copy;
+-
+-	if (map == VM_MAP_NULL ||
+-	    count > VM_MAP_ENTRY_MAX) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	error = KERN_SUCCESS;
+-	for (i = 0; i < count; i++) {
+-		vm_map_address_t map_addr;
+-		vm_map_size_t map_size;
+-
+-		map_addr = (vm_map_address_t)(data_list[i].address);
+-		map_size = (vm_map_size_t)(data_list[i].size);
+-
+-		if (map_size != 0) {
+-			error = vm_map_copyin(map,
+-			    map_addr,
+-			    map_size,
+-			    FALSE,              /* src_destroy */
+-			    &copy);
+-			if (KERN_SUCCESS == error) {
+-				error = vm_map_copyout(
+-					current_task()->map,
+-					&map_addr,
+-					copy);
+-				if (KERN_SUCCESS == error) {
+-					data_list[i].address = map_addr;
+-					continue;
+-				}
+-				vm_map_copy_discard(copy);
+-			}
+-		}
+-		data_list[i].address = (mach_vm_address_t)0;
+-		data_list[i].size = (mach_vm_size_t)0;
+-	}
+-	return error;
+-}
+-
+-/*
+- * vm_read_list -
+- * Read/copy a list of address ranges from specified map.
+- *
+- * MIG does not know how to deal with a returned array of
+- * vm_map_copy_t structures, so we have to do the copyout
+- * manually here.
+- *
+- * The source and destination ranges are limited to those
+- * that can be described with a vm_address_t (i.e. same
+- * size map as the kernel).
+- *
+- * JMM - If the result of the copyout is an address range
+- * that cannot be described with a vm_address_t (i.e. the
+- * caller had a larger address space but used this call
+- * anyway), it will result in a truncated address being
+- * returned (and a likely confused caller).
+- */
+-
+-kern_return_t
+-vm_read_list(
+-	vm_map_t                map,
+-	vm_read_entry_t data_list,
+-	natural_t               count)
+-{
+-	mach_msg_type_number_t  i;
+-	kern_return_t   error;
+-	vm_map_copy_t   copy;
+-
+-	if (map == VM_MAP_NULL ||
+-	    count > VM_MAP_ENTRY_MAX) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	error = KERN_SUCCESS;
+-	for (i = 0; i < count; i++) {
+-		vm_map_address_t map_addr;
+-		vm_map_size_t map_size;
+-
+-		map_addr = (vm_map_address_t)(data_list[i].address);
+-		map_size = (vm_map_size_t)(data_list[i].size);
+-
+-		if (map_size != 0) {
+-			error = vm_map_copyin(map,
+-			    map_addr,
+-			    map_size,
+-			    FALSE,              /* src_destroy */
+-			    &copy);
+-			if (KERN_SUCCESS == error) {
+-				error = vm_map_copyout(current_task()->map,
+-				    &map_addr,
+-				    copy);
+-				if (KERN_SUCCESS == error) {
+-					data_list[i].address =
+-					    CAST_DOWN(vm_offset_t, map_addr);
+-					continue;
+-				}
+-				vm_map_copy_discard(copy);
+-			}
+-		}
+-		data_list[i].address = (mach_vm_address_t)0;
+-		data_list[i].size = (mach_vm_size_t)0;
+-	}
+-	return error;
+-}
+-
+-/*
+- * mach_vm_read_overwrite -
+- * Overwrite a range of the current map with data from the specified
+- * map/address range.
+- *
+- * In making an assumption that the current thread is local, it is
+- * no longer cluster-safe without a fully supportive local proxy
+- * thread/task (but we don't support cluster's anymore so this is moot).
+- */
+-
+-kern_return_t
+-mach_vm_read_overwrite(
+-	vm_map_t                map,
+-	mach_vm_address_t       address,
+-	mach_vm_size_t  size,
+-	mach_vm_address_t       data,
+-	mach_vm_size_t  *data_size)
+-{
+-	kern_return_t   error;
+-	vm_map_copy_t   copy;
+-
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	error = vm_map_copyin(map, (vm_map_address_t)address,
+-	    (vm_map_size_t)size, FALSE, &copy);
+-
+-	if (KERN_SUCCESS == error) {
+-		if (copy) {
+-			assertf(copy->size == (vm_map_size_t) size, "Req size: 0x%llx, Copy size: 0x%llx\n", (uint64_t) size, (uint64_t) copy->size);
+-		}
+-
+-		error = vm_map_copy_overwrite(current_thread()->map,
+-		    (vm_map_address_t)data,
+-		    copy, (vm_map_size_t) size, FALSE);
+-		if (KERN_SUCCESS == error) {
+-			*data_size = size;
+-			return error;
+-		}
+-		vm_map_copy_discard(copy);
+-	}
+-	return error;
+-}
+-
+-/*
+- * vm_read_overwrite -
+- * Overwrite a range of the current map with data from the specified
+- * map/address range.
+- *
+- * This routine adds the additional limitation that the source and
+- * destination ranges must be describable with vm_address_t values
+- * (i.e. the same size address spaces as the kernel, or at least the
+- * the ranges are in that first portion of the respective address
+- * spaces).
+- */
+-
+-kern_return_t
+-vm_read_overwrite(
+-	vm_map_t        map,
+-	vm_address_t    address,
+-	vm_size_t       size,
+-	vm_address_t    data,
+-	vm_size_t       *data_size)
+-{
+-	kern_return_t   error;
+-	vm_map_copy_t   copy;
+-
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	error = vm_map_copyin(map, (vm_map_address_t)address,
+-	    (vm_map_size_t)size, FALSE, &copy);
+-
+-	if (KERN_SUCCESS == error) {
+-		if (copy) {
+-			assertf(copy->size == (vm_map_size_t) size, "Req size: 0x%llx, Copy size: 0x%llx\n", (uint64_t) size, (uint64_t) copy->size);
+-		}
+-
+-		error = vm_map_copy_overwrite(current_thread()->map,
+-		    (vm_map_address_t)data,
+-		    copy, (vm_map_size_t) size, FALSE);
+-		if (KERN_SUCCESS == error) {
+-			*data_size = size;
+-			return error;
+-		}
+-		vm_map_copy_discard(copy);
+-	}
+-	return error;
+-}
+-
+-
+ /*
+- * mach_vm_write -
+- * Overwrite the specified address range with the data provided
+- * (from the current map).
 + * evergo (0113e): dyld remaps the shared cache __DATA ranges within its
 + * task (vm_remap from the nested shared region sub-map). On this port the
 + * remapped copies have been observed corrupted in userland (dyld B+tree
 + * erase assertion, NULL loader structures) while the on-disk cache is
 + * byte-perfect. Verify, for the first remaps after boot-arg remapcheck=1,
 + * that the destination content matches the source content.
-+ */
+  */
+-kern_return_t
+-mach_vm_write(
+-	vm_map_t                        map,
+-	mach_vm_address_t               address,
+-	pointer_t                       data,
+-	mach_msg_type_number_t          size)
+-{
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	return vm_map_copy_overwrite(map, (vm_map_address_t)address,
+-	           (vm_map_copy_t) data, size, FALSE /* interruptible XXX */);
+-}
 +static uint32_t evergo_remapcheck_state;
-+
+ 
+-/*
+- * vm_write -
+- * Overwrite the specified address range with the data provided
+- * (from the current map).
+- *
+- * The addressability of the range of addresses to overwrite is
+- * limited bu the use of a vm_address_t (same size as kernel map).
+- * Either the target map is also small, or the range is in the
+- * low addresses within it.
+- */
+-kern_return_t
+-vm_write(
+-	vm_map_t                        map,
+-	vm_address_t                    address,
+-	pointer_t                       data,
+-	mach_msg_type_number_t          size)
 +static bool
 +evergo_remapcheck_on(void)
-+{
+ {
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
 +	if (evergo_remapcheck_state == 0) {
 +		uint32_t v = 0;
 +		(void)PE_parse_boot_argn("remapcheck", &v, sizeof(v));
 +		evergo_remapcheck_state = v ? 2 : 1;
-+	}
+ 	}
+-
+-	return vm_map_copy_overwrite(map, (vm_map_address_t)address,
+-	           (vm_map_copy_t) data, size, FALSE /* interruptible XXX */);
 +	return evergo_remapcheck_state == 2;
-+}
-+
+ }
+ 
+-/*
+- * mach_vm_copy -
+- * Overwrite one range of the specified map with the contents of
+- * another range within that same map (i.e. both address ranges
+- * are "over there").
+- */
+-kern_return_t
+-mach_vm_copy(
+-	vm_map_t                map,
+-	mach_vm_address_t       source_address,
+-	mach_vm_size_t  size,
+-	mach_vm_address_t       dest_address)
 +static void
 +evergo_remap_verify(
 +	vm_map_t               map,
 +	vm_map_address_t       dst,
 +	vm_map_address_t       src,
 +	vm_map_size_t          size)
-+{
+ {
+-	vm_map_copy_t copy;
+-	kern_return_t kr;
+-
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	kr = vm_map_copyin(map, (vm_map_address_t)source_address,
+-	    (vm_map_size_t)size, FALSE, &copy);
+-
+-	if (KERN_SUCCESS == kr) {
+-		if (copy) {
+-			assertf(copy->size == (vm_map_size_t) size, "Req size: 0x%llx, Copy size: 0x%llx\n", (uint64_t) size, (uint64_t) copy->size);
+-		}
+-
+-		kr = vm_map_copy_overwrite(map,
+-		    (vm_map_address_t)dest_address,
+-		    copy, (vm_map_size_t) size, FALSE /* interruptible XXX */);
 +	vm_map_copy_t  c_dst = VM_MAP_COPY_NULL;
 +	vm_map_copy_t  c_src = VM_MAP_COPY_NULL;
 +	vm_map_address_t k_dst = 0, k_src = 0;
 +	kern_return_t   kr;
 +	vm_map_size_t   len = MIN(size, 4 * 4096);
-+
+ 
+-		if (KERN_SUCCESS != kr) {
+-			vm_map_copy_discard(copy);
+-		}
 +	kr = vm_map_copyin(map, dst, len, FALSE, &c_dst);
 +	if (kr != KERN_SUCCESS) {
-+		printf("SWEET REMAP: dst copyin failed %d dst 0x%llx
-+", kr, (uint64_t)dst);
++		printf("SWEET REMAP: dst copyin failed %d dst 0x%llxkr(uint64_t)dst\n", kr, (uint64_t)dst);
 +		return;
-+	}
+ 	}
+-	return kr;
+-}
+-
+-kern_return_t
+-vm_copy(
+-	vm_map_t        map,
+-	vm_address_t    source_address,
+-	vm_size_t       size,
+-	vm_address_t    dest_address)
+-{
+-	vm_map_copy_t copy;
+-	kern_return_t kr;
+-
+-	if (map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
 +	kr = vm_map_copyout(kernel_map, &k_dst, c_dst);
 +	if (kr != KERN_SUCCESS) {
-+		printf("SWEET REMAP: dst copyout failed %d
-+", kr);
++		printf("SWEET REMAP: dst copyout failed %dkr\n", kr);
 +		vm_map_copy_discard(c_dst);
 +		return;
-+	}
+ 	}
+-
+-	kr = vm_map_copyin(map, (vm_map_address_t)source_address,
+-	    (vm_map_size_t)size, FALSE, &copy);
+-
+-	if (KERN_SUCCESS == kr) {
+-		if (copy) {
+-			assertf(copy->size == (vm_map_size_t) size, "Req size: 0x%llx, Copy size: 0x%llx\n", (uint64_t) size, (uint64_t) copy->size);
+-		}
+-
+-		kr = vm_map_copy_overwrite(map,
+-		    (vm_map_address_t)dest_address,
+-		    copy, (vm_map_size_t) size, FALSE /* interruptible XXX */);
+-
+-		if (KERN_SUCCESS != kr) {
+-			vm_map_copy_discard(copy);
 +	kr = vm_map_copyin(map, src, len, FALSE, &c_src);
 +	if (kr == KERN_SUCCESS) {
 +		kr = vm_map_copyout(kernel_map, &k_src, c_src);
 +	}
 +	if (kr != KERN_SUCCESS) {
-+		printf("SWEET REMAP: src copy failed %d src 0x%llx
-+", kr, (uint64_t)src);
++		printf("SWEET REMAP: src copy failed %d src 0x%llxkr(uint64_t)src\n", kr, (uint64_t)src);
 +		kmem_free(kernel_map, k_dst, round_page(len));
 +		return;
 +	}
@@ -71,33 +1014,261 @@ index f7603d9..6d4da9e 100644
 +			    *(uint8_t *)(uintptr_t)(k_src + o)) {
 +				break;
 +			}
-+		}
-+		printf("SWEET REMAP: MISMATCH dst 0x%llx src 0x%llx len 0x%llx "
-+		    "first diff at 0x%llx: dst %02x %02x %02x %02x src %02x %02x %02x %02x
-+",
-+		    (uint64_t)dst, (uint64_t)src, (uint64_t)len, (uint64_t)o,
-+		    *(uint8_t *)(uintptr_t)(k_dst + o),
-+		    *(uint8_t *)(uintptr_t)(k_dst + o + 1),
-+		    *(uint8_t *)(uintptr_t)(k_dst + o + 2),
-+		    *(uint8_t *)(uintptr_t)(k_dst + o + 3),
-+		    *(uint8_t *)(uintptr_t)(k_src + o),
-+		    *(uint8_t *)(uintptr_t)(k_src + o + 1),
-+		    *(uint8_t *)(uintptr_t)(k_src + o + 2),
-+		    *(uint8_t *)(uintptr_t)(k_src + o + 3));
-+	} else {
-+		printf("SWEET REMAP: verify OK dst 0x%llx len 0x%llx
-+",
-+		    (uint64_t)dst, (uint64_t)len);
-+	}
+ 		}
+-	}
+-	return kr;
+-}
+-
+-/*
+- * mach_vm_map -
+- * Map some range of an object into an address space.
+- *
+- * The object can be one of several types of objects:
+- *	NULL - anonymous memory
+- *	a named entry - a range within another address space
+- *	                or a range within a memory object
+- *	a whole memory object
+- *
+- */
+-kern_return_t
+-mach_vm_map_external(
+-	vm_map_t                target_map,
+-	mach_vm_offset_t        *address,
+-	mach_vm_size_t          initial_size,
+-	mach_vm_offset_t        mask,
+-	int                     flags,
+-	ipc_port_t              port,
+-	vm_object_offset_t      offset,
+-	boolean_t               copy,
+-	vm_prot_t               cur_protection,
+-	vm_prot_t               max_protection,
+-	vm_inherit_t            inheritance)
+-{
+-	vm_map_kernel_flags_t vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
+-
+-	/* filter out any kernel-only flags */
+-	if (flags & ~VM_FLAGS_USER_MAP) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	vm_map_kernel_flags_set_vmflags(&vmk_flags, flags);
+-	/* range_id is set by mach_vm_map_kernel */
+-	return mach_vm_map_kernel(target_map, address, initial_size, mask,
+-	           vmk_flags, port, offset, copy,
+-	           cur_protection, max_protection,
+-	           inheritance);
+-}
+-
+-kern_return_t
+-mach_vm_map_kernel(
+-	vm_map_t                target_map,
+-	mach_vm_offset_t        *address,
+-	mach_vm_size_t          initial_size,
+-	mach_vm_offset_t        mask,
+-	vm_map_kernel_flags_t   vmk_flags,
+-	ipc_port_t              port,
+-	vm_object_offset_t      offset,
+-	boolean_t               copy,
+-	vm_prot_t               cur_protection,
+-	vm_prot_t               max_protection,
+-	vm_inherit_t            inheritance)
+-{
+-	kern_return_t           kr;
+-	vm_map_offset_t         vmmaddr;
+-
+-	vmmaddr = (vm_map_offset_t) *address;
+-
+-	/* filter out any kernel-only flags */
+-	if (!vm_map_kernel_flags_check_vmflags(vmk_flags, VM_FLAGS_USER_MAP)) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	/* range_id is set by vm_map_enter_mem_object */
+-	kr = vm_map_enter_mem_object(target_map,
+-	    &vmmaddr,
+-	    initial_size,
+-	    mask,
+-	    vmk_flags,
+-	    port,
+-	    offset,
+-	    copy,
+-	    cur_protection,
+-	    max_protection,
+-	    inheritance);
+-
+-#if KASAN
+-	if (kr == KERN_SUCCESS && target_map->pmap == kernel_pmap) {
+-		kasan_notify_address(vmmaddr, initial_size);
+-	}
+-#endif
+-
+-	*address = vmmaddr;
+-	return kr;
+-}
+-
+-
+-/* legacy interface */
+-__attribute__((always_inline))
+-kern_return_t
+-vm_map_64_external(
+-	vm_map_t                target_map,
+-	vm_offset_t             *address,
+-	vm_size_t               size,
+-	vm_offset_t             mask,
+-	int                     flags,
+-	ipc_port_t              port,
+-	vm_object_offset_t      offset,
+-	boolean_t               copy,
+-	vm_prot_t               cur_protection,
+-	vm_prot_t               max_protection,
+-	vm_inherit_t            inheritance)
+-{
+-	static_assert(sizeof(vm_offset_t) == sizeof(mach_vm_offset_t));
+-
+-	return mach_vm_map_external(target_map, (mach_vm_offset_t *)address,
+-	           size, mask, flags, port, offset, copy,
+-	           cur_protection, max_protection, inheritance);
+-}
+-
+-/* temporary, until world build */
+-__attribute__((always_inline))
+-kern_return_t
+-vm_map_external(
+-	vm_map_t                target_map,
+-	vm_offset_t             *address,
+-	vm_size_t               size,
+-	vm_offset_t             mask,
+-	int                     flags,
+-	ipc_port_t              port,
+-	vm_offset_t             offset,
+-	boolean_t               copy,
+-	vm_prot_t               cur_protection,
+-	vm_prot_t               max_protection,
+-	vm_inherit_t            inheritance)
+-{
+-	static_assert(sizeof(vm_offset_t) == sizeof(mach_vm_offset_t));
+-
+-	return mach_vm_map_external(target_map, (mach_vm_offset_t *)address,
+-	           size, mask, flags, port, offset, copy,
+-	           cur_protection, max_protection, inheritance);
+-}
+-
+-/*
+- * mach_vm_remap_new -
+- * Behaves like mach_vm_remap, except that VM_FLAGS_RETURN_DATA_ADDR is always set
+- * and {cur,max}_protection are in/out.
+- */
+-kern_return_t
+-mach_vm_remap_new_external(
+-	vm_map_t                target_map,
+-	mach_vm_offset_t        *address,
+-	mach_vm_size_t          size,
+-	mach_vm_offset_t        mask,
+-	int                     flags,
+-	mach_port_t             src_tport,
+-	mach_vm_offset_t        memory_address,
+-	boolean_t               copy,
+-	vm_prot_t               *cur_protection,   /* IN/OUT */
+-	vm_prot_t               *max_protection,   /* IN/OUT */
+-	vm_inherit_t            inheritance)
+-{
+-	vm_map_kernel_flags_t   vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
+-	vm_map_t                src_map;
+-	kern_return_t           kr;
+-
+-	/* filter out any kernel-only flags */
+-	if (flags & ~VM_FLAGS_USER_REMAP) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	vm_map_kernel_flags_set_vmflags(&vmk_flags,
+-	    flags | VM_FLAGS_RETURN_DATA_ADDR);
+-
+-	if (target_map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	if ((*cur_protection & ~VM_PROT_ALL) ||
+-	    (*max_protection & ~VM_PROT_ALL) ||
+-	    (*cur_protection & *max_protection) != *cur_protection) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-	if ((*max_protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) ==
+-	    (VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+-		/*
+-		 * XXX FBDP TODO
+-		 * enforce target's "wx" policies
+-		 */
+-		return KERN_PROTECTION_FAILURE;
+-	}
+-
+-	if (copy || *max_protection == VM_PROT_READ || *max_protection == VM_PROT_NONE) {
+-		src_map = convert_port_to_map_read(src_tport);
++		printf("SWEET REMAP: MISMATCH dst 0x%llx src 0x%llx len 0x%llx first diff at 0x%llx: dst %02x %02x %02x %02x src %02x %02x %02x %02x(uint64_t)dst(uint64_t)src(uint64_t)len(uint64_t)o*(uint8_t *)(uintptr_t)(k_dst + o)*(uint8_t *)(uintptr_t)(k_dst + o + 1)*(uint8_t *)(uintptr_t)(k_dst + o + 2)*(uint8_t *)(uintptr_t)(k_dst + o + 3)*(uint8_t *)(uintptr_t)(k_src + o)*(uint8_t *)(uintptr_t)(k_src + o + 1)*(uint8_t *)(uintptr_t)(k_src + o + 2)*(uint8_t *)(uintptr_t)(k_src + o + 3)\n", (uint64_t)dst, (uint64_t)src, (uint64_t)len, (uint64_t)o, *(uint8_t *)(uintptr_t)(k_dst + o), *(uint8_t *)(uintptr_t)(k_dst + o + 1), *(uint8_t *)(uintptr_t)(k_dst + o + 2), *(uint8_t *)(uintptr_t)(k_dst + o + 3), *(uint8_t *)(uintptr_t)(k_src + o), *(uint8_t *)(uintptr_t)(k_src + o + 1), *(uint8_t *)(uintptr_t)(k_src + o + 2), *(uint8_t *)(uintptr_t)(k_src + o + 3));
+ 	} else {
+-		src_map = convert_port_to_map(src_tport);
+-	}
+-
+-	if (src_map == VM_MAP_NULL) {
+-		return KERN_INVALID_ARGUMENT;
+-	}
+-
+-	static_assert(sizeof(mach_vm_offset_t) == sizeof(vm_map_address_t));
+-
+-	/* range_id is set by vm_map_remap */
+-	kr = vm_map_remap(target_map,
+-	    address,
+-	    size,
+-	    mask,
+-	    vmk_flags,
+-	    src_map,
+-	    memory_address,
+-	    copy,
+-	    cur_protection,    /* IN/OUT */
+-	    max_protection,    /* IN/OUT */
+-	    inheritance);
+-
+-	vm_map_deallocate(src_map);
+-
+-	if (kr == KERN_SUCCESS) {
+-		ipc_port_release_send(src_tport);  /* consume on success */
++		printf("SWEET REMAP: verify OK dst 0x%llx len 0x%llx(uint64_t)dst(uint64_t)len\n", (uint64_t)dst, (uint64_t)len);
+ 	}
+-	return kr;
+-}
+-
+-/*
+- * mach_vm_remap -
+- * Remap a range of memory from one task into another,
+- * to another address range within the same task, or
+- * over top of itself (with altered permissions and/or
+- * as an in-place copy of itself).
+- */
+-kern_return_t
+-mach_vm_remap_external(
+-	vm_map_t                target_map,
+-	mach_vm_offset_t        *address,
+-	mach_vm_size_t  size,
+-	mach_vm_offset_t        mask,
+-	int                     flags,
+-	vm_map_t                src_map,
+-	mach_vm_offset_t        memory_address,
+-	boolean_t               copy,
+-	vm_prot_t               *cur_protection,    /* OUT */
+-	vm_prot_t               *max_protection,    /* OUT */
+-	vm_inherit_t            inheritance)
+-{
+-	vm_tag_t tag;
+-	VM_GET_FLAGS_ALIAS(flags, tag);
+-
+-	return mach_vm_remap_kernel(target_map, address, size, mask, flags, tag, src_map, memory_address,
+-	           copy, cur_protection, max_protection, inheritance);
 +	kmem_free(kernel_map, k_dst, round_page(len));
 +	kmem_free(kernel_map, k_src, round_page(len));
-+}
-+
-+
- #include <libkern/OSDebug.h>
- #include <IOKit/IOBSD.h>
+ }
  
-@@ -1379,6 +1467,16 @@ mach_vm_remap_kernel_helper(
+ static kern_return_t
+@@ -1379,6 +244,16 @@ mach_vm_remap_kernel_helper(
  	if (kr == KERN_SUCCESS && target_map->pmap == kernel_pmap) {
  		kasan_notify_address(*address, size);
  	}
