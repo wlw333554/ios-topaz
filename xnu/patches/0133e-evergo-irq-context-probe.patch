@@ -1,0 +1,94 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..5e77d14 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1847,6 +1847,47 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ 	__builtin_unreachable();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * evergo (0133e): remember what the first interrupts looked like.
++ *
++ * On the phone the boot dies in a different place every time (a NULL CpuDatap
++ * while re-enabling interrupts, an all-zero spinlock, a UPL whose map_object
++ * vanished). Those are all interrupt-context shapes, and QEMU's virt platform
++ * does not produce the same interrupt mix, so the failures cannot be
++ * reproduced locally. Record the first eight IRQs here - intid, the per-CPU
++ * data, the current thread and its magic, the preemption level - and let the
++ * panic handler print them. No printf in interrupt context.
++ */
++#define EVERGO_IRQ_SLOTS 8
++
++uint32_t evergo_irq_count;
++uint32_t evergo_irq_intid[EVERGO_IRQ_SLOTS];
++void    *evergo_irq_cdp[EVERGO_IRQ_SLOTS];
++void    *evergo_irq_thread[EVERGO_IRQ_SLOTS];
++uint64_t evergo_irq_magic[EVERGO_IRQ_SLOTS];
++uint32_t evergo_irq_preempt[EVERGO_IRQ_SLOTS];
++
++static inline void
++evergo_irq_probe(uint32_t intid, cpu_data_t *cdp)
++{
++	uint32_t n = evergo_irq_count;
++
++	if (n >= EVERGO_IRQ_SLOTS) {
++		return;
++	}
++	thread_t th = current_thread();
++
++	evergo_irq_intid[n] = intid;
++	evergo_irq_cdp[n] = cdp;
++	evergo_irq_thread[n] = th;
++	evergo_irq_magic[n] = th != THREAD_NULL ?
++	    (uint64_t)th->thread_magic : 0;
++	evergo_irq_preempt[n] = (uint32_t)get_preemption_level();
++	evergo_irq_count = n + 1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -1864,6 +1905,8 @@ sleh_irq(arm_saved_state_t *state)
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
++	evergo_irq_probe(intid, cdp);
++
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 7d51deb..ae602c6 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -158,6 +158,28 @@ evergo_anom_dump(void)
+ 			printf("SWEET DSC: probe did not run\n");
+ 		}
+ 	}
++
++	/*
++	 * evergo (0133e): the first interrupts and the context they arrived in.
++	 * A bad thread magic or a NULL per-CPU pointer here explains the
++	 * device-only, different-every-boot crashes.
++	 */
++	{
++		extern uint32_t evergo_irq_count;
++		extern uint32_t evergo_irq_intid[8];
++		extern void *evergo_irq_cdp[8];
++		extern void *evergo_irq_thread[8];
++		extern uint64_t evergo_irq_magic[8];
++		extern uint32_t evergo_irq_preempt[8];
++
++		printf("SWEET IRQ: %u interrupt(s) seen\n", evergo_irq_count);
++		for (uint32_t i = 0; i < evergo_irq_count && i < 8; i++) {
++			printf("SWEET IRQ: #%u intid %u cpudata %p thread %p magic 0x%llx "
++			    "preempt %u\n", i, evergo_irq_intid[i], evergo_irq_cdp[i],
++			    evergo_irq_thread[i], (unsigned long long)evergo_irq_magic[i],
++			    evergo_irq_preempt[i]);
++		}
++	}
+ #endif
+ }
+ 
