@@ -1,0 +1,27 @@
+diff --git a/osfmk/kern/ledger.c b/osfmk/kern/ledger.c
+index 78c641a..34a09c1 100644
+--- a/osfmk/kern/ledger.c
++++ b/osfmk/kern/ledger.c
+@@ -2351,7 +2351,21 @@ ledger_get_entry_info(ledger_t ledger,
+ {
+ 	uint64_t now = mach_absolute_time();
+ 
+-	assert(ledger != NULL);
++	/*
++	 * evergo (0120e): a missing ledger must not panic the boot. Early
++	 * userland asks for resource accounting on this port - proc_pid_rusage()
++	 * -> get_task_logical_writes(), plus the wakeup/IO rate monitors - and
++	 * can reach tasks that have no ledger; a zeroed answer is harmless,
++	 * while this assert ended the v42 boot right after xpcproxy died
++	 * (ledger.c:2354 Assertion failed: ledger != NULL). Print the caller so
++	 * the path that does it is named on the console.
++	 */
++	if (ledger == NULL) {
++		printf("SWEET LEDGER: NULL ledger for entry %d, caller %p\n",
++		    entry, __builtin_return_address(0));
++		memset(lei, 0, sizeof(*lei));
++		return;
++	}
+ 	assert(lei != NULL);
+ 
+ 	ledger_fill_entry_info(ledger, entry, lei, now);
