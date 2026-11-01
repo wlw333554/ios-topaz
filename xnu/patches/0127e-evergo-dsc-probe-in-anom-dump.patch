@@ -1,12 +1,11 @@
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 514b2f8..a827d27 100644
+index 514b2f8..bcf4939 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -486,6 +486,17 @@ bsd_rooted_ramdisk(void)
+@@ -486,6 +486,16 @@ bsd_rooted_ramdisk(void)
   * exactly what a zero-length cache looks like from the inside, so print the
   * size the kernel really gets before launchd starts.
   */
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
 +/*
 + * evergo (0127e): the cache probe prints once, early, and a panic later in
 + * the boot scrolls it away. Keep the answers in globals so the panic handler
@@ -20,7 +19,7 @@ index 514b2f8..a827d27 100644
  static void
  evergo_probe_dsc(void)
  {
-@@ -498,7 +509,10 @@ evergo_probe_dsc(void)
+@@ -498,7 +508,10 @@ evergo_probe_dsc(void)
  	};
  	vfs_context_t ctx = vfs_context_kernel();
  
@@ -32,7 +31,7 @@ index 514b2f8..a827d27 100644
  		vnode_t vp = NULLVP;
  		struct vnode_attr va;
  		int error;
-@@ -506,6 +520,10 @@ evergo_probe_dsc(void)
+@@ -506,6 +519,10 @@ evergo_probe_dsc(void)
  		error = vnode_lookup(paths[i], 0, &vp, ctx);
  		if (error != 0) {
  			printf("SWEET DSC: %s -> lookup error %d\n", paths[i], error);
@@ -43,7 +42,7 @@ index 514b2f8..a827d27 100644
  			continue;
  		}
  		VATTR_INIT(&va);
-@@ -519,6 +537,10 @@ evergo_probe_dsc(void)
+@@ -519,6 +536,10 @@ evergo_probe_dsc(void)
  			printf("SWEET DSC: %s -> size %lld mode 0%o fileid %llu\n",
  			    paths[i], (long long)va.va_data_size, (unsigned int)va.va_mode,
  			    (unsigned long long)va.va_fileid);
