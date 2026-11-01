@@ -1,0 +1,22 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index ad6e316..649d02c 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -6116,7 +6116,16 @@ void
+ 
+ #if ZSECURITY_CONFIG(READ_ONLY)
+ 	assert(zone_security_array[zid].z_submap_idx == Z_SUBMAP_IDX_READ_ONLY);
+-	pmap_ro_zone_bzero(zid, (vm_offset_t)addr, 0, esize);
++	/*
++	 * evergo (0115e): SKIP the free-time zeroing. pmap_ro_zone_bzero is
++	 * the prime suspect for the random zeroed structures on this port:
++	 * if it zeroes the wrong page (neighbor element), one legitimate
++	 * free kills a live structure - exactly the Z_ZERO wreckage seen
++	 * since v17 (thread_ro/proc_ro/MAC label, plus plimit/task next
++	 * door). Freed ro elements stay stale until reallocated (Z_ZERO
++	 * re-zeroes on alloc), and the read-only mapping still protects
++	 * them from userland. No data is leaked anywhere.
++	 */
+ #else
+ 	(void)zid;
+ 	bzero(addr, esize);
