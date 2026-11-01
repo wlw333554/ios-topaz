@@ -1,0 +1,58 @@
+diff --git a/bsd/kern/kern_fork.c b/bsd/kern/kern_fork.c
+index 9629bbd..f4c1d14 100644
+--- a/bsd/kern/kern_fork.c
++++ b/bsd/kern/kern_fork.c
+@@ -1235,9 +1235,24 @@ proc_spinunlock(proc_t p)
+ 	lck_spin_unlock(&p->p_slock);
+ }
+ 
++void
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * evergo (0123e): remember the last caller of proc_list_lock(). The v46 boot
++ * died with "Mutex <proc_list_mlock> is unexpectedly owned by thread ...",
++ * which is the recursive-lock check in lck_mtx_lock, but the panic names the
++ * mutex and not the code that locked it twice. One store on an already slow
++ * path makes that name available to the panic handler.
++ */
++void *evergo_proc_list_locker;
++#endif
++
+ void
+ proc_list_lock(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	evergo_proc_list_locker = __builtin_return_address(0);
++#endif
+ 	lck_mtx_lock(&proc_list_mlock);
+ }
+ 
+diff --git a/osfmk/kern/lock_mtx.c b/osfmk/kern/lock_mtx.c
+index 21c5e26..035ed40 100644
+--- a/osfmk/kern/lock_mtx.c
++++ b/osfmk/kern/lock_mtx.c
+@@ -172,6 +172,24 @@ __abortlike
+ static void
+ __lck_mtx_owned_panic(lck_mtx_t *lock, thread_t thread)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0123e): a recursive lck_mtx_lock() says which mutex and which
++	 * thread, but not which code path asked for it twice. Print the last
++	 * proc_list_lock() caller (the only mutex seen to trigger this so far)
++	 * with its symbol, so the panic screen names the culprit.
++	 */
++	extern void *evergo_proc_list_locker;
++	extern void evergo_symbol_snprintf(char *, size_t, void *);
++	char sym[96];
++
++	sym[0] = '\0';
++	evergo_symbol_snprintf(sym, sizeof(sym), evergo_proc_list_locker);
++	printf("SWEET MTX: recursive lock %p owner %p, "
++	    "last proc_list_lock caller %p (%s)\n",
++	    (void *)lock, (void *)thread, evergo_proc_list_locker,
++	    sym[0] != '\0' ? sym : "?");
++#endif
+ 	panic("Mutex %p is unexpectedly owned by thread %p", lock, thread);
+ }
+ 
