@@ -1128,6 +1128,14 @@ directly). If instead the boot now hangs before userspace, pull the sweetlog
 ring from the last 4 MiB of userdata (`read_sweetlog.py`) - the same SWEET
 THREAD/ANOM lines are there.
 
-**CI hardening (this commit):** xnu.yml now greps the built kernel for the ten
+**CI hardening (commit f92cd6b):** xnu.yml now greps the built kernel for the ten
 diagnostic markers and fails the build when one is missing, so a silently
-skipped patch can never ship again.
+skipped patch can never ship again. Verified by run `41277310214` (all steps
+green, including the new "Verify evergo diagnostics are compiled in" step).
+
+**Artifacts are the user's job (2026-11-01):** the user downloads CI build
+artifacts and hands over a local path; the agent does not run `gh run download`
+and does not write blob/artifact downloaders. Everything downstream (extract,
+verify SHA256SUMS, rebuild the two images, bump README/flash_root.bat, sync
+verify_image_kernel.py into the release folder) stays with the agent.
+
