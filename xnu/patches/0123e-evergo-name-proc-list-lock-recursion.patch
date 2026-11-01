@@ -1,19 +1,17 @@
 diff --git a/bsd/kern/kern_fork.c b/bsd/kern/kern_fork.c
-index 9629bbd..f4c1d14 100644
+index 9629bbd..802b11c 100644
 --- a/bsd/kern/kern_fork.c
 +++ b/bsd/kern/kern_fork.c
-@@ -1235,9 +1235,24 @@ proc_spinunlock(proc_t p)
+@@ -1235,9 +1235,22 @@ proc_spinunlock(proc_t p)
  	lck_spin_unlock(&p->p_slock);
  }
  
-+void
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +/*
 + * evergo (0123e): remember the last caller of proc_list_lock(). The v46 boot
 + * died with "Mutex <proc_list_mlock> is unexpectedly owned by thread ...",
-+ * which is the recursive-lock check in lck_mtx_lock, but the panic names the
-+ * mutex and not the code that locked it twice. One store on an already slow
-+ * path makes that name available to the panic handler.
++ * the recursive-lock check in lck_mtx_lock, which names the mutex but not the
++ * code that took it twice. One store on an already slow path is enough.
 + */
 +void *evergo_proc_list_locker;
 +#endif
@@ -28,31 +26,25 @@ index 9629bbd..f4c1d14 100644
  }
  
 diff --git a/osfmk/kern/lock_mtx.c b/osfmk/kern/lock_mtx.c
-index 21c5e26..035ed40 100644
+index 21c5e26..ddecd0a 100644
 --- a/osfmk/kern/lock_mtx.c
 +++ b/osfmk/kern/lock_mtx.c
-@@ -172,6 +172,24 @@ __abortlike
+@@ -172,7 +172,18 @@ __abortlike
  static void
  __lck_mtx_owned_panic(lck_mtx_t *lock, thread_t thread)
  {
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +	/*
-+	 * evergo (0123e): a recursive lck_mtx_lock() says which mutex and which
-+	 * thread, but not which code path asked for it twice. Print the last
-+	 * proc_list_lock() caller (the only mutex seen to trigger this so far)
-+	 * with its symbol, so the panic screen names the culprit.
++	 * evergo (0123e): add the last proc_list_lock() caller to the panic
++	 * text. A recursive lck_mtx_lock() otherwise names only the mutex, and
++	 * the caller is what we need; the address symbolizes offline.
 +	 */
 +	extern void *evergo_proc_list_locker;
-+	extern void evergo_symbol_snprintf(char *, size_t, void *);
-+	char sym[96];
-+
-+	sym[0] = '\0';
-+	evergo_symbol_snprintf(sym, sizeof(sym), evergo_proc_list_locker);
-+	printf("SWEET MTX: recursive lock %p owner %p, "
-+	    "last proc_list_lock caller %p (%s)\n",
-+	    (void *)lock, (void *)thread, evergo_proc_list_locker,
-+	    sym[0] != '\0' ? sym : "?");
-+#endif
++	panic("Mutex %p is unexpectedly owned by thread %p, "
++	    "last proc_list_lock caller %p", lock, thread, evergo_proc_list_locker);
++#else
  	panic("Mutex %p is unexpectedly owned by thread %p", lock, thread);
++#endif
  }
  
+ __abortlike
