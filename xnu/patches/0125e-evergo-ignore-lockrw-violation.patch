@@ -1,0 +1,97 @@
+diff --git a/osfmk/kern/lock_rw.c b/osfmk/kern/lock_rw.c
+index cd21cd8..b4e1360 100644
+--- a/osfmk/kern/lock_rw.c
++++ b/osfmk/kern/lock_rw.c
+@@ -58,6 +58,7 @@
+ #include <kern/locks_internal.h>
+ #include <kern/lock_stat.h>
+ #include <kern/locks.h>
++#include <pexpert/pexpert.h>
+ #include <kern/zalloc.h>
+ #include <kern/thread.h>
+ #include <kern/processor.h>
+@@ -1091,6 +1092,29 @@ lck_rw_lock_exclusive_gen(
+  * @returns Returns TRUE if the thread spun or blocked while attempting to acquire the lock, FALSE
+  *          otherwise.
+  */
++/*
++ * evergo (0125e): with boot-arg ignore_bad_lockrw=1, tolerate taking a
++ * non-sleepable RW lock while preemption is still enabled. The v48 boot got
++ * through early userland and then died on this assertion (lock_rw.c:1158).
++ * The violation costs latency - the acquirer or holder can be preempted -
++ * but the lock state itself stays correct, and 0109e already recorded the
++ * caller in the 0106e registry as kind 7 (lockrw), so the code that did it
++ * is still visible if something panics later.
++ */
++static bool
++evergo_lockrw_violation_ignored(void)
++{
++	static int allow = -1;
++
++	if (allow < 0) {
++		uint32_t v = 0;
++
++		(void)PE_parse_boot_argn("ignore_bad_lockrw", &v, sizeof(v));
++		allow = (v != 0) ? 1 : 0;
++	}
++	return allow != 0;
++}
++
+ bool
+ lck_rw_lock_exclusive_check_contended(
+ 	lck_rw_t        *lock)
+@@ -1111,7 +1135,9 @@ lck_rw_lock_exclusive_check_contended(
+ 		 */
+ 		extern void evergo_anom_record(int, void *, void *);
+ 		evergo_anom_record(7, lock, __builtin_return_address(0));
+-		panic("Taking non-sleepable RW lock with preemption enabled\n");
++		if (!evergo_lockrw_violation_ignored()) {
++			panic("Taking non-sleepable RW lock with preemption enabled\n");
++		}
+ 	}
+ 
+ 	if (LCK_RW_LOCK_EXCLUSIVE_TAS(lock)) {
+@@ -1155,7 +1181,9 @@ lck_rw_lock_exclusive_internal_inline(
+ 		 */
+ 		extern void evergo_anom_record(int, void *, void *);
+ 		evergo_anom_record(7, lock, __builtin_return_address(0));
+-		panic("Taking non-sleepable RW lock with preemption enabled\n");
++		if (!evergo_lockrw_violation_ignored()) {
++			panic("Taking non-sleepable RW lock with preemption enabled\n");
++		}
+ 	}
+ 
+ 	if (LCK_RW_LOCK_EXCLUSIVE_TAS(lock)) {
+@@ -1404,7 +1432,9 @@ lck_rw_lock_shared_internal_inline(
+ 		 */
+ 		extern void evergo_anom_record(int, void *, void *);
+ 		evergo_anom_record(7, lock, __builtin_return_address(0));
+-		panic("Taking non-sleepable RW lock with preemption enabled\n");
++		if (!evergo_lockrw_violation_ignored()) {
++			panic("Taking non-sleepable RW lock with preemption enabled\n");
++		}
+ 	}
+ 
+ 	for (;;) {
+@@ -1961,7 +1991,9 @@ lck_rw_try_lock_shared_internal_inline(
+ 		 */
+ 		extern void evergo_anom_record(int, void *, void *);
+ 		evergo_anom_record(7, lock, __builtin_return_address(0));
+-		panic("Taking non-sleepable RW lock with preemption enabled\n");
++		if (!evergo_lockrw_violation_ignored()) {
++			panic("Taking non-sleepable RW lock with preemption enabled\n");
++		}
+ 	}
+ 
+ #if     CONFIG_DTRACE
+@@ -2045,7 +2077,9 @@ lck_rw_try_lock_exclusive_internal_inline(
+ 		 */
+ 		extern void evergo_anom_record(int, void *, void *);
+ 		evergo_anom_record(7, lock, __builtin_return_address(0));
+-		panic("Taking non-sleepable RW lock with preemption enabled\n");
++		if (!evergo_lockrw_violation_ignored()) {
++			panic("Taking non-sleepable RW lock with preemption enabled\n");
++		}
+ 	}
+ 
+ 	assertf(lock->lck_rw_owner == 0, "state=0x%x, owner=%p",
