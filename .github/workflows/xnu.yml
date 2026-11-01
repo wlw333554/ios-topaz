@@ -139,7 +139,6 @@ jobs:
               rc=1
             fi
           done <<'EOF'
-          SWEET ZRORO: zid
           SWEET ANOM: %s first ptr
           threadrel
           lockrw
@@ -149,6 +148,20 @@ jobs:
           SWEET SRMAP
           SWEET TRO: thread
           SWEET THREAD: double release
+          SWEET ZRO: %s(NULL) zid
+          EOF
+          # Conditional markers: these only exist when the read-only zone
+          # allocator is compiled in (ZSECURITY_CONFIG_READ_ONLY). 0124e turns
+          # it off for this port, so report them but do not fail the build.
+          while IFS= read -r marker; do
+            [ -n "$marker" ] || continue
+            if strings -a "$K" | grep -qF -- "$marker"; then
+              echo "  ok (ro zones on): $marker"
+            else
+              echo "  note: '$marker' absent - read-only zones are compiled out"
+            fi
+          done <<'EOF'
+          SWEET ZRORO: zid
           EOF
           exit $rc
 
