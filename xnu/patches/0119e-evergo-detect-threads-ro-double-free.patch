@@ -1,0 +1,99 @@
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index 4e09ebf..cb0078b 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -348,6 +348,66 @@ init_thread_from_template(thread_t thread)
+ #pragma clang diagnostic pop
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
++/*
++ * evergo (0119e): threads_ro double-free detector.
++ *
++ * Only three places touch the lifetime of a threads_ro element:
++ * thread_ro_create() and the 0095e recovery helper evergo_thread_ro_alloc()
++ * allocate, thread_ro_destroy() frees. Remember which elements are currently
++ * free; freeing one of them twice is the corruption that later shows up as
++ * "element modified after free", and the second free's caller is the
++ * culprit. Record it in the 0106e anomaly registry so the panic screen
++ * carries the name of the function that dropped the last reference again.
++ */
++#define EVERGO_TRO_FREE_SLOTS   64
++
++static void *evergo_tro_free_elem[EVERGO_TRO_FREE_SLOTS];
++static void *evergo_tro_free_addr[EVERGO_TRO_FREE_SLOTS];
++static uint32_t evergo_tro_free_n;
++
++void evergo_tro_note_alloc(void *tro);
++void evergo_tro_note_free(void *tro, void *caller);
++
++void
++evergo_tro_note_alloc(void *tro)
++{
++	for (uint32_t i = 0; i < evergo_tro_free_n; i++) {
++		if (evergo_tro_free_elem[i] == tro) {
++			evergo_tro_free_n--;
++			evergo_tro_free_elem[i] = evergo_tro_free_elem[evergo_tro_free_n];
++			evergo_tro_free_addr[i] = evergo_tro_free_addr[evergo_tro_free_n];
++			return;
++		}
++	}
++}
++
++void
++evergo_tro_note_free(void *tro, void *caller)
++{
++	for (uint32_t i = 0; i < evergo_tro_free_n; i++) {
++		if (evergo_tro_free_elem[i] == tro) {
++			printf("SWEET TRO: double free of threads_ro %p "
++			    "(first caller %p, second caller %p)\n",
++			    tro, evergo_tro_free_addr[i], caller);
++			extern void evergo_anom_record(int, void *, void *);
++			evergo_anom_record(8, tro, caller);
++			return;
++		}
++	}
++	if (evergo_tro_free_n == EVERGO_TRO_FREE_SLOTS) {
++		for (uint32_t i = 1; i < EVERGO_TRO_FREE_SLOTS; i++) {
++			evergo_tro_free_elem[i - 1] = evergo_tro_free_elem[i];
++			evergo_tro_free_addr[i - 1] = evergo_tro_free_addr[i];
++		}
++		evergo_tro_free_n--;
++	}
++	evergo_tro_free_elem[evergo_tro_free_n] = tro;
++	evergo_tro_free_addr[evergo_tro_free_n] = caller;
++	evergo_tro_free_n++;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET && MACH_ASSERT */
++
+ static void
+ thread_ro_create(task_t parent_task, thread_t th, thread_ro_t tro_tpl)
+ {
+@@ -357,6 +417,9 @@ thread_ro_create(task_t parent_task, thread_t th, thread_ro_t tro_tpl)
+ 	tro_tpl->tro_owner = th;
+ 	tro_tpl->tro_task  = parent_task;
+ 	th->t_tro = zalloc_ro(ZONE_ID_THREAD_RO, Z_WAITOK | Z_ZERO | Z_NOFAIL);
++#if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
++	evergo_tro_note_alloc(th->t_tro);
++#endif
+ 	zalloc_ro_update_elem(ZONE_ID_THREAD_RO, th->t_tro, tro_tpl);
+ }
+ 
+@@ -368,6 +431,9 @@ thread_ro_destroy(thread_t th)
+ 	struct ucred *cred = tro->tro_cred;
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
++	evergo_tro_note_free(tro, __builtin_return_address(0));
++#endif
+ 	zfree_ro(ZONE_ID_THREAD_RO, tro);
+ #if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
+ 	/*
+@@ -888,6 +954,7 @@ evergo_thread_ro_alloc(thread_t th)
+ 	thread_ro_t tro = zalloc_ro(ZONE_ID_THREAD_RO, Z_NOWAIT | Z_ZERO);
+ 
+ 	if (tro != NULL) {
++		evergo_tro_note_alloc(tro);
+ 		tro->tro_owner = th;
+ 		th->t_tro = tro;
+ 	}
