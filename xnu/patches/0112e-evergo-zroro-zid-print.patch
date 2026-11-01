@@ -1,8 +1,8 @@
 diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
-index 6ea5ec2..ad6e316 100644
+index d9d7d50..649d02c 100644
 --- a/osfmk/kern/zalloc.c
 +++ b/osfmk/kern/zalloc.c
-@@ -7080,6 +7080,14 @@ zone_id_require_ro_panic(zone_id_t zid, void *addr)
+@@ -7089,6 +7089,15 @@ zone_id_require_ro_panic(zone_id_t zid, void *addr)
  	 */
  	extern void evergo_anom_record(int, void *, void *);
  	evergo_anom_record(5, addr, __builtin_return_address(0));
@@ -14,6 +14,7 @@ index 6ea5ec2..ad6e316 100644
 +",
 +			    zid, addr, __builtin_return_address(0));
 +		}
- 	}
++	}
  
  	struct zone_size_params p = zone_ro_size_params[zid];
+ 	vm_offset_t elem = (vm_offset_t)addr;
