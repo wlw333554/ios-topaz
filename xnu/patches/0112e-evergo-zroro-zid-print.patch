@@ -1,8 +1,7 @@
 diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
-index d9d7d50..649d02c 100644
 --- a/osfmk/kern/zalloc.c
 +++ b/osfmk/kern/zalloc.c
-@@ -7089,6 +7089,15 @@ zone_id_require_ro_panic(zone_id_t zid, void *addr)
+@@ -7089,6 +7089,14 @@
  	 */
  	extern void evergo_anom_record(int, void *, void *);
  	evergo_anom_record(5, addr, __builtin_return_address(0));
@@ -10,8 +9,7 @@ index d9d7d50..649d02c 100644
 +		static uint32_t evergo_zroro_prints;
 +		if (evergo_zroro_prints < 8) {
 +			evergo_zroro_prints++;
-+			printf("SWEET ZRORO: zid %d addr %p caller %p
-+",
++			printf("SWEET ZRORO: zid %d addr %p caller %p\n",
 +			    zid, addr, __builtin_return_address(0));
 +		}
 +	}

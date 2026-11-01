@@ -1,5 +1,4 @@
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index cdc1def..3dc603b 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
 @@ -92,10 +92,10 @@
@@ -16,10 +15,9 @@ index cdc1def..3dc603b 100644
  
  static struct {
 diff --git a/osfmk/kern/lock_rw.c b/osfmk/kern/lock_rw.c
-index 416c84f..cd21cd8 100644
 --- a/osfmk/kern/lock_rw.c
 +++ b/osfmk/kern/lock_rw.c
-@@ -1101,7 +1101,17 @@ lck_rw_lock_exclusive_check_contended(
+@@ -1101,7 +1101,17 @@
  	if (lock->lck_rw_can_sleep) {
  		lck_rw_lock_count_inc(thread, lock);
  	} else if (get_preemption_level() == 0) {
@@ -38,7 +36,7 @@ index 416c84f..cd21cd8 100644
  	}
  
  	if (LCK_RW_LOCK_EXCLUSIVE_TAS(lock)) {
-@@ -1135,7 +1145,17 @@ lck_rw_lock_exclusive_internal_inline(
+@@ -1135,7 +1145,17 @@
  	if (lock->lck_rw_can_sleep) {
  		lck_rw_lock_count_inc(thread, lock);
  	} else if (get_preemption_level() == 0) {
@@ -57,7 +55,7 @@ index 416c84f..cd21cd8 100644
  	}
  
  	if (LCK_RW_LOCK_EXCLUSIVE_TAS(lock)) {
-@@ -1374,7 +1394,17 @@ lck_rw_lock_shared_internal_inline(
+@@ -1374,7 +1394,17 @@
  	if (lock->lck_rw_can_sleep) {
  		lck_rw_lock_count_inc(thread, lock);
  	} else if (get_preemption_level() == 0) {
@@ -76,7 +74,7 @@ index 416c84f..cd21cd8 100644
  	}
  
  	for (;;) {
-@@ -1921,7 +1951,17 @@ lck_rw_try_lock_shared_internal_inline(
+@@ -1921,7 +1951,17 @@
  	if (lock->lck_rw_can_sleep) {
  		lck_rw_lock_count_inc(thread, lock);
  	} else if (get_preemption_level() == 0) {
@@ -95,7 +93,7 @@ index 416c84f..cd21cd8 100644
  	}
  
  #if     CONFIG_DTRACE
-@@ -1995,7 +2035,17 @@ lck_rw_try_lock_exclusive_internal_inline(
+@@ -1995,7 +2035,17 @@
  	if (lock->lck_rw_can_sleep) {
  		lck_rw_lock_count_inc(thread, lock);
  	} else if (get_preemption_level() == 0) {

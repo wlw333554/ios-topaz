@@ -1,8 +1,7 @@
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index 3dc603b..d57f23c 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -92,10 +92,10 @@
+@@ -92,10 +92,11 @@
   * of every anomaly kind here and let the panic path print the registry, so
   * one photograph carries the original crime scene.
   */
@@ -10,16 +9,15 @@ index 3dc603b..d57f23c 100644
 +#define EVERGO_ANOM_KINDS       9
  
  static const char *evergo_anom_names[EVERGO_ANOM_KINDS] = {
--	"tro", "nsr", "maclabel", "ipc", "procro", "zroro", "lockrw", "spare",
-+	"tro", "nsr", "maclabel", "ipc", "procro", "zroro", "lockrw", "threadrel",
+ 	"tro", "nsr", "maclabel", "ipc", "procro", "zroro", "lockrw", "spare",
++	"threadrel",
  };
  
  static struct {
 diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
-index bef15bb..4e09ebf 100644
 --- a/osfmk/kern/thread.c
 +++ b/osfmk/kern/thread.c
-@@ -914,6 +914,8 @@ thread_ref_release(thread_t thread)
+@@ -914,6 +914,8 @@
  		    os_ref_get_count_raw(&thread->ref_count),
  		    caller[0] != '\0' ? caller : "?",
  		    __builtin_return_address(0));
