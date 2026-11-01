@@ -1,0 +1,24 @@
+diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+index e535ab5..bef15bb 100644
+--- a/osfmk/kern/thread.c
++++ b/osfmk/kern/thread.c
+@@ -369,6 +369,19 @@ thread_ro_destroy(thread_t th)
+ #endif
+ 
+ 	zfree_ro(ZONE_ID_THREAD_RO, tro);
++#if defined(ARM64_BOARD_CONFIG_SWEET) && MACH_ASSERT
++	/*
++	 * evergo (0116e): clear t_tro after freeing. Without this, any
++	 * access to the dying thread's ro between the free and the thread
++	 * element release returns the FREED element (zone_require_ro only
++	 * checks the zone range, not the freed state) - and a later
++	 * reallocation of that element plus the stale pointer produced the
++	 * threads_ro double-free the zone debugger caught in v38
++	 * (element modified after free). With t_tro NULL, the 0095e
++	 * recovery tolerates the access instead.
++	 */
++	th->t_tro = NULL;
++#endif
+ #if MACH_BSD
+ 	if (cred) {
+ 		uthread_cred_free(cred);
