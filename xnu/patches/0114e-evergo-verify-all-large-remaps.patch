@@ -1,0 +1,19 @@
+diff --git a/osfmk/vm/vm_user.c b/osfmk/vm/vm_user.c
+index b6205ae..263be60 100644
+--- a/osfmk/vm/vm_user.c
++++ b/osfmk/vm/vm_user.c
+@@ -1453,7 +1453,13 @@ mach_vm_remap_kernel_helper(
+ 	}
+ #endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	if (kr == KERN_SUCCESS && copy && evergo_remapcheck_on()) {
++	if (kr == KERN_SUCCESS && evergo_remapcheck_on() &&
++	    size >= 1024 * 1024) {
++		/*
++		 * evergo (0114e): v36 showed zero SWEET REMAP lines - the copy
++		 * gate skipped dyld's remaps (they arrive with copy=false).
++		 * Verify every large remap instead; small ones are noise.
++		 */
+ 		static uint32_t evergo_remap_verifies;
+ 		if (evergo_remap_verifies < 12) {
+ 			evergo_remap_verifies++;
