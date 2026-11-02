@@ -1,8 +1,8 @@
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 3165760..bb2e460 100644
+index 3165760..e204c8b 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -546,6 +546,77 @@ evergo_probe_dsc(void)
+@@ -546,6 +546,81 @@ evergo_probe_dsc(void)
  }
  #endif /* ARM64_BOARD_CONFIG_SWEET */
  
@@ -45,8 +45,12 @@ index 3165760..bb2e460 100644
 +	for (int i = 0; i < EVERGO_CANARY_PAGES; i++) {
 +		vm_offset_t addr = 0;
 +
-+		/* KERNEL_PRIVATE declares the three-argument form. */
-+		if (kmem_alloc(kernel_map, &addr, PAGE_SIZE) != KERN_SUCCESS) {
++		/*
++		 * The kernel is built with XNU_KERNEL_PRIVATE, so kmem_alloc is
++		 * the five-argument form: (map, addrp, size, kma_flags, tag).
++		 */
++		if (kmem_alloc(kernel_map, &addr, PAGE_SIZE,
++		    KMA_NOFAIL | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
 +			evergo_canary_addr[i] = NULL;
 +			continue;
 +		}
@@ -80,7 +84,7 @@ index 3165760..bb2e460 100644
  void
  bsd_init(void)
  {
-@@ -991,6 +1062,8 @@ bsd_init(void)
+@@ -991,6 +1066,8 @@ bsd_init(void)
  	init_rootvnode = NULLVP;  /* use rootvnode after this point */
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
