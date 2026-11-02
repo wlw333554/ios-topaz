@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 3165760..05546f8 100644
+index 3165760..bb2e460 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -546,6 +546,77 @@ evergo_probe_dsc(void)
@@ -12,9 +12,9 @@ index 3165760..05546f8 100644
 + *
 + * The phone dies in a different place on every boot - a data abort at
 + * far 0x1d, a proc whose proc_ro is NULL, an instruction fetch at pc 0 - while
-+ * the same kernel reaches launchd in QEMU every single time. Interrupts,
-+ * TLB maintenance, DMA buffer contiguity and the CPU count have all been
-+ * ruled out, so what is left is something scribbling over kernel memory.
++ * the same kernel reaches launchd in QEMU every single time. Interrupts, TLB
++ * maintenance, DMA buffer contiguity and the CPU count have all been ruled
++ * out, so what is left is something scribbling over kernel memory.
 + *
 + * Fill a few pages from the kernel map with a pattern and check them at known
 + * milestones (and again from the panic handler). The first check that reports
@@ -45,8 +45,8 @@ index 3165760..05546f8 100644
 +	for (int i = 0; i < EVERGO_CANARY_PAGES; i++) {
 +		vm_offset_t addr = 0;
 +
-+		if (kmem_alloc(kernel_map, &addr, PAGE_SIZE,
-+		    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		/* KERNEL_PRIVATE declares the three-argument form. */
++		if (kmem_alloc(kernel_map, &addr, PAGE_SIZE) != KERN_SUCCESS) {
 +			evergo_canary_addr[i] = NULL;
 +			continue;
 +		}
@@ -90,19 +90,16 @@ index 3165760..05546f8 100644
  	 * evergo (0128e): probe here, not before VFS_ROOT(). The first attempt
  	 * ran while the mount had no root vnode yet, so every lookup - the
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index ae602c6..b3b253e 100644
+index ae602c6..32694b1 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
-@@ -180,6 +180,26 @@ evergo_anom_dump(void)
+@@ -180,6 +180,23 @@ evergo_anom_dump(void)
  			    evergo_irq_preempt[i]);
  		}
  	}
 +
 +	/*
-+	 * evergo (0134e): the canary pages, re-checked at panic time. A page
-+	 * that reports "changed at <milestone>" says the scribbler ran after
-+	 * that milestone; a page that only changes now says it happened between
-+	 * the last check and the panic.
++	 * evergo (0134e): the canary pages, re-checked at panic time.
 +	 */
 +	{
 +		extern void evergo_canary_check(const char *);
