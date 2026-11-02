@@ -1,0 +1,122 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 3165760..05546f8 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -546,6 +546,77 @@ evergo_probe_dsc(void)
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * evergo (0134e): canary pages.
++ *
++ * The phone dies in a different place on every boot - a data abort at
++ * far 0x1d, a proc whose proc_ro is NULL, an instruction fetch at pc 0 - while
++ * the same kernel reaches launchd in QEMU every single time. Interrupts,
++ * TLB maintenance, DMA buffer contiguity and the CPU count have all been
++ * ruled out, so what is left is something scribbling over kernel memory.
++ *
++ * Fill a few pages from the kernel map with a pattern and check them at known
++ * milestones (and again from the panic handler). The first check that reports
++ * a change brackets WHEN the corruption happens; the page that changed says
++ * WHICH allocator region was hit.
++ */
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++
++#define EVERGO_CANARY_PAGES 4
++
++void *evergo_canary_addr[EVERGO_CANARY_PAGES];
++const char *evergo_canary_dirty[EVERGO_CANARY_PAGES];
++
++void evergo_canary_init(void);
++void evergo_canary_check(const char *where);
++
++void
++evergo_canary_init(void)
++{
++	static bool done;
++
++	if (done) {
++		return;
++	}
++	done = true;
++
++	for (int i = 0; i < EVERGO_CANARY_PAGES; i++) {
++		vm_offset_t addr = 0;
++
++		if (kmem_alloc(kernel_map, &addr, PAGE_SIZE,
++		    VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++			evergo_canary_addr[i] = NULL;
++			continue;
++		}
++		memset((void *)addr, 0xa5, PAGE_SIZE);
++		evergo_canary_addr[i] = (void *)addr;
++	}
++}
++
++void
++evergo_canary_check(const char *where)
++{
++	for (int i = 0; i < EVERGO_CANARY_PAGES; i++) {
++		uint8_t *p = evergo_canary_addr[i];
++
++		if (p == NULL || evergo_canary_dirty[i] != NULL) {
++			continue;
++		}
++		for (vm_size_t off = 0; off < PAGE_SIZE; off++) {
++			if (p[off] != 0xa5) {
++				evergo_canary_dirty[i] = where;
++				printf("SWEET CANARY: page %d changed at %s "
++				    "(off %lu: 0x%02x, was 0xa5)\n",
++				    i, where, (unsigned long)off, p[off]);
++				break;
++			}
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ void
+ bsd_init(void)
+ {
+@@ -991,6 +1062,8 @@ bsd_init(void)
+ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++	evergo_canary_init();
++	evergo_canary_check("after root mount");
+ 	/*
+ 	 * evergo (0128e): probe here, not before VFS_ROOT(). The first attempt
+ 	 * ran while the mount had no root vnode yet, so every lookup - the
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index ae602c6..b3b253e 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -180,6 +180,26 @@ evergo_anom_dump(void)
+ 			    evergo_irq_preempt[i]);
+ 		}
+ 	}
++
++	/*
++	 * evergo (0134e): the canary pages, re-checked at panic time. A page
++	 * that reports "changed at <milestone>" says the scribbler ran after
++	 * that milestone; a page that only changes now says it happened between
++	 * the last check and the panic.
++	 */
++	{
++		extern void evergo_canary_check(const char *);
++		extern void *evergo_canary_addr[4];
++		extern const char *evergo_canary_dirty[4];
++
++		evergo_canary_check("panic");
++		for (int i = 0; i < 4; i++) {
++			printf("SWEET CANARY: page %d %p %s\n", i,
++			    evergo_canary_addr[i],
++			    evergo_canary_dirty[i] != NULL ?
++			    evergo_canary_dirty[i] : "clean");
++		}
++	}
+ #endif
+ }
+ 
