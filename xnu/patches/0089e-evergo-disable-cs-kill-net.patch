@@ -16,7 +16,7 @@ With both enforcement knobs off, evergo now:
   - logs the exec reason namespace/code on late exec failures.
 ---
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 6f14796..4ac5181 100644
+index 6f14796..b45e483 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1415,7 +1415,11 @@ grade:
@@ -46,7 +46,60 @@ index 6f14796..4ac5181 100644
  			if (bootarg_execfailurereports) {
  				set_proc_name(imgp, current_proc());
  			}
-@@ -7361,6 +7372,23 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -7339,6 +7350,52 @@ proc_process_signature(proc_t p, os_reason_t *signature_failure_reason)
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * evergo (0089e): one line per exec is far too loud.
++ *
++ * With enforcement off every exec takes this path, and launchd re-execs a
++ * handful of daemons that have no hardware here (fairplayd.H2 has no FairPlay,
++ * bluetoothd has no Bluetooth) in a tight loop.  The resulting flood scrolls
++ * the panic header - the one thing we actually need to read - off the screen.
++ *
++ * Keep the first line for each name, then stay quiet except for a counter
++ * every 256 hits, so a looping daemon still shows up in the log.
++ */
++#define EVERGO_EXEC_NAMES 16
++
++static struct {
++	char name[24];
++	unsigned long count;
++} evergo_exec_seen[EVERGO_EXEC_NAMES];
++
++static void
++evergo_exec_note(const char *name, int mac_return, void *cs_error)
++{
++	for (int i = 0; i < EVERGO_EXEC_NAMES; i++) {
++		if (evergo_exec_seen[i].name[0] == '\0') {
++			strlcpy(evergo_exec_seen[i].name, name,
++			    sizeof(evergo_exec_seen[i].name));
++			evergo_exec_seen[i].count = 1;
++			printf("SWEET exec: %s: enforcement disabled, "
++			    "signature checks skipped (mac_return %d, cs_error %p)\n",
++			    name, mac_return, cs_error);
++			return;
++		}
++		if (strcmp(evergo_exec_seen[i].name, name) == 0) {
++			evergo_exec_seen[i].count++;
++			if ((evergo_exec_seen[i].count & 0xff) == 0) {
++				printf("SWEET exec: %s: still skipping signature "
++				    "checks, %lu execs so far\n", name,
++				    evergo_exec_seen[i].count);
++			}
++			return;
++		}
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static int
+ process_signature(proc_t p, struct image_params *imgp)
+ {
+@@ -7361,6 +7418,22 @@ process_signature(proc_t p, struct image_params *imgp)
  	proc_csflags_update(p, imgp->ip_csflags);
  	proc_unlock(p);
  
@@ -60,9 +113,8 @@ index 6f14796..4ac5181 100644
 +	 * updated from ip_csflags with the kill bits already stripped.
 +	 */
 +	if (!cs_system_enforcement() && !cs_process_enforcement(p)) {
-+		printf("SWEET exec: %s: enforcement disabled, signature checks skipped"
-+		    " (mac_return %d, cs_error %p)\n",
-+		    p->p_name, imgp->ip_mac_return, (void *)imgp->ip_cs_error);
++		evergo_exec_note(p->p_name, imgp->ip_mac_return,
++		    (void *)imgp->ip_cs_error);
 +		return 0;
 +	}
 +#endif
