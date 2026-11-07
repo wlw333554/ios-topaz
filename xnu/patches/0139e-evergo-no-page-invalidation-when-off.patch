@@ -1,0 +1,62 @@
+From f0139e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0139e] evergo: stop invalidating pages when enforcement is off
+
+The v63 boot got all the way to launchd sending the validated shared cache
+and then dyld died:
+
+  Sending validated cache to launchd
+  Trying to send bytes to launchd
+  dyld[241]: Assertion failed: (_mapper), Function SharedCache,
+      File ProcessFlags.cpp, (line 888)
+  CRASH xpcproxy[241] sig 6 sub 0x0
+
+The same screen shows why:
+
+  CODE SIGNING: cs_invalid_page(0x102a90000): p=23[apfscomp]
+      final status 0x22000000, allowing (remove VALID) page
+
+The shared cache shards are hard links, and without a trust cache their pages
+can never validate. vm_fault() checks VMP_CS_TAINTED() *before* it checks
+whether enforcement is enabled (vm_fault.c: the tainted branch comes first,
+the "!cs_enforcement_enabled" branch comes later), so every tainted page still
+reaches cs_invalid_page(), which then strips CS_VALID and complains - and
+dyld, which asked for those pages, asserts.
+
+With enforcement off there is no trust cache, so no Apple-signed page can ever
+validate and every one of them is "tainted". Tearing CS_VALID off the process
+for that is not enforcement, it is just noise - and it is what breaks dyld.
+
+Skip the invalidation entirely when enforcement is off: the page stays
+untouched, cs_invalid_page() returns 0, and dyld gets its cache.
+---
+diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
+index 43b1ea6..40d36d3 100644
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -254,6 +254,26 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
+ 
+ 	p = current_proc();
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0139e): with code-signing enforcement off there is no trust
++	 * cache, so no Apple-signed page can ever validate and every page looks
++	 * tainted. vm_fault() checks VMP_CS_TAINTED() before it checks whether
++	 * enforcement is on, so all of them land here; stripping CS_VALID then
++	 * breaks dyld, which asserts in SharedCache::_mapper as soon as the
++	 * shared cache pages are invalidated.
++	 *
++	 * There is nothing to enforce and nothing to report - let the page
++	 * through untouched.
++	 */
++	if (!cs_system_enforcement() && !cs_process_enforcement(p)) {
++		if (cs_killed) {
++			*cs_killed = FALSE;
++		}
++		return 0;
++	}
++#endif
++
+ 	if (verbose) {
+ 		printf("CODE SIGNING: cs_invalid_page(0x%llx): p=%d[%s]\n",
+ 		    vaddr, proc_getpid(p), p->p_comm);
