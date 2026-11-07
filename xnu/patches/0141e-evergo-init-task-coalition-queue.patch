@@ -1,0 +1,90 @@
+From f0141e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0141e] evergo: give a never-queued task_coalition a ring before remqueue
+
+The v65 boot still died in the same function, and disassembling it shows the
+faulting access is not the coalition comparison at all:
+
+    ldr  x8, [x1, #0x5c0]      ; task->coalition[JETSAM]   -- matched coal
+    cmp  x8, x19
+    b.eq ...                   ; 0090e's guard did its job
+    ...
+    add  x0, x1, #0x5d8        ; &task->task_coalition[JETSAM]
+    ldr  x8, [x1, #0x5e0]      ; x8 = that chain's .prev
+    ldr  x9, [x8]              ; <- faults: .prev is NULL
+    cmp  x9, x0
+
+which is the inlined remqueue() in the COALITION_TASKROLE_LEADER case:
+
+    remqueue(&task->task_coalition[COALITION_TYPE_JETSAM]);
+    queue_chain_init(task->task_coalition[COALITION_TYPE_JETSAM]);
+
+remqueue() tests "prev->next != &elem", so a chain whose prev is NULL is
+dereferenced. queue_chain_init() sets next = prev = NULL, so any task that was
+never actually queued carries exactly that and the first role assignment
+faults.
+
+Give such a chain a self-linked ring before anything touches it: remqueue()
+then sees an empty queue and does nothing, and enqueue_tail() has a valid head
+to link into. Same treatment for the outgoing leader in the LEADER case.
+
+Also drop the dead block 0140e added: coalitions_set_roles() already skips a
+NULL coalition one line earlier ("if (!coalitions[i]) continue;"), so that
+check could never be true and the compiler removed it entirely - which is why
+the string is not in the kernel at all.
+---
+diff --git a/osfmk/kern/coalition.c b/osfmk/kern/coalition.c
+index e0f9ed3..10bd5e7 100644
+--- a/osfmk/kern/coalition.c
++++ b/osfmk/kern/coalition.c
+@@ -1047,6 +1047,18 @@ i_coal_jetsam_set_taskrole(coalition_t coal, task_t task, int role)
+ 		return KERN_SUCCESS;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0141e): a task that was never queued has its chain as
++	 * {NULL, NULL} (queue_chain_init), not a self-linked ring, and
++	 * remqueue() dereferences prev->next - far 0 on the first role
++	 * assignment.  Make it a proper empty ring first.
++	 */
++	if (task->task_coalition[COALITION_TYPE_JETSAM].prev == NULL) {
++		queue_init(&task->task_coalition[COALITION_TYPE_JETSAM]);
++	}
++#endif
++
+ 	cj = &coal->j;
+ 
+ 	switch (role) {
+@@ -1057,6 +1069,12 @@ i_coal_jetsam_set_taskrole(coalition_t coal, task_t task, int role)
+ 			/* re-queue the exiting leader onto the "other" list */
+ 			coal_dbg("    re-queue existing leader (%d) as OTHER",
+ 			    task_pid(cj->leader));
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			/* evergo (0141e): re_queue_tail() remqueues first. */
++			if (cj->leader->task_coalition[COALITION_TYPE_JETSAM].prev == NULL) {
++				queue_init(&cj->leader->task_coalition[COALITION_TYPE_JETSAM]);
++			}
++#endif
+ 			re_queue_tail(&cj->other, &cj->leader->task_coalition[COALITION_TYPE_JETSAM]);
+ 		}
+ 		/*
+@@ -1893,19 +1911,6 @@ coalitions_set_roles(coalition_t coalitions[COALITION_NUM_TYPES],
+ 		 * adopt it, and then the per-type set_taskrole would trip its
+ 		 * assertion and panic the kernel.
+ 		 */
+-		if (coalitions[i] == COALITION_NULL) {
+-			/*
+-			 * evergo (0140e): a NULL coalition would be
+-			 * dereferenced by coal_call() below.  The identity check
+-			 * 0090e added does not catch this: it passes when the
+-			 * task has no coalition of this type either, and the
+-			 * call then faults on the NULL.
+-			 */
+-			printf("coalitions_set_roles: pid %d has no %s "
+-			    "coalition, skipping\n", task_pid(task),
+-			    coal_type_str(i));
+-			continue;
+-		}
+ 		if (task->coalition[i] != coalitions[i]) {
+ 			printf("coalitions_set_roles: pid %d not a member of %s "
+ 			    "coalition id:%llu, skipping\n", task_pid(task),
