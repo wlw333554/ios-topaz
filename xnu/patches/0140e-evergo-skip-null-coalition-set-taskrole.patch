@@ -1,0 +1,59 @@
+From f0140e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0140e] evergo: do not call into a NULL coalition
+
+The v64 boot died in a data abort:
+
+  panic(cpu 0 caller ...): Kernel data abort. at pc 0xfffffe000732407c,
+      lr 0xfffffe0007324684, far 0x0 esr 0x96000006
+
+sym_kernel.py resolves the pc to _i_coal_jetsam_set_taskrole + 0xf8, and
+disassembling it shows the faulting instruction:
+
+    ldr  x8, [x1, #0x5e0]      ; x8 = task->coalition[COALITION_TYPE_JETSAM]
+    ldr  x9, [x8]              ; <- faults: x8 is NULL
+    cmp  x9, x0
+
+So task->coalition[JETSAM] is NULL and the code dereferences it.
+
+0090e already made the jetsam set_taskrole mismatch non-fatal, but it only
+checked the coalition *identity*:
+
+    if (task->coalition[i] != coalitions[i]) { ...skip... }
+
+That check passes when both sides are NULL - and then the code goes on to call
+coal_call(coalitions[i], set_taskrole, ...), which dereferences the NULL
+coalition. The kernel log shows the two cases mixed:
+
+    coalitions_set_roles: pid 29 not a member of RESOURCE coalition id:17, skipping
+    coalitions_set_roles: pid 29 not a member of JETSAM coalition id:18, skipping
+
+so some types were skipped and one of them was NULL.
+
+Skip NULL coalitions outright, and skip a task that has no coalition of that
+type at all. A task without a role only loses that coalition's accounting; the
+process still runs, which is what 0090e was after.
+---
+diff --git a/osfmk/kern/coalition.c b/osfmk/kern/coalition.c
+index cbfb2cc..e0f9ed3 100644
+--- a/osfmk/kern/coalition.c
++++ b/osfmk/kern/coalition.c
+@@ -1893,6 +1893,19 @@ coalitions_set_roles(coalition_t coalitions[COALITION_NUM_TYPES],
+ 		 * adopt it, and then the per-type set_taskrole would trip its
+ 		 * assertion and panic the kernel.
+ 		 */
++		if (coalitions[i] == COALITION_NULL) {
++			/*
++			 * evergo (0140e): a NULL coalition would be
++			 * dereferenced by coal_call() below.  The identity check
++			 * 0090e added does not catch this: it passes when the
++			 * task has no coalition of this type either, and the
++			 * call then faults on the NULL.
++			 */
++			printf("coalitions_set_roles: pid %d has no %s "
++			    "coalition, skipping\n", task_pid(task),
++			    coal_type_str(i));
++			continue;
++		}
+ 		if (task->coalition[i] != coalitions[i]) {
+ 			printf("coalitions_set_roles: pid %d not a member of %s "
+ 			    "coalition id:%llu, skipping\n", task_pid(task),
