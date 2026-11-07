@@ -1,0 +1,72 @@
+From f0135e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0135e] evergo: give a proc back a usable proc_ro instead of panicking
+
+0129e made proc_ro_proc(NULL) return PROC_NULL, so a proc whose p_proc_ro was
+already destroyed no longer dies on a NULL dereference - it dies on the backref
+check in proc_get_ro() instead:
+
+  panic(cpu 0 caller ...): proc_ro->proc backref mismatch:
+      p=0xfffffe1b527bdf18, ro=0, proc_ro_proc(ro)=0 @kern_proc.c:5004
+
+Seen on v60 immediately after xpcproxy[201] died with SIGSEGV, with all four
+canary pages clean and "SWEET ANOM: none recorded" - so a proc_ro went away
+under a still-live proc; the memory was not scribbled on.
+
+Build a fresh proc_ro that owns this proc (pr_task stays NULL, so the task
+side reports "none"), install it on the proc and return it. Same repair shape
+as 0129e's task_get_ro() path, and it names the caller that got here.
+---
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index b3a00da..d4456ad 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -4926,6 +4926,22 @@ evergo_proc_ro_recover(task_t t)
+ 
+ 	return proc_ro_alloc(PROC_NULL, NULL, t, &data);
+ }
++
++/*
++ * evergo (0135e): give a proc back a usable proc_ro.
++ *
++ * proc_ro_proc(NULL) returns PROC_NULL since 0129e, so a proc whose
++ * p_proc_ro was already destroyed no longer dies on a NULL deref; it dies
++ * on the backref check in proc_get_ro() instead. Build a ro that owns this
++ * proc and install it, so every later reader sees a consistent, zeroed ro.
++ */
++proc_ro_t
++evergo_proc_ro_recover_proc(proc_t p)
++{
++	struct proc_ro_data data = {};
++
++	return proc_ro_alloc(p, &data, TASK_NULL, NULL);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ void
+@@ -5009,6 +5025,26 @@ proc_get_ro(proc_t p)
+ {
+ 	proc_ro_t ro = p->p_proc_ro;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0135e): the proc outlived its proc_ro. Repair instead of
++	 * panicking: allocate a ro that names this proc, install it and hand
++	 * it back. Without the install every call would leak another element.
++	 */
++	if (__improbable(ro == NULL)) {
++		proc_ro_t fresh = evergo_proc_ro_recover_proc(p);
++
++		printf("SWEET PROC: proc %p (%s) had p_proc_ro == 0, caller %p - "
++		    "repaired with %p\n", p, &p->p_name[0],
++		    __builtin_return_address(0), fresh);
++		if (fresh == NULL) {
++			panic("SWEET PROC: proc_ro recovery failed for proc %p", p);
++		}
++		p->p_proc_ro = fresh;
++		return fresh;
++	}
++#endif
++
+ 	zone_require_ro(ZONE_ID_PROC_RO, sizeof(struct proc_ro), ro);
+ 	if (__improbable(proc_ro_proc(ro) != p)) {
+ 		panic_proc_ro_proc_backref_mismatch(p, ro);
