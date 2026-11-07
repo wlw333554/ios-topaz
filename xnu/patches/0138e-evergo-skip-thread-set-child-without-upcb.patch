@@ -1,0 +1,67 @@
+From f0138e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0138e] evergo: skip thread_set_child() when the child has no upcb
+
+The v62 boot died in a data abort:
+
+  Kernel data abort. at pc 0xfffffe0007498f1c, lr 0xfffffe00077f5ff0, far 0x0
+  esr: 0x96000006
+
+sym_kernel.py resolves those to
+
+  pc  = _thread_set_child + 0xc
+  lr  = _fork1 + 0x19c
+
+thread_set_child() writes the child's fork() return value into its saved user
+registers:
+
+  child_state = get_user_regs(child);          /* -> child->machine.upcb */
+  set_saved_state_reg(child_state, 0, pid);
+
+get_user_regs() returns thread->machine.upcb, and upcb is only allocated in
+machine_thread_init() for a task that is not kernel_task. In the spawn path
+fork1() never calls thread_dup() (that is guarded by "if (!spawn)"), so the
+child thread has no upcb at all and the write faults at far 0.
+
+The same fork also produced
+
+  SWEET FORK: child task 0xfffffe2002c16ae8 has no proc, caller 0xfffffe00077e7efc
+  SWEET TRO: thread 0xfffffe24d6780430 has t_tro == 0 (freed thread, zone-zeroed?)
+  SWEET ANOM: tro first ptr 0xfffffe24d6780430 caller 0xfffffe00073e4b08
+
+and 0xfffffe00077e7efc is _posix_spawn + 0x7c0 - so posix_spawn() is the one
+asking for a child whose task has no proc, and the child it gets back is
+already broken.
+
+Guard the write: when there is no saved user state there is nothing to set.
+The child's registers are set up later anyway, when the image is activated.
+---
+diff --git a/osfmk/arm64/status.c b/osfmk/arm64/status.c
+index b595c56..db2da5a 100644
+--- a/osfmk/arm64/status.c
++++ b/osfmk/arm64/status.c
+@@ -2030,6 +2030,25 @@ thread_set_child(thread_t child,
+ 
+ 	child_state = get_user_regs(child);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0138e): in the spawn path fork1() never calls thread_dup(),
++	 * so the child thread has no saved user state at all (upcb is only
++	 * allocated in machine_thread_init() for a non-kernel task). Writing the
++	 * fork() return value through it faults at far 0 - the v62 boot died in
++	 * _thread_set_child+0xc called from _fork1+0x19c.
++	 *
++	 * There is nothing to set in that case; the child's registers are set up
++	 * when the image is activated.
++	 */
++	if (__improbable(child_state == NULL)) {
++		printf("SWEET FORK: thread %p has no upcb, caller %p - "
++		    "skipping thread_set_child\n", child,
++		    __builtin_return_address(0));
++		return;
++	}
++#endif
++
+ 	set_saved_state_reg(child_state, 0, pid);
+ 	set_saved_state_reg(child_state, 1, 1ULL);
+ }
