@@ -1,0 +1,101 @@
+From f0142e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0142e] evergo: stop SWEET AKS from flooding the screen and the log
+
+Boots that finally reach userspace print one IOLog line for *every*
+AppleKeyStore call. A single daemon that polls selector 17 fills the whole
+console and the 4 MiB SWEETLOG ring in seconds - the screenshot from
+2026-11-07 shows about two hundred identical "lockd sel 17 ... -> 0x0" lines
+and nothing else.
+
+That is the same problem 0089e fixed for the exec log: the information is
+worth one line per (process, selector), not one line per call.
+
+Keep the first line for each (name, selector) pair and then stay quiet except
+for a running counter every 256 calls, so a genuinely hot selector is still
+visible while the screen and the ring stay readable.
+
+No behaviour change: the method dispatch and return values are untouched.
+---
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..bb31743 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -234,8 +234,78 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
++#if defined(SWEET)
++	/*
++	 * evergo (0142e): one line per call floods the console and the
++	 * SWEETLOG ring as soon as a daemon polls a selector.  Keep the first
++	 * line for each (process, selector) and a counter every 256 calls.
++	 * Plain loops instead of strlcpy/strcmp: this file does not pull in
++	 * libkern.h.
++	 */
++	{
++#define EVERGO_AKS_SLOTS 24
++		static struct {
++			char name[24];
++			uint32_t sel;
++			unsigned long count;
++		} seen[EVERGO_AKS_SLOTS];
++		static unsigned long other;
++		int slot = -1;
++
++		for (int i = 0; i < EVERGO_AKS_SLOTS; i++) {
++			if (seen[i].name[0] == '\0') {
++				slot = -2;	/* first free slot; entries are packed */
++				break;
++			}
++			if (seen[i].sel != selector) {
++				continue;
++			}
++			bool same = true;
++			for (int k = 0; k < (int)sizeof(seen[i].name); k++) {
++				if (seen[i].name[k] != name[k]) {
++					same = false;
++					break;
++				}
++				if (name[k] == '\0') {
++					break;
++				}
++			}
++			if (same) {
++				slot = i;
++				break;
++			}
++		}
++
++		if (slot >= 0) {
++			seen[slot].count++;
++			if ((seen[slot].count & 0xff) == 0) {
++				IOLog("SWEET AKS: %s sel %u still busy, %lu calls\n",
++				    name, selector, seen[slot].count);
++			}
++		} else if (slot == -2) {
++			int i;
++			for (i = 0; i < EVERGO_AKS_SLOTS; i++) {
++				if (seen[i].name[0] == '\0') {
++					break;
++				}
++			}
++			for (int k = 0; k < (int)sizeof(seen[i].name) - 1 && name[k]; k++) {
++				seen[i].name[k] = name[k];
++			}
++			seen[i].sel = selector;
++			seen[i].count = 1;
++			IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u "
++			    "-> 0x%x\n", name, selector, arg0, in_scalars, in_struct,
++			    out_scalars, out_struct, ret);
++		} else if ((other++ & 0xff) == 0) {
++			IOLog("SWEET AKS: %s sel %u (table full) -> 0x%x\n",
++			    name, selector, ret);
++		}
++	}
++#else
+ 	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+ 	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++#endif
+ 	return ret;
+ }
+ #endif /* SWEET */
