@@ -132,9 +132,13 @@ jobs:
             gh release download 22G74 \
               --repo dortania/KdkSupportPkg \
               --pattern 'Kernel_Debug_Kit_13.5_build_22G74.dmg' \
-              --dir /tmp --output KDK.dmg --clobber \
+              --dir /tmp --clobber \
               || { echo "gh download failed, trying curl"; \
                    curl --fail --location --max-time 900 -o /tmp/KDK.dmg "$URL" || true; }
+            # --dir keeps the asset's own name; normalise to KDK.dmg
+            if [ -f '/tmp/Kernel_Debug_Kit_13.5_build_22G74.dmg' ]; then
+              mv -f '/tmp/Kernel_Debug_Kit_13.5_build_22G74.dmg' /tmp/KDK.dmg
+            fi
             size=$(stat -f%z /tmp/KDK.dmg 2>/dev/null || echo 0)
             echo "downloaded $size bytes"
             # a real KDK dmg is 628 MB; anything smaller is an error page
@@ -241,8 +245,10 @@ jobs:
         if: always()
         run: |
           mkdir -p out/kdk-libs
+          shopt -s nullglob
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
-            b=$(basename "$lib" .a)
+            [ -f "$lib" ] || continue
+            b=$(basename "$lib" .a | tr -c 'A-Za-z0-9._-' '_')
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
             lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
