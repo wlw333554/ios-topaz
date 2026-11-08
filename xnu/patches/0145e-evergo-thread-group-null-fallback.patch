@@ -1,0 +1,67 @@
+From f0145e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0145e] evergo: never let a thread be born with a NULL thread_group
+
+The v70 boot reaches "SpringBoard has finished initializing" and then dies
+at 45 seconds in
+
+    SWEET EARLY PANIC: thread_group.c:171 Assertion failed:
+        thread->thread_group != NULL
+
+thread_group_init_thread() takes the group from
+task_coalition_get_thread_group(task), which returns
+coal->j.thread_group directly.  coalition.c cleans that field to NULL when
+a jetsam coalition is torn down, so a thread created while its task's
+coalition is being dismantled inherits a NULL group.  sched_clutch_for_thread()
+then asserts, and every later clutch path dereferences it too.
+
+This is the same "object torn down before its users" family that 0137e (proc_ro),
+0138e (upcb), 0141e (task_coalition queue) and 0143e (refcnt/itk_space/zone)
+all addressed, but on a field none of them covered.
+
+Fix it at the source, not at the reader: in thread_group_init_thread(), if the
+coalition hands back NULL, give the thread tg_system - the same permanent
+"system" group that thread_group_init() creates at startup and that
+task_coalition_get_thread_group() already falls back to for a non-jetsam
+coalition (coalition.c:1555).  tg_system is immortal and needs no retain.
+This also keeps sched_clutch.c:2420's
+    assert(thread->thread_group == clutch->sc_tg)
+true, which a reader-side fallback in sched_clutch_for_thread() would break.
+
+Report once per distinct task so a real coalition bug stays visible.
+---
+diff --git a/osfmk/kern/thread_group.c b/osfmk/kern/thread_group.c
+index f04b813..39fa986 100644
+--- a/osfmk/kern/thread_group.c
++++ b/osfmk/kern/thread_group.c
+@@ -299,6 +299,31 @@ void
+ thread_group_init_thread(thread_t t, task_t task)
+ {
+ 	struct thread_group *tg = task_coalition_get_thread_group(task);
++#if defined(SWEET)
++	/*
++	 * evergo (0145e): coal->j.thread_group is set to NULL when a jetsam
++	 * coalition is torn down.  A thread created while its task's coalition
++	 * is being dismantled would otherwise be born with a NULL group and
++	 * trip sched_clutch_for_thread()'s assertion (thread_group.c:171),
++	 * which is exactly how the v70 boot died after SpringBoard finished
++	 * initializing.
++	 *
++	 * tg_system is created at startup and never released, so it is a safe
++	 * permanent home for such a thread.  task_coalition_get_thread_group()
++	 * already uses it as the fallback for a COALITION_NULL task, so this
++	 * is the same policy extended to "coalition being dismantled".
++	 */
++	if (__improbable(tg == NULL)) {
++		static task_t last_task;
++		if (last_task != task) {
++			last_task = task;
++			printf("SWEET TG: task %p coalition had no thread group, "
++			    "using system for thread %p caller %p\n",
++			    task, t, __builtin_return_address(0));
++		}
++		tg = tg_system;
++	}
++#endif
+ 	t->thread_group = tg;
+ 	KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_THREAD_GROUP, MACH_THREAD_GROUP_SET),
+ 	    THREAD_GROUP_INVALID, thread_group_id(tg), (uintptr_t)thread_tid(t));
