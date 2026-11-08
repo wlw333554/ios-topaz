@@ -116,6 +116,8 @@ jobs:
       # Pre-install the KDK ourselves with a size/type check and retries, so
       # build.sh sees KDKROOT already present and skips its download entirely.
       - name: Pre-install KDK (verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           KDKROOT=/Library/Developer/KDKs/KDK_13.5_22G74.kdk
@@ -124,26 +126,32 @@ jobs:
           for attempt in 1 2 3; do
             echo "KDK download attempt $attempt"
             rm -f /tmp/KDK.dmg
-            curl --fail --location --retry 3 --retry-delay 5 \
-                 --max-time 900 --connect-timeout 60 \
-                 -H 'Accept: application/octet-stream' \
-                 -o /tmp/KDK.dmg "$URL" || { sleep 10; continue; }
+            # evergo 2026-11-08: the releases/download URL returns 504 from
+            # GitHub runners now; gh release download uses the api.github.com
+            # asset endpoint, which stays reachable.
+            gh release download 22G74 \
+              --repo dortania/KdkSupportPkg \
+              --pattern 'Kernel_Debug_Kit_13.5_build_22G74.dmg' \
+              --dir /tmp --output KDK.dmg --clobber \
+              || { echo "gh download failed, trying curl"; \
+                   curl --fail --location --max-time 900 -o /tmp/KDK.dmg "$URL" || true; }
             size=$(stat -f%z /tmp/KDK.dmg 2>/dev/null || echo 0)
             echo "downloaded $size bytes"
-            # a real KDK dmg is hundreds of MB; anything smaller is an error page
+            # a real KDK dmg is 628 MB; anything smaller is an error page
             if [ "$size" -gt 100000000 ] && hdiutil imageinfo /tmp/KDK.dmg >/dev/null 2>&1; then
               break
             fi
             echo "bad dmg (size $size), retrying"
             sleep 10
           done
+          test "$(stat -f%z /tmp/KDK.dmg)" -gt 100000000
           hdiutil attach /tmp/KDK.dmg
           sudo mkdir -p /Library/Developer/KDKs
-          sudo cp -R '/Volumes/Kernel Debug Kit/KDK_13.5_22G74.kdk' /Library/Developer/KDKs/ \
-            || sudo cp -R /Volumes/Kernel\ Debug\ Kit/*.kdk /Library/Developer/KDKs/
+          sudo cp -R /Volumes/Kernel\ Debug\ Kit/*.kdk /Library/Developer/KDKs/ \
+            || sudo cp -R '/Volumes/Kernel Debug Kit/'* /Library/Developer/KDKs/
           hdiutil detach '/Volumes/Kernel Debug Kit' || true
           ls -lah /Library/Developer/KDKs
-          test -d "$KDKROOT"
+          test -d "$KDKROOT" || { echo "KDKROOT missing after install"; find /Library/Developer/KDKs -maxdepth 2; exit 1; }
 
       - name: Build
         working-directory: dxb
