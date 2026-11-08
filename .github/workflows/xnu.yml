@@ -110,6 +110,41 @@ jobs:
           restore-keys: |
             ccache-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
 
+      # evergo 2026-11-08: dxb's KDK download (curl -L of a GitHub release URL)
+      # intermittently returns an HTML error page instead of the dmg, and the
+      # script hdiutil-attaches it without checking -> "image not recognized".
+      # Pre-install the KDK ourselves with a size/type check and retries, so
+      # build.sh sees KDKROOT already present and skips its download entirely.
+      - name: Pre-install KDK (verified)
+        run: |
+          set -euo pipefail
+          KDKROOT=/Library/Developer/KDKs/KDK_13.5_22G74.kdk
+          if [ -d "$KDKROOT" ]; then echo "KDK already installed"; exit 0; fi
+          URL='https://github.com/dortania/KdkSupportPkg/releases/download/22G74/Kernel_Debug_Kit_13.5_build_22G74.dmg'
+          for attempt in 1 2 3; do
+            echo "KDK download attempt $attempt"
+            rm -f /tmp/KDK.dmg
+            curl --fail --location --retry 3 --retry-delay 5 \
+                 --max-time 900 --connect-timeout 60 \
+                 -H 'Accept: application/octet-stream' \
+                 -o /tmp/KDK.dmg "$URL" || { sleep 10; continue; }
+            size=$(stat -f%z /tmp/KDK.dmg 2>/dev/null || echo 0)
+            echo "downloaded $size bytes"
+            # a real KDK dmg is hundreds of MB; anything smaller is an error page
+            if [ "$size" -gt 100000000 ] && hdiutil imageinfo /tmp/KDK.dmg >/dev/null 2>&1; then
+              break
+            fi
+            echo "bad dmg (size $size), retrying"
+            sleep 10
+          done
+          hdiutil attach /tmp/KDK.dmg
+          sudo mkdir -p /Library/Developer/KDKs
+          sudo cp -R '/Volumes/Kernel Debug Kit/KDK_13.5_22G74.kdk' /Library/Developer/KDKs/ \
+            || sudo cp -R /Volumes/Kernel\ Debug\ Kit/*.kdk /Library/Developer/KDKs/
+          hdiutil detach '/Volumes/Kernel Debug Kit' || true
+          ls -lah /Library/Developer/KDKs
+          test -d "$KDKROOT"
+
       - name: Build
         working-directory: dxb
         env:
