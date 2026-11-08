@@ -21,6 +21,26 @@ _head:
 	.globl _start
 _start:
 	msr	daifset, #0xf
+	/*
+	 * evergo (0141b): MTK LK does PSCI CPU_ON for every secondary core
+	 * before jumping to the kernel entry, so ALL cores land here. Only
+	 * the boot core (MPIDR Aff0 == 0) may proceed; the rest would race
+	 * the loader and corrupt kernel memory once XNU starts. Park them
+	 * at a safe address until XNU takes over (XNU PSCI-ONs secondaries
+	 * itself, overwriting whatever we park them at here).
+	 */
+	mrs	x1, mpidr_el1
+	ubfx	x1, x1, #0, #16		/* Aff0 + Aff1 */
+	cbz	x1, 5f			/* Aff0 == 0: boot core, continue */
+	/*
+	 * Secondary core: spin at a safe address. XNU's PE_cpu_start()
+	 * will PSCI CPU_ON this core to its own entry point, overwriting
+	 * the park address, so the stale execution never reaches the
+	 * loader or the kernel proper.
+	 */
+	adr	x1, _sec_park
+	br	x1
+5:
 	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
 	adr	x1, _stack_top
@@ -39,6 +59,18 @@ _start:
 	bl	shim_main
 3:	wfe
 	b	3b
+
+/*
+ * evergo (0141b): secondary cores parked here by _start above.  This is
+ * inside the shim's image; XNU will overwrite this address as it boots,
+ * but the core is in `wfe` (not executing), and XNU's PE_cpu_start()
+ * will PSCI CPU_ON it to XNU's own secondary entry before the address
+ * gets reused.
+ */
+	.globl _sec_park
+_sec_park:
+	wfe
+	b	_sec_park
 
 /* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
 	.globl secondary_entry
