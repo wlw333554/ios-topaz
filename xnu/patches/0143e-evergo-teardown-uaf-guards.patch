@@ -1,0 +1,119 @@
+From f0143e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0143e] evergo: three UAF walls on the userspace teardown path
+
+The v67 boot reached userspace and then walked into three panics, all of them
+the same shape: something that had already been destroyed was used once more
+while a crashed daemon was being torn down.
+
+1) os_refcnt: attempted resurrection @os_refcnt.c
+
+   A retain on an object whose refcount is already zero.  In a development
+   build this is a panic; the object is dead either way, so refusing the
+   retain is enough and the boot survives.  Report it once per distinct
+   pointer so a real leak still shows up.
+
+2) Kernel data abort in task_clear_return_wait() @task.c
+
+       pc = _task_clear_return_wait + 0x60   (is_write_lock(task->itk_space))
+       x1 = task + 0x5c0 = task->itk_space = NULL
+
+   That is the same wall 0122e fixed for ipc_object_copyout(): taking a space
+   lock on a NULL space faults at address 3.  Skip the lock/wakeup when the
+   space is gone - the task is being torn down and there is nobody left to
+   inherit anything.
+
+3) zone_require failed: address not in a zone (addr: 0xffffffffff8080)
+   @zalloc.c:1422
+
+   0xffffffffff8080 is not a kernel pointer at all, so zone_require() is being
+   handed an already-scrubbed value.  With the read-only zone allocator off
+   (0124e) this check is only a diagnostic; report and carry on instead of
+   taking the boot down.
+---
+diff --git a/libkern/os/refcnt.c b/libkern/os/refcnt.c
+index 0fd6a7a..ce972ed 100644
+--- a/libkern/os/refcnt.c
++++ b/libkern/os/refcnt.c
+@@ -65,7 +65,23 @@ os_ref_panic_retain(os_ref_atomic_t *rc)
+ 	if (os_atomic_load(rc, relaxed) >= OS_REFCNT_MAX_COUNT) {
+ 		panic("os_refcnt: overflow (rc=%p)", rc);
+ 	} else {
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++		/*
++		 * evergo (0143e): the object is already at zero references, so it
++		 * is dead no matter what this retain does.  Panicking only costs
++		 * the boot - which is how v67 died while tearing down a crashed
++		 * daemon.  Say it (once per pointer) and let the retain fail.
++		 */
++		static void *last_rc;
++		if (last_rc != (void *)rc) {
++			last_rc = (void *)rc;
++			printf("SWEET REF: resurrect refused, rc %p caller %p\n",
++			    rc, __builtin_return_address(0));
++		}
++		return;
++#else
+ 		panic("os_refcnt: attempted resurrection (rc=%p)", rc);
++#endif
+ 	}
+ }
+ 
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index f85c100..9b17b1d 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -760,6 +760,24 @@ task_clear_return_wait(task_t task, uint32_t flags)
+ 	}
+ 
+ 	if (flags & TCRW_CLEAR_FINAL_WAIT) {
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++		/*
++		 * evergo (0143e): the task is being torn down and its space may
++		 * already be gone; is_write_lock(NULL) faults at address 3 (the
++		 * same wall 0122e hit in ipc_object_copyout).  Nothing can
++		 * inherit from a task that has no space, so there is nothing to
++		 * wake either.
++		 */
++		if (__improbable(task->itk_space == IPS_NULL ||
++		    task->itk_space == NULL)) {
++			printf("SWEET TASK: clear_return_wait with dead space, "
++			    "task %p caller %p - skipping\n", task,
++			    __builtin_return_address(0));
++			task->t_returnwaitflags &= ~(TRW_LRETURNWAIT |
++			    TRW_LRETURNWAITER);
++			return;
++		}
++#endif
+ 		is_write_lock(task->itk_space);
+ 
+ 		task->t_returnwaitflags &= ~TRW_LRETURNWAIT;
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 0061645..4034f97 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -1419,7 +1419,25 @@ zone_require_panic(zone_t zone, void *addr)
+ 	zone_t other;
+ 
+ 	if (!from_zone_map(addr, zone_elem_inner_size(zone))) {
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++		/*
++		 * evergo (0143e): with the read-only zone allocator compiled out
++		 * (0124e) this check is a diagnostic, not a security boundary.
++		 * v67 hit it with addr 0xffffffffff8080 - not even a kernel
++		 * pointer - while a crashed daemon was being torn down.  Report
++		 * and continue instead of losing the boot.
++		 */
++		static void *last_bad;
++		if (last_bad != addr) {
++			last_bad = addr;
++			printf("SWEET ZONE: require(%s) got out-of-zone addr %p, "
++			    "caller %p - continuing\n", zone->z_name, addr,
++			    __builtin_return_address(0));
++		}
++		return;
++#else
+ 		panic("zone_require failed: address not in a zone (addr: %p)", addr);
++#endif
+ 	}
+ 
+ 	zindex = zone_index_from_ptr(addr);
