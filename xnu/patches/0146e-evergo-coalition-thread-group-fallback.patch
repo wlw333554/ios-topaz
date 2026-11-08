@@ -1,0 +1,69 @@
+From f0146e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0146e] evergo: task_coalition_get_thread_group must never return NULL
+
+0145e fixed thread_group_init_thread() so a thread is not BORN with a NULL
+thread_group.  The v71 boot (k5c09b004) still dies in the very same
+thread_group.c:171 assertion, which means the NULL is written back later,
+during the thread's life.
+
+The real source is one function:
+
+    struct thread_group *
+    task_coalition_get_thread_group(task_t task)
+    {
+        coalition_t coal = task->coalition[COALITION_TYPE_JETSAM];
+        if (coal == COALITION_NULL)
+            return init_coalition[JETSAM]->j.thread_group;
+        return coal->j.thread_group;        /* <-- NULL while being torn down */
+    }
+
+coalition.c:980 sets coal->j.thread_group = NULL when a jetsam coalition is
+reaped.  Every caller of this function assumes the result is valid:
+
+  thread_group.c:644  thread_group_get_home_group() -> first candidate for
+                      thread_compute_resolved_thread_group(), whose result is
+                      assigned straight to t->thread_group (lines 781/1140)
+  bank.c:942          thread_group_retain(task_coalition_get_thread_group(task))
+  coalition.c:1607..  thread_group_set_flags_locked(...)
+
+Fix it once at the source: if coal->j.thread_group is NULL, return the
+init jetsam coalition's group - the exact same fallback the function already
+uses for COALITION_NULL (coalition.c:1555).  That group is created at boot
+and never released, so no retain is needed.
+
+This makes 0145e's birth-time guard redundant but harmless (defence in depth),
+and it covers the run-time hierarchy resolution that 0145e could not reach.
+Report once per distinct task so a genuinely broken coalition stays visible.
+---
+diff --git a/osfmk/kern/coalition.c b/osfmk/kern/coalition.c
+index 10bd5e7..6299f29 100644
+--- a/osfmk/kern/coalition.c
++++ b/osfmk/kern/coalition.c
+@@ -1554,6 +1554,27 @@ task_coalition_get_thread_group(task_t task)
+ 	if (coal == COALITION_NULL) {
+ 		return init_coalition[COALITION_TYPE_JETSAM]->j.thread_group;
+ 	}
++#if defined(SWEET)
++	/*
++	 * evergo (0146e): coalition.c sets coal->j.thread_group to NULL when a
++	 * jetsam coalition is reaped, while the task still points at it.  The
++	 * v70/v71 boots died in sched_clutch_for_thread() because
++	 * thread_group_get_home_group() -> thread_compute_resolved_thread_group()
++	 * fed that NULL straight back into t->thread_group at run time.
++	 *
++	 * Fall back to the init jetsam coalition's group - the same one used
++	 * above for COALITION_NULL - which lives for the whole boot.
++	 */
++	if (__improbable(coal->j.thread_group == NULL)) {
++		static task_t last_task;
++		if (last_task != task) {
++			last_task = task;
++			printf("SWEET COAL: task %p coalition %p has no thread "
++			    "group, using init jetsam group\n", task, coal);
++		}
++		return init_coalition[COALITION_TYPE_JETSAM]->j.thread_group;
++	}
++#endif
+ 	return coal->j.thread_group;
+ }
+ 
