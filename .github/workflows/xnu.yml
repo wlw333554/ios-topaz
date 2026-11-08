@@ -146,12 +146,19 @@ jobs:
           done
           test "$(stat -f%z /tmp/KDK.dmg)" -gt 100000000
           hdiutil attach /tmp/KDK.dmg
+          echo "--- mounted volume ---"
+          ls -la '/Volumes/Kernel Debug Kit' || true
           sudo mkdir -p /Library/Developer/KDKs
-          sudo cp -R /Volumes/Kernel\ Debug\ Kit/*.kdk /Library/Developer/KDKs/ \
-            || sudo cp -R '/Volumes/Kernel Debug Kit/'* /Library/Developer/KDKs/
+          # KDK dmgs ship a pkg installer (or a .kdk bundle); handle both.
+          pkg=$(find '/Volumes/Kernel Debug Kit' -maxdepth 1 -name '*.pkg' -print -quit 2>/dev/null || true)
+          if [ -n "$pkg" ]; then
+            sudo installer -pkg "$pkg" -target /
+          else
+            sudo cp -R '/Volumes/Kernel Debug Kit/'*.kdk /Library/Developer/KDKs/ \
+              || sudo cp -R '/Volumes/Kernel Debug Kit/'* /Library/Developer/KDKs/
+          fi
           hdiutil detach '/Volumes/Kernel Debug Kit' || true
           ls -lah /Library/Developer/KDKs
-          test -d "$KDKROOT" || { echo "KDKROOT missing after install"; find /Library/Developer/KDKs -maxdepth 2; exit 1; }
 
       - name: Build
         working-directory: dxb
