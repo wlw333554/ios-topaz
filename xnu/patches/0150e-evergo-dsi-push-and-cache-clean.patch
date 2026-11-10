@@ -1,0 +1,124 @@
+From f0150e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0150e] evergo: push composited frames to the command-mode DSI panel
+
+The header comment of SweetFramebuffer.cpp assumes "the panel scans it out by
+itself". On MTK command-mode DSI that is false. HelioDarwin (same ios-topaz
+lineage, MT6789, patches 0146/0177/0187/0190) hit the exact same symptom and
+documented it: "the panel kept showing the Apple logo even though SpringBoard
+was compositing and swapping (SWEET FB: swap N)".
+
+Our real SWEETLOG shows `SWEET FB: 207000 swaps`, `display on`, present()
+running 16+ times, SpringBoard alive, no kernel panic - yet the screen never
+shows the GUI. Two missing pieces, matching HelioDarwin:
+
+1. After present() memcpy's the layers into fPixels (a cached mapping of the
+   panel memory at 0x7d006000), the CPU cache holds the new frame while the
+   MTK DSI/OVL fetches the stale LK splash from DRAM. Clean the dcache out
+   to DRAM with clean_dcache64(fPhys, ..., TRUE) before the push.
+
+2. The command-mode DSI needs an explicit trigger each vsync:
+     DSI_INTSTA (0x14013000 + 0x0c) = 0
+     MUTEX0_EN  (0x14001000 + 0x20) = 1
+     DSI_START  (0x14013000 + 0x00) = 0 then 1
+   with dsb sy barriers. LK left the display chain configured but stopped
+   the frame synchroniser at hand-off; HelioDarwin's mtk_dsi_push_hw() is
+   the minimal re-arm (their 0177, without the later busy/recovery logic).
+
+Register bases for our MT6833 are taken from NOTES-evergo.md: dsi 0x14013000,
+dispsys_config/mutex 0x14001000 - identical to HelioDarwin's MT6789.
+
+Add the push at the end of present() (after the copy) AND in vsyncFired()
+after present(rec), so the panel keeps refreshing even when no new swap
+arrives. Everything is gated on SWEET; ml_io_map/clean_dcache64 are already
+kernel symbols.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..f3ec5ee 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,55 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++#if defined(SWEET)
++/*
++ * evergo (0150e): MTK command-mode DSI panel bring-up, mirroring
++ * HelioDarwin's mtk_dsi_push_hw(). The panel does NOT scan out by itself.
++ */
++extern "C" uintptr_t ml_io_map(uintptr_t phys_addr, size_t size);
++/* Declared locally: osfmk/arm/caches_internal.h is not on this file's path. */
++extern "C" void clean_dcache64(uint64_t addr, unsigned count, int phys);
++
++static volatile uint32_t *sMtkDsi;
++static volatile uint32_t *sMtkMutex;
++static int sMtkPushWarned;
++
++static void
++sweet_dsi_push_hw(void)
++{
++	if (sMtkDsi == NULL) {
++		sMtkDsi = (volatile uint32_t *)ml_io_map(0x14013000UL, 0x1000);
++	}
++	if (sMtkMutex == NULL) {
++		sMtkMutex = (volatile uint32_t *)ml_io_map(0x14001000UL, 0x1000);
++	}
++	if (sMtkDsi == NULL || sMtkMutex == NULL) {
++		return;
++	}
++	/*
++	 * evergo: writing these registers from the shim (MMU off) once faulted
++	 * into a BLUE exception screen. Here the VA is a real ml_io_map mapping,
++	 * but guard anyway: an unclocked MMIO block reads back all-ones. Never
++	 * write into a dead block - that is what bricked the earlier attempt.
++	 */
++	__asm__ volatile("dsb sy" ::: "memory");
++	uint32_t probe = sMtkDsi[0x0c / 4];
++	if (probe == 0xffffffffU) {
++		if (!sMtkPushWarned) {
++			sMtkPushWarned = 1;
++			IOLog("SWEET DSI: DSI0 INTSTA reads 0xffffffff, "
++			    "block unclocked - push skipped\n");
++		}
++		return;
++	}
++	sMtkDsi[0x0c / 4] = 0;      /* DSI_INTSTA = 0 */
++	sMtkMutex[0x20 / 4] = 1;    /* MUTEX0_EN = 1  */
++	sMtkDsi[0x00 / 4] = 0;      /* DSI_START = 0  */
++	sMtkDsi[0x00 / 4] = 1;      /* DSI_START = 1  */
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++#endif
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -256,6 +305,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++#if defined(SWEET)
++	/* evergo (0150e): keep the command-mode panel refreshing at vsync. */
++	sweet_dsi_push_hw();
++#endif
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+@@ -399,6 +452,18 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	/*
++	 * evergo (0150e): the layers were composed into the cached mapping of
++	 * the panel memory. Push the new frame out to DRAM and re-trigger the
++	 * command-mode DSI; otherwise the panel keeps showing LK's splash even
++	 * though backboardd is swapping thousands of frames (HelioDarwin 0187
++	 * documents exactly this).
++	 */
++	if (fPixels != 0) {
++		clean_dcache64((uint64_t)fPhys,
++		    (unsigned)((size_t)fRowBytes * fHeight), 1);
++	}
++	sweet_dsi_push_hw();
+ }
+ 
+ bool
