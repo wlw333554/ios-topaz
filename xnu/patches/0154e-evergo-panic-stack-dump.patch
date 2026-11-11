@@ -8,15 +8,14 @@ Output goes through panic_plain -> console -> SWEETLOG, so the ring
 carries it out even when the screen is dark.
 ---
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 24f1abc..6f29e21 100644
+index 24f1abc..745fa07 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -502,6 +502,36 @@ panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss)
+@@ -502,6 +502,34 @@ panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss)
  	    state->x[24], state->x[25], state->x[26], state->x[27],
  	    state->x[28], state->fp, state->lr, state->sp,
  	    state->pc, state->cpsr, state->esr, state->far);
 +
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
 +	/*
 +	 * evergo (0154e): when the fault is a call through a corrupted pointer,
 +	 * pc AND lr AND fp can all be zero (observed: instruction fetch abort at
@@ -44,7 +43,6 @@ index 24f1abc..6f29e21 100644
 +			}
 +		}
 +	}
-+#endif
  }
  
  void
