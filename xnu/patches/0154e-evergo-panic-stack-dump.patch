@@ -1,48 +1,68 @@
 From f0154e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-Subject: [PATCH 0154e] evergo: dump the interrupted stack in the panic path
-A call through a NULL function pointer leaves pc, lr and fp all zero, so
-the register dump names nobody. Dump the first 48 words at the interrupted
-sp: kernel stacks are wired so the reads cannot fault, and the caller
-frame records in there can be symbolized offline against the same binary.
-Output goes through panic_plain -> console -> SWEETLOG, so the ring
-carries it out even when the screen is dark.
+Subject: [PATCH 0154e v2] evergo: dump the interrupted stack BEFORE the panic call
+Two lessons learned the hard way, both only visible by disassembling the
+artifact:
+
+1. #if defined(ARM64_BOARD_CONFIG_SWEET) compiles to nothing in sleh.c:
+   the macro lives in pexpert/pexpert/arm64/board_config.h, which osfmk
+   files do not include. v1 produced a binary identical in size to the
+   previous build, with zero SWEET STACK strings.
+
+2. panic_plain is a macro for panic() (kern/debug.h), which never returns.
+   Placing the dump after the register dump makes it dead code the compiler
+   strips - v2 still had no strings while __TEXT_EXEC grew a page from
+   unrelated code movement.
+
+This version inserts the dump BEFORE the register dump and uses printf(),
+which returns, so the loop survives. Output reaches console + SWEETLOG via
+_cnputs (the 0043 CRASH lines already prove that path). A local extern
+declaration is provided because sleh.c never sees kern/misc_protos.h.
+
+The dump is an instrument: nothing in the fault path changes, and the 48
+extra lines only appear in a panic dump.
 ---
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 24f1abc..745fa07 100644
+index 24f1abc..3c59f0d 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -502,6 +502,34 @@ panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss)
- 	    state->x[24], state->x[25], state->x[26], state->x[27],
- 	    state->x[28], state->fp, state->lr, state->sp,
- 	    state->pc, state->cpsr, state->esr, state->far);
-+
+@@ -482,6 +482,40 @@ panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss)
+ 		    VALUE(state->far));
+ 	}
+ 
 +	/*
 +	 * evergo (0154e): when the fault is a call through a corrupted pointer,
 +	 * pc AND lr AND fp can all be zero (observed: instruction fetch abort at
-+	 * 0, esr 0x86000005), and the register dump above then names nobody. The
++	 * 0, esr 0x86000005), and the register dump below then names nobody. The
 +	 * interrupted stack still holds the caller frame records, so dump the
-+	 * first words at sp. Values inside the kernel text range can be
-+	 * symbolized offline with sym_kernel.py against the same kernel binary.
++	 * first words at sp right now, with printf - which RETURNS.
 +	 *
-+	 * The stack grows down, so [sp, sp+N) walks back into the frames of the
-+	 * callers; kernel stacks are wired, so these reads cannot fault.
++	 * Order matters: the register dump below goes through panic_plain, and
++	 * panic_plain is a macro for panic() (kern/debug.h), which never returns,
++	 * so anything after it is dead code the compiler strips. The dump must
++	 * run before it.
++	 *
++	 * printf output reaches the console and the SWEETLOG ring through
++	 * _cnputs, so the lines survive even when the screen has scrolled.
++	 * sleh.c's include chain never reaches kern/misc_protos.h, hence the
++	 * local declaration.
 +	 */
 +	{
++		extern int printf(const char *format, ...);
++
 +		uint64_t ksp = state->sp;
 +
 +		if (ksp != 0) {
-+			panic_plain("SWEET STACK: sp 0x%016llx, dumping 48 words\n",
-+			    (unsigned long long)ksp);
++			printf("SWEET STACK: sp 0x%016llx, dumping 48 words\n", ksp);
 +			for (int i = 0; i < 48; i++) {
 +				uint64_t word =
 +				    *(const volatile uint64_t *)(ksp + (uint64_t)i * 8);
 +
-+				panic_plain("SWEET STACK %02d @0x%016llx: 0x%016llx\n",
-+				    i, (unsigned long long)(ksp + (uint64_t)i * 8),
-+				    word);
++				printf("SWEET STACK %02d @0x%016llx: 0x%016llx\n",
++				    i, ksp + (uint64_t)i * 8, word);
 +			}
 +		}
 +	}
- }
- 
- void
++
+ 	panic_plain("%s at pc 0x%016llx, lr 0x%016llx (saved state: %p%s)\n"
+ 	    "\t  x0:  0x%016llx x1:  0x%016llx  x2:  0x%016llx  x3:  0x%016llx\n"
+ 	    "\t  x4:  0x%016llx x5:  0x%016llx  x6:  0x%016llx  x7:  0x%016llx\n"
