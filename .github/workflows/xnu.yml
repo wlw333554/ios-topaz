@@ -174,49 +174,45 @@ jobs:
           bash build.sh
           ccache -s
 
-      - name: Verify evergo diagnostics are compiled in
+      - name: Verify evergo essentials are compiled in
         # dxb/build.sh only warns when a patch fails to apply, so a silently
-        # skipped diagnostic patch still yields a "successful" kernel. Fail
-        # here instead: every marker below must be present in the binary.
+        # skipped patch still yields a "successful" kernel. The patch set was
+        # slimmed to 17 device-essential patches (see NOTES-evergo.md), so this
+        # gate now asserts the SYMBOLS those patches must produce.
         run: |
           set -e
           K=$(ls dxb/fakeroot/System/Library/Kernels/kernel.* 2>/dev/null | head -1)
           test -n "$K" || { echo "::error::no kernel produced"; exit 1; }
           echo "kernel: $K"
+          SYMS=$(nm -g "$K" 2>/dev/null | awk '{print $3}')
+          STRS=$(strings -a "$K")
           rc=0
-          while IFS= read -r marker; do
-            [ -n "$marker" ] || continue
-            if strings -a "$K" | grep -qF -- "$marker"; then
-              echo "  ok: $marker"
+
+          need_sym() {
+            if echo "$SYMS" | grep -qx "$1"; then
+              echo "  ok sym: $1"
             else
-              echo "::error::missing diagnostic string '$marker' (a patch was silently skipped)"
+              echo "::error::missing symbol '$1' (a patch was silently skipped)"
               rc=1
             fi
-          done <<'EOF'
-          SWEET ANOM: %s first ptr
-          threadrel
-          lockrw
-          SWEET REMAP: MISMATCH
-          SWEET IPS: dealloc space mismatch
-          SWEET NSR: no-senders for freed thread
-          SWEET SRMAP
-          SWEET TRO: thread
-          SWEET THREAD: double release
-          SWEET ZRO: %s(NULL) zid
-          EOF
-          # Conditional markers: these only exist when the read-only zone
-          # allocator is compiled in (ZSECURITY_CONFIG_READ_ONLY). 0124e turns
-          # it off for this port, so report them but do not fail the build.
-          while IFS= read -r marker; do
-            [ -n "$marker" ] || continue
-            if strings -a "$K" | grep -qF -- "$marker"; then
-              echo "  ok (ro zones on): $marker"
+          }
+          need_str() {
+            if echo "$STRS" | grep -qF -- "$1"; then
+              echo "  ok str: $1"
             else
-              echo "  note: '$marker' absent - read-only zones are compiled out"
+              echo "::error::missing string '$1' (a patch was silently skipped)"
+              rc=1
             fi
-          done <<'EOF'
-          SWEET ZRORO: zid
-          EOF
+          }
+
+          # device essentials
+          need_sym _sweet_ufs_rootdev          # 0084e 0085e 0086e 0091e
+          need_sym _sweet_early_putc           # 0081e
+          need_sym _sweet_log_append           # 0083e
+          need_sym _vm_shared_region_map_file_setup   # 0099e 0100e patch this
+          need_sym _cs_invalid_page            # 0139e patches this
+          # 0150e: the helper is often inlined, so assert its message instead
+          need_str "SWEET DSI: DSI0 INTSTA reads 0xffffffff"
           exit $rc
 
       - name: Package build tree for local compiles
