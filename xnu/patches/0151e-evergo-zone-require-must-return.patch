@@ -1,0 +1,113 @@
+From f0151e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0151e] evergo: zone_require_panic must actually return
+
+The real panic captured from the device decodes to
+
+    ESR 0xf2000001  -> EC 0x3c = BRK (software breakpoint)
+    pc  0xfffffe0007ab5594 = _zone_require_panic + 0x100
+    lr  0xfffffe0007ab5594
+
+Disassembly of that address shows
+
+    0x7ab5588  adrp x0, ... 0x705e000
+    0x7ab558c  add  x0, x0, #0x67e    -> "SWEET ZONE: require(%s) got
+                                          out-of-zone addr %p, caller %p
+                                          - continuing\n"
+    0x7ab5590  bl   printf
+    0x7ab5594  brk  #1                <-- crash here
+
+So 0143e's "report and continue" branch DOES run and DOES print, and then the
+compiler emits an unconditional BRK after it.  Reason: the function is
+declared `__abortlike`, which expands to `__dead2 __cold __not_tail_called`
+and `__dead2` is `noreturn`.  A `return;` inside a noreturn function is
+ignored and the compiler appends `__builtin_unreachable()` -> brk.  0143e's
+`return;` therefore never took effect; the boot still died, one instruction
+later than before.
+
+Fix on SWEET:
+  - drop `__abortlike` from zone_require_panic (keep it for zone_id_require_panic
+    which is a pure forwarder and never returns either way),
+  - and convert ALL THREE panic branches inside it to report-and-return, not
+    just the "not in a zone" one: "invalid zone index" and "address in
+    unexpected zone id" would otherwise still be fatal.
+
+This turns a diagnostic check (the read-only zone allocator is already
+compiled out by 0124e) into a log line instead of a dead device.
+---
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 0061645..ed92ac2 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -1411,7 +1411,9 @@ zone_id_for_element(void *addr, vm_size_t esize)
+ }
+ 
+ /* This function just formats the reason for the panics by redoing the checks */
++#if !defined(ARM64_BOARD_CONFIG_SWEET) && !defined(SWEET)
+ __abortlike
++#endif
+ static void
+ zone_require_panic(zone_t zone, void *addr)
+ {
+@@ -1419,20 +1421,62 @@ zone_require_panic(zone_t zone, void *addr)
+ 	zone_t other;
+ 
+ 	if (!from_zone_map(addr, zone_elem_inner_size(zone))) {
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++		/*
++		 * evergo (0143e/0151e): with the read-only zone allocator compiled
++		 * out (0124e) this check is a diagnostic, not a security boundary.
++		 * 0143e already printed here but the function was __abortlike
++		 * (noreturn), so the compiler appended a BRK right after printf and
++		 * the device still died - see 0151e's header for the disassembly.
++		 */
++		static void *last_bad;
++		if (last_bad != addr) {
++			last_bad = addr;
++			printf("SWEET ZONE: require(%s) got out-of-zone addr %p, "
++			    "caller %p - continuing\n", zone->z_name, addr,
++			    __builtin_return_address(0));
++		}
++		return;
++#else
+ 		panic("zone_require failed: address not in a zone (addr: %p)", addr);
++#endif
+ 	}
+ 
+ 	zindex = zone_index_from_ptr(addr);
+ 	other = &zone_array[zindex];
+ 	if (zindex >= os_atomic_load(&num_zones, relaxed) || !other->z_self) {
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++		/* evergo (0151e): diagnostic only - report, do not die. */
++		static uint32_t last_zindex;
++		if (last_zindex != zindex) {
++			last_zindex = zindex;
++			printf("SWEET ZONE: require(%s) invalid zone index %d "
++			    "(addr %p) - continuing\n",
++			    zone->z_name, zindex, addr);
++		}
++		return;
++#else
+ 		panic("zone_require failed: invalid zone index %d "
+ 		    "(addr: %p, expected: %s%s)", zindex,
+ 		    addr, zone_heap_name(zone), zone->z_name);
++#endif
+ 	} else {
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++		/* evergo (0151e): same - a wrong zone is worth a line, not a boot. */
++		static void *last_wrong;
++		if (last_wrong != addr) {
++			last_wrong = addr;
++			printf("SWEET ZONE: require(%s) wrong zone %d (%s%s) "
++			    "addr %p - continuing\n", zone->z_name, zindex,
++			    zone_heap_name(other), other->z_name, addr);
++		}
++		return;
++#else
+ 		panic("zone_require failed: address in unexpected zone id %d (%s%s) "
+ 		    "(addr: %p, expected: %s%s)",
+ 		    zindex, zone_heap_name(other), other->z_name,
+ 		    addr, zone_heap_name(zone), zone->z_name);
++#endif
+ 	}
+ }
+ 
