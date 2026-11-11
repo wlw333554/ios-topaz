@@ -1,0 +1,102 @@
+From f0153e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH 0153e] evergo: proc_get_ro must not hand back NULL
+Generate 0153e: proc_get_ro must not hand back NULL.
+
+Base = the CURRENT CI buildtree (_btnow), so the anchors match and CI will not
+silently skip it (the 0151e lesson).
+
+The v82 device panic:
+
+    panic(cpu 0 caller _sleh_synchronous_sp1): Kernel data abort
+    pc = 0xfffffe00077fb9ac = _proc_ucred + 0x10
+    lr = 0xfffffe00077f4b94 = _fork1 + 0x158
+    far = 0x10   esr = 0x96000006
+
+Disassembly of the faulting site:
+
+    _proc_ucred:
+        0xfffffe00077fb9a8  mov x20, x0
+        0xfffffe00077fb9ac  ldr x19, [x0, #0x18]   <-- faults, x0 == NULL
+
+and the call site is _fork1 calling _proc_ucred, whose source is
+
+    proc_ucred(proc_t p) { return kauth_cred_require(proc_get_ro(p)->p_ucred); }
+
+so proc_get_ro(p) returned NULL and the ->p_ucred dereference went to 0x10.
+
+Why it only shows up NOW: 0124e turned ZSECURITY_CONFIG(READ_ONLY) off, and
+zone_require_ro() compiles to nothing in that configuration
+
+    #if ZSECURITY_CONFIG(READ_ONLY)  ...  panic on a bad addr ...
+    #else  #pragma unused(zid, addr)  #endif
+
+so the NULL p_proc_ro that zone_require_ro used to catch now sails through
+proc_get_ro() and crashes later, in proc_ucred. v80 died inside the check;
+v82 dies past it.
+
+Fix: when p_proc_ro is NULL (a zombie's ro is freed before the proc struct -
+see proc_reap_internal()), or when the backref does not match, hand back
+kernproc's ro, exactly as current_proc_ro() already does one function below.
+Every field in it is valid (real ucred, pid 0, name "kernel_task"), so callers
+that only want a cred to report on or to fork a dying proc get sane values
+instead of a fault.
+---
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index 407a18b..688e02f 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -4985,10 +4985,54 @@ proc_get_ro(proc_t p)
+ {
+ 	proc_ro_t ro = p->p_proc_ro;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * evergo (0153e): a zombie's p_proc_ro is NULL by design - see
++	 * proc_reap_internal(), which releases the ro and clears the pointer while
++	 * the proc struct is still reachable. zone_require_ro() used to catch that
++	 * (it panics on a bad address), but 0124e compiles it away when
++	 * ZSECURITY_CONFIG(READ_ONLY) is off, so the NULL now reaches the caller:
++	 *
++	 *     proc_ucred() -> kauth_cred_require(proc_get_ro(p)->p_ucred)
++	 *
++	 * and faults at [NULL + 0x18] (observed: _proc_ucred+0x10, far 0x10,
++	 * lr _fork1+0x158). Hand back kernproc's ro instead, the same fallback
++	 * current_proc_ro() uses immediately below: every field in it is valid.
++	 */
++	if (__improbable(ro == NULL)) {
++		static void *last_null;
++
++		if (last_null != p) {
++			last_null = p;
++			printf("SWEET PROC: proc %p (%s) had p_proc_ro == 0, caller %p - "
++			    "using kernproc ro\n", p, &p->p_name[0],
++			    __builtin_return_address(0));
++		}
++		return kernproc->p_proc_ro;
++	}
++
++	/*
++	 * The backref can also be stale on a proc whose ro was recycled. Report it
++	 * once and use the kernel ro rather than panicking: this port cannot
++	 * survive a boot where a dying daemon's bookkeeping is off by a little.
++	 */
++	if (__improbable(proc_ro_proc(ro) != p)) {
++		static proc_t last_bad_p;
++
++		if (last_bad_p != p) {
++			last_bad_p = p;
++			printf("SWEET PROC: proc %p (%s) ro %p backref %p mismatch - "
++			    "using kernproc ro\n", p, &p->p_name[0], ro,
++			    proc_ro_proc(ro));
++		}
++		return kernproc->p_proc_ro;
++	}
++#else
+ 	zone_require_ro(ZONE_ID_PROC_RO, sizeof(struct proc_ro), ro);
+ 	if (__improbable(proc_ro_proc(ro) != p)) {
+ 		panic_proc_ro_proc_backref_mismatch(p, ro);
+ 	}
++#endif
+ 
+ 	return ro;
+ }
