@@ -1,0 +1,269 @@
+name: AcFun Web Archive Shard
+
+# 在 Actions 页 "Run workflow" 填参数：
+#   url         : CDX 列表的 7z 直链（内含 json）或 json 直链
+#   shard_count : 把 CDX 列表切成多少片（默认 93 = 464 万 / 5 万）
+#   shard_index : 本次跑第几片（1..shard_count）
+#   shard_size  : 每片多少条（默认 50000，一次 run 5~6 小时内能跑完）
+#   per_pack    : 每个 7z 装多少网页文件（默认 100000）
+#   limit       : 测试用，只抓前 N 条（0 = 正常分片跑）
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "CDX 列表直链（7z 或 json）"
+        required: true
+        default: ""
+      shard_count:
+        description: "分片总数"
+        required: false
+        default: "93"
+      shard_index:
+        description: "本次跑第几片（从 1 开始）"
+        required: false
+        default: "1"
+      shard_size:
+        description: "每片条数"
+        required: false
+        default: "50000"
+      per_pack:
+        description: "每个 7z 包装多少网页文件"
+        required: false
+        default: "100000"
+      limit:
+        description: "测试：只抓前 N 条（0 = 关闭）"
+        required: false
+        default: "0"
+      delay:
+        description: "请求间隔秒（0 = 不限速）"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full p7zip-rar >/dev/null
+          pip install --quiet requests beautifulsoup4 lxml curl_cffi brotli zstandard
+          7z | head -2 || true
+
+      - name: Move workdir to big disk
+        run: |
+          sudo mkdir -p /mnt/acfun
+          sudo chown -R $USER:$USER /mnt/acfun
+          mkdir -p /mnt/acfun/work
+
+      - name: Run workflow script
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          python3 - <<'PYEOF'
+          import json, os, sys
+          from pathlib import Path
+
+          url          = "${{ github.event.inputs.url }}".strip()
+          shard_count  = int("${{ github.event.inputs.shard_count }}" or 93)
+          shard_index  = int("${{ github.event.inputs.shard_index }}" or 1)
+          shard_size   = int("${{ github.event.inputs.shard_size }}" or 50000)
+          limit        = int("${{ github.event.inputs.limit }}" or 0)
+          delay        = "${{ github.event.inputs.delay }}" or "0"
+
+          assert url, "必须填 url"
+          assert 1 <= shard_index <= shard_count, "shard_index 超范围"
+
+          base = Path("/mnt/acfun/work")
+          inp  = base / "input"
+          inp.mkdir(parents=True, exist_ok=True)
+
+          # ---------- 下载 & 解压 ----------
+          import requests, subprocess
+          name = url.split("?")[0].rstrip("/").split("/")[-1] or "input.bin"
+          if "fn=" in url:
+              name = url.split("fn=")[-1].split("&")[0]
+          dest = inp / name
+          if not dest.exists():
+              print("[input] downloading", url)
+              with requests.get(url, stream=True, timeout=180) as r:
+                  r.raise_for_status()
+                  with open(dest, "wb") as f:
+                      for chunk in r.iter_content(1 << 20):
+                          f.write(chunk)
+              print("[input] got %.1f MB" % (dest.stat().st_size / 1048576))
+          else:
+              print("[input] cached:", dest.name)
+
+          jsons = []
+          if dest.suffix.lower() == ".json":
+              jsons = [dest]
+          else:
+              outd = inp / dest.stem
+              if not outd.exists():
+                  outd.mkdir(parents=True)
+                  subprocess.run(["7z", "x", "-y", str(dest), "-o" + str(outd)],
+                                 check=True, capture_output=True)
+              jsons = sorted(outd.glob("*.json"))
+          assert jsons, "没有 json"
+          print("[input] json files:", [j.name for j in jsons])
+
+          # ---------- 拼接 + 分片 ----------
+          # CDX 数组流：表头行 + 每条一行(自带逗号) + "]"。
+          # 多个 json 拼成一个大列表再切片。
+          all_lines = []
+          header = None
+          for j in jsons:
+              with open(j, "r", encoding="utf-8", errors="replace") as f:
+                  first = True
+                  for line in f:
+                      s = line.rstrip("\n")
+                      if not s.strip():
+                          continue
+                      if first:
+                          header = s
+                          first = False
+                          continue
+                      if s == "]":
+                          continue
+                      all_lines.append(s.rstrip(","))
+          total = len(all_lines)
+          print("[plan] total entries:", total)
+
+          if limit:
+              sel = all_lines[:limit]
+              shard_tag = "limit%d" % limit
+          else:
+              start = (shard_index - 1) * shard_size
+              end   = min(start + shard_size, total)
+              assert start < total, "shard_index 超出总量"
+              sel = all_lines[start:end]
+              shard_tag = "shard%02dof%02d" % (shard_index, shard_count)
+          print("[plan] shard %s: %d entries" % (shard_tag, len(sel)))
+
+          # 生成爬虫用的 json（表头保留原样——它自带尾逗号，后面接数据行）
+          listfile = inp / ("cdx_%s.json" % shard_tag)
+          with open(listfile, "w", encoding="utf-8") as f:
+              f.write(header + "\n")
+              f.write(",\n".join(sel))
+              f.write("]\n")
+
+          Path("/mnt/acfun/work/shard_tag.txt").write_text(shard_tag)
+          PYEOF
+
+          TAG=$(cat /mnt/acfun/work/shard_tag.txt)
+          # ---------- 爬取 ----------
+          python3 档案馆网页爬取列表版.py \
+            "/mnt/acfun/work/input/cdx_${TAG}.json" \
+            -o /mnt/acfun/work/pages \
+            -d "${{ github.event.inputs.delay }}" \
+            --snapshot-field timestamp
+
+      - name: Pack 100k-per-7z
+        run: |
+          set -e
+          TAG=$(cat /mnt/acfun/work/shard_tag.txt)
+          python3 - <<'PYEOF'
+          import os, json, subprocess, time
+          from pathlib import Path
+
+          base = Path("/mnt/acfun/work")
+          pages = base / "pages"
+          parts = base / "parts"
+          parts.mkdir(exist_ok=True)
+
+          files = []
+          for dp, dns, fns in os.walk(pages):
+              for fn in fns:
+                  if fn.startswith("."):
+                      continue
+                  files.append(os.path.join(dp, fn))
+          files.sort()
+          print("[pack] files:", len(files))
+          if not files:
+              raise SystemExit("no files crawled")
+
+          # 分批：per_pack 由 workflow 输入传进来（默认 100000）
+          per = int("${{ github.event.inputs.per_pack }}" or 100000)
+          idx = 1
+          i = 0
+          while i < len(files):
+              batch = files[i:i + per]
+              name = "%s_part_%05d.7z" % ("$(cat /mnt/acfun/work/shard_tag.txt)", idx)
+              out = parts / name
+              lf = parts / (".lf_%d.txt" % idx)
+              lf.write_text("\n".join(batch), encoding="utf-8")
+              print("[pack] %s : %d files" % (name, len(batch)))
+              t0 = time.time()
+              subprocess.run(
+                  ["7z", "a", "-t7z", str(out), "-y",
+                   "-mx=9", "-m0=LZMA:d=384m:fb=273", "-ms=on",
+                   "-spf2", "@%s" % str(lf)],
+                  check=True)
+              print("[pack] %s done %.1f MB in %.0fs"
+                    % (name, out.stat().st_size / 1048576, time.time() - t0))
+              lf.unlink(missing_ok=True)
+              idx += 1
+              i += len(batch)
+          PYEOF
+
+      - name: Final store-only 7z of all parts
+        run: |
+          set -e
+          TAG=$(cat /mnt/acfun/work/shard_tag.txt)
+          cd /mnt/acfun/work/parts
+          OUT="/mnt/acfun/work/${TAG}_all.7z"
+          7z a -t7z "$OUT" -y -mx=0 ./part*.7z
+          ls -la "$OUT"
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG=$(cat /mnt/acfun/work/shard_tag.txt)
+          REPO="${GITHUB_REPOSITORY}"
+          OUT="/mnt/acfun/work/${TAG}_all.7z"
+          SIZE=$(stat -c%s "$OUT")
+          echo "final size: $SIZE bytes"
+          if [ "$SIZE" -gt 2000000000 ]; then
+            echo ">2GB: splitting into 1.9G volumes"
+            cd /mnt/acfun/work
+            7z a -t7z -v1900m "${TAG}_all_vol.7z" -mx=0 "$OUT"
+            gh release create "$TAG" -R "$REPO" --title "AcFun $TAG" --notes "shard package (volumes)"
+            gh release upload "$TAG" ${TAG}_all_vol.7z.* -R "$REPO" --clobber
+            gh release view "$TAG" -R "$REPO" --json assets --jq '.assets[].name' || true
+            echo "DOWNLOAD_BASE=https://github.com/$REPO/releases/download/$TAG"
+          else
+            gh release create "$TAG" -R "$REPO" --title "AcFun $TAG" --notes "shard package"
+            gh release upload "$TAG" "$OUT" -R "$REPO" --clobber
+            echo "DOWNLOAD: https://github.com/$REPO/releases/download/$TAG/${TAG}_all.7z"
+          fi
+
+      - name: Summary
+        run: |
+          TAG=$(cat /mnt/acfun/work/shard_tag.txt)
+          {
+            echo "## Shard $TAG"
+            echo "- pages: $(find /mnt/acfun/work/pages -type f ! -name '.*' | wc -l)"
+            echo "- parts : $(ls /mnt/acfun/work/parts/*.7z 2>/dev/null | wc -l)"
+            echo "- final : ${TAG}_all.7z"
+            echo ""
+            echo "下载页: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
