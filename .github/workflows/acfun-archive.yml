@@ -27,7 +27,7 @@ on:
       shard_size:
         description: "entries per shard"
         required: false
-        default: "50000"
+        default: "100000"
       per_pack:
         description: "web pages per 7z part"
         required: false

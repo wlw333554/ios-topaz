@@ -1527,7 +1527,7 @@ class WaybackListDownloader:
             log(f"[INFO] 应用 before 过滤: 选择 <= {self.before_date} 的最新快照")
             entries = filter_entries_by_before(entries, self.before_date, self.snapshot_field)
         else:
-            which = "最早快照(timestamp)" if self.snapshot_field == "timestamp" else "最晚快照(endtimestamp)"
+            which = {"timestamp":"最早快照(timestamp)","endtimestamp":"最晚快照(endtimestamp)","earliest-fallback":"最晚→最早回退"}.get(self.snapshot_field,self.snapshot_field)
             log(f"[INFO] 未设置 before 参数，将使用列表中的{which}")
 
         # 与本地文件比对
@@ -1972,7 +1972,8 @@ class WaybackListDownloader:
 
     def process_entry(self, entry):
         original_url = entry[0]
-        timestamp = entry[3] if self.snapshot_field == "endtimestamp" else entry[2]
+        latest_ts = entry[3] if len(entry) > 3 else ""
+        earliest_ts = entry[2] if len(entry) > 2 else ""
 
         if original_url in self.downloaded:
             log(f"[SKIP] 已下载: {original_url}")
@@ -1990,21 +1991,46 @@ class WaybackListDownloader:
             return
 
         kind = detect_kind(original_url)
-        log(f"\n[PROCESS] {original_url} (快照: {timestamp}, 类型: {kind})")
 
-        resp = self._download_with_retry(original_url, timestamp)
-        if resp is None:
-            log(f"[SKIP] 下载失败: {original_url}")
-            return
+        # 时间戳优先级：先最晚（endtimestamp），不行再最早（timestamp）。
+        # 每级最多重试 3 次；两级都失败才放弃这条 URL。
+        # --snapshot-field 仍可用于强制单一时间戳的旧行为。
+        if self.snapshot_field == "endtimestamp":
+            ts_chain = [latest_ts]
+        elif self.snapshot_field == "earliest-fallback":
+            ts_chain = [latest_ts, earliest_ts]
+        else:
+            ts_chain = [earliest_ts]
 
-        local_path, ftype = self._save_resource(original_url, resp, timestamp)
-        if not local_path:
-            return
+        last_err = None
+        for stage, timestamp in enumerate(ts_chain):
+            if not timestamp:
+                continue
+            label_ts = "最晚" if (stage == 0 and len(ts_chain) > 1) else (
+                "最早" if len(ts_chain) > 1 else "")
+            log(f"\n[PROCESS] {original_url} (快照[{label_ts or '主'}]: "
+                f"{timestamp}, 类型: {kind})")
 
-        self.downloaded.add(original_url)
-        self.processed_count += 1
-        # 只追加一行日志，避免整份状态重写（串行路径的主要开销来源）
-        self.state_manager.record(original_url, local_path, ftype)
+            resp = self._download_with_retry(original_url, timestamp,
+                                             max_retries=3)
+            if resp is not None:
+                local_path, ftype = self._save_resource(original_url, resp,
+                                                        timestamp)
+                if local_path:
+                    self.downloaded.add(original_url)
+                    self.processed_count += 1
+                    self.state_manager.record(original_url, local_path, ftype)
+                    return
+                last_err = "save failed"
+                continue
+
+            # 这一级 3 次重试全失败；还有下一级就换时间戳再试
+            log(f"[SKIP] 下载失败: {original_url} (快照[{label_ts or '主'}]: "
+                f"{timestamp})")
+            last_err = "download failed"
+
+        if last_err:
+            log(f"[GIVEUP] {original_url} 所有时间戳均失败 ({last_err})")
 
     @staticmethod
     def _fmt_eta(seconds: float) -> str:
@@ -2119,8 +2145,10 @@ def main():
                         help="不使用代理探测结果缓存（每次启动都重新探测）")
     parser.add_argument("--proxy-cache-ttl", type=float, default=1800.0, metavar="SEC",
                         help="代理缓存有效期（秒，默认 1800）")
-    parser.add_argument("--snapshot-field", default="timestamp", choices=["timestamp", "endtimestamp"],
-                        help="快照时间字段: timestamp(最早，默认) 或 endtimestamp(最晚)")
+    parser.add_argument("--snapshot-field", default="earliest-fallback",
+                        choices=["timestamp", "endtimestamp", "earliest-fallback"],
+                        help="快照时间策略: earliest-fallback(默认：先最晚，"
+                             "不行再最早) / timestamp(只最早) / endtimestamp(只最晚)")
     parser.add_argument("--from", dest="from_date", default=None,
                         help="起始日期 (YYYYMMDD 或 YYYY-MM-DD)")
     parser.add_argument("--to", dest="to_date", default=None,
