@@ -95,14 +95,23 @@ jobs:
           inp.mkdir(parents=True, exist_ok=True)
 
           # ---------- 下载 & 解压 ----------
-          import requests, subprocess
+          import requests, subprocess, os
           name = url.split("?")[0].rstrip("/").split("/")[-1] or "input.bin"
           if "fn=" in url:
               name = url.split("fn=")[-1].split("&")[0]
           dest = inp / name
           if not dest.exists():
+              # github.com 的 release 直链（私有仓库）要带 GITHUB_TOKEN；
+              # 外部直链（webgetstore 等）匿名即可。
+              headers = {}
+              if "github.com" in url or "githubusercontent.com" in url:
+                  tok = os.environ.get("GH_TOKEN")
+                  if tok:
+                      headers["Authorization"] = "Bearer " + tok
+                      headers["Accept"] = "application/octet-stream"
               print("[input] downloading", url)
-              with requests.get(url, stream=True, timeout=180) as r:
+              with requests.get(url, stream=True, timeout=180,
+                                headers=headers) as r:
                   r.raise_for_status()
                   with open(dest, "wb") as f:
                       for chunk in r.iter_content(1 << 20):
