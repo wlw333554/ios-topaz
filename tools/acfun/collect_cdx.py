@@ -29,6 +29,7 @@ import importlib.util
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -37,6 +38,7 @@ from pathlib import Path
 from urllib.parse import quote as url_quote
 
 import requests
+from urllib.parse import quote as url_quote, unquote as urllib_parse_unquote
 
 warnings.filterwarnings("ignore")
 
@@ -315,19 +317,47 @@ def main():
             name = url.split("fn=")[-1].split("&")[0]
         dest = inp / name
         if not (dest.exists() and dest.stat().st_size > 0):
-            headers = {}
-            if "github.com" in url or "githubusercontent.com" in url:
-                tok = os.environ.get("GH_TOKEN")
-                if tok:
-                    headers["Authorization"] = "Bearer " + tok
-            print("[input] downloading", url)
-            with _rq.get(url, stream=True, timeout=(30, 300),
-                         headers=headers) as r:
-                r.raise_for_status()
-                with open(dest, "wb") as f:
-                    for chunk in r.iter_content(1 << 20):
-                        f.write(chunk)
-            print("[input] got %.1f MB" % (dest.stat().st_size / 1048576))
+            is_gh = ("github.com" in url or "githubusercontent.com" in url)
+            if is_gh:
+                # GitHub release 资产：走 gh CLI（原生鉴权，避免 302 重定向
+                # 剥掉 Authorization 导致的 404）。解析出 owner/repo/tag/file。
+                import re as _re
+                m = _re.match(
+                    r"https?://github\.com/([^/]+)/([^/]+)/releases/"
+                    r"download/([^/]+)/([^?#]+)", url)
+                if not m:
+                    raise RuntimeError("unsupported github release URL: " + url)
+                owner, repo, tag, fname = m.groups()
+                fname = urllib_parse_unquote(fname)
+                print("[input] gh release download %s/%s %s %s"
+                      % (owner, repo, tag, fname))
+                env = dict(os.environ)
+                if "GH_TOKEN" in env and not env.get("GH_TOKEN"):
+                    env.pop("GH_TOKEN")
+                r = subprocess.run(
+                    ["gh", "release", "download", tag,
+                     "-R", "%s/%s" % (owner, repo),
+                     "-p", fname, "-D", str(inp), "--clobber"],
+                    capture_output=True, text=True, env=env)
+                if r.returncode != 0:
+                    raise RuntimeError("gh release download failed: %s %s"
+                                       % (r.stdout[-300:], r.stderr[-300:]))
+                got = inp / fname
+                if got != dest and got.exists():
+                    got.replace(dest)
+                print("[input] got %.1f MB"
+                      % (dest.stat().st_size / 1048576))
+            else:
+                headers = {}
+                print("[input] downloading", url)
+                with _rq.get(url, stream=True, timeout=(30, 300),
+                             headers=headers) as r:
+                    r.raise_for_status()
+                    with open(dest, "wb") as f:
+                        for chunk in r.iter_content(1 << 20):
+                            f.write(chunk)
+                print("[input] got %.1f MB"
+                      % (dest.stat().st_size / 1048576))
         jsons = []
         if dest.suffix.lower() == ".json":
             jsons = [dest]
