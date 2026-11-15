@@ -1947,28 +1947,102 @@ class WaybackListDownloader:
         return local_path, ftype
 
     @staticmethod
-    def _get_html_text(resp) -> str:
-        try:
-            return resp.content.decode('utf-8')
-        except UnicodeDecodeError:
-            pass
+    def _decode_score(text: str):
+        """
+        给一种解码结果打分（越小越好）。用于「候选编码逐一解码、择优取用」。
 
-        content = resp.content[:4096]
-        match = re.search(rb'charset=["\']?([a-zA-Z0-9\-_]+)["\']?', content, re.I)
-        if match:
-            charset = match.group(1).decode('ascii').lower()
-            try:
-                return resp.content.decode(charset)
-            except:
-                pass
+        - 替换符占比：GBK/Big5 字节流被 utf-8 errors='replace' 强解时整页变 U+FFFD，
+          这是视频库 1192 条乱码（127036 个 U+FFFD）的直接来源，必须重罚；
+        - 高位拉丁占比（U+0080-U+00FF 与拉丁扩展 U+0100-U+024F）：
+          GBK 字节流被 latin-1/utf-8 误读时会产生大量 Ã©/ǿ 之类字符，
+          正常中日文页面几乎不含这些；latin-1 虽然永无替换符，靠这一项把它压下去；
+        - 控制字符占比：越低越好。
+        """
+        n = len(text) or 1
+        bad = text.count('\ufffd') / n
+        # weird 三类：高位拉丁（latin-1 误读）、拉丁扩展（utf-8 误读 GBK 的 C7BF→ǿ 类）、
+        # 半角片假名 U+FF61-FF9F（cp932/shift-jis 误读 GBK 的产物，如 ｡ｶｺ｣；
+        # 注意不能把整个 U+FF00-FFEF 都算上——全角标点 U+FF01-FF5E 是正常中文标点）
+        weird = sum(1 for ch in text
+                    if 0x80 <= ord(ch) <= 0xFF
+                    or 0x0100 <= ord(ch) <= 0x024F
+                    or 0xFF61 <= ord(ch) <= 0xFF9F) / n
+        ctrl = sum(1 for ch in text if ord(ch) < 32 and ch not in '\t\r\n') / n
+        # weird 必须排在 bad 之前：latin-1 解码任何字节流都永不产生替换符（bad=0），
+        # 若 bad 优先，latin-1 会以「0 个替换符」险胜「只差 1 个脏字节的 gb18030」。
+        return (weird, bad, ctrl)
 
-        for encoding in ['shift-jis', 'euc-jp', 'cp932', 'gbk', 'big5']:
+    @classmethod
+    def _get_html_text(cls, resp) -> str:
+        """
+        解码响应体：候选编码逐一解码（errors='replace'）、按 _decode_score 择优。
+
+        旧版「先试 utf-8 严格解码、失败才看 charset 声明、最后 replace 兜底」有两个坑：
+        1) GBK 页面里夹杂恰好合法的 UTF-8 序列（如「强」GBK=C7BF → U+01FF）时，
+           utf-8 严格解码会「成功」，返回半页错乱文本——错得悄无声息；
+        2) 声明缺失/探测失败时一路跌到 errors='replace'，整页中文变 U+FFFD。
+        新版把 header/meta 声明的编码放进候选一起评分，谁像正经页面用谁。
+        """
+        content = resp.content
+        head = content[:4096]
+
+        def _try_decode(enc):
             try:
-                return resp.content.decode(encoding)
-            except:
+                return content.decode(enc, errors='replace')
+            except (LookupError, UnicodeDecodeError):
+                return None
+
+        # 0) 声明的编码拥有优先裁判权：解码后替换符占比 <1% 即直接采用，不参与评分竞争。
+        #    原因：GBK/Big5/Shift-JIS 三个双字节编码互解对方字节流时替换符都很少，
+        #    纯评分会让 Big5 以「FFFD 恰好更少」反超正确的 gb18030（实测 94.html）。
+        #    老页面 meta 里明确写着 charset=gb2312，就按声明来。
+        declared = (getattr(resp, "encoding", None) or "").lower()
+        m = re.search(rb'charset=["\']?([a-zA-Z0-9\-_]+)["\']?', head, re.I)
+        meta_enc = m.group(1).decode('ascii').lower() if m else None
+        for enc in (declared, meta_enc):
+            if not enc or enc in ('iso-8859-1', 'ascii'):
                 continue
+            norm = enc
+            if norm in ('gb2312', 'gbk'):
+                norm = 'gb18030'      # gb18030 是 gb2312/gbk 的超集，解不动的字节更少
+            elif norm in ('shift_jis', 'sjis'):
+                norm = 'shift-jis'
+            t = _try_decode(norm)
+            if t is not None and t.count('\ufffd') / max(1, len(t)) < 0.01:
+                return t
 
-        return resp.content.decode('utf-8', errors='replace')
+        candidates = []
+
+        # 1) BOM
+        if head.startswith(b"\xef\xbb\xbf"):
+            candidates.append("utf-8-sig")
+        elif head.startswith(b"\xff\xfe"):
+            candidates.append("utf-16-le")
+        elif head.startswith(b"\xfe\xff"):
+            candidates.append("utf-16-be")
+
+        # 2) 声明过的编码（评分竞争时也带上）
+        for enc in (declared, meta_enc):
+            if enc and enc not in ('iso-8859-1', 'ascii') and enc not in candidates:
+                candidates.append(enc)
+
+        # 3) 常见编码兜底候选
+        for enc in ('utf-8', 'gb18030', 'big5', 'shift-jis', 'cp932', 'latin-1'):
+            if enc not in candidates:
+                candidates.append(enc)
+
+        best = None
+        for enc in candidates:
+            t = _try_decode(enc)
+            if t is None:
+                continue
+            score = cls._decode_score(t)
+            if best is None or score < best[0]:
+                best = (score, enc, t)
+
+        if best is None:
+            return content.decode('utf-8', errors='replace')
+        return best[2]
 
     def process_entry(self, entry):
         original_url = entry[0]
@@ -2018,7 +2092,8 @@ class WaybackListDownloader:
                                                         timestamp)
                 if local_path:
                     self.downloaded.add(original_url)
-                    self.processed_count += 1
+                    with self.count_lock:
+                        self.processed_count += 1
                     self.state_manager.record(original_url, local_path, ftype)
                     return
                 last_err = "save failed"
@@ -2041,8 +2116,12 @@ class WaybackListDownloader:
             return f"{seconds//60}m{seconds%60:02d}s"
         return f"{seconds//3600}h{(seconds%3600)//60:02d}m"
 
-    def run(self):
-        """严格串行：一个请求发完才发下一个"""
+    def run(self, threads: int = 1):
+        """
+        下载主循环。threads=1 时严格串行（一个请求发完才发下一个，原行为）；
+        threads>1 时用线程池并发（共享 RateLimiter 全局限速闸门与 data_lock，
+        fetcher 的会话是 threading.local，每线程独立，互不串 cookie）。
+        """
         total = len(self.entries)
         if total == 0:
             log("[INFO] 没有待下载的条目")
@@ -2051,19 +2130,53 @@ class WaybackListDownloader:
         start = time.time()
         next_progress = time.time() + self.progress_interval
 
-        for i, entry in enumerate(self.entries, 1):
-            self.process_entry(entry)
+        if threads <= 1:
+            for i, entry in enumerate(self.entries, 1):
+                self.process_entry(entry)
 
-            now = time.time()
-            if now >= next_progress:
-                next_progress = now + self.progress_interval
-                done = i
-                elapsed = max(0.001, now - start)
-                rate = done / elapsed
-                eta = (total - done) / rate if rate > 0 else 0
-                log(f"[PROGRESS] {done}/{total} ({done*100.0/total:.1f}%) | "
-                    f"成功 {self.processed_count} | {rate:.2f} 条/秒 | "
-                    f"已用 {self._fmt_eta(elapsed)} | 预计剩余 {self._fmt_eta(eta)}")
+                now = time.time()
+                if now >= next_progress:
+                    next_progress = now + self.progress_interval
+                    done = i
+                    elapsed = max(0.001, now - start)
+                    rate = done / elapsed
+                    eta = (total - done) / rate if rate > 0 else 0
+                    log(f"[PROGRESS] {done}/{total} ({done*100.0/total:.1f}%) | "
+                        f"成功 {self.processed_count} | {rate:.2f} 条/秒 | "
+                        f"已用 {self._fmt_eta(elapsed)} | 预计剩余 {self._fmt_eta(eta)}")
+        else:
+            import concurrent.futures
+            done_n = 0
+            done_lock = threading.Lock()
+
+            def _work(entry):
+                try:
+                    self.process_entry(entry)
+                except Exception as e:
+                    log(f"[ERROR] 条目处理异常 {entry[0]}: {e}")
+                return entry[0]
+
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=threads,
+                    thread_name_prefix="dl") as ex:
+                futures = [ex.submit(_work, e) for e in self.entries]
+                for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        log(f"[ERROR] future 异常: {e}")
+                    with done_lock:
+                        done_n = i
+                    now = time.time()
+                    if now >= next_progress:
+                        next_progress = now + self.progress_interval
+                        done = done_n
+                        elapsed = max(0.001, now - start)
+                        rate = done / elapsed
+                        eta = (total - done) / rate if rate > 0 else 0
+                        log(f"[PROGRESS] {done}/{total} ({done*100.0/total:.1f}%) | "
+                            f"成功 {self.processed_count} | {rate:.2f} 条/秒 | "
+                            f"已用 {self._fmt_eta(elapsed)} | 预计剩余 {self._fmt_eta(eta)}")
 
         self._flush_state(final=True)
         self.fetcher.save_cookies()
@@ -2181,6 +2294,8 @@ def main():
                    help="请求顺序: list(列表顺序) 或 page-first(先页面后资源)")
     g.add_argument("--timeout", type=int, default=30, help="单请求超时（秒）")
     g.add_argument("--max-retries", type=int, default=10, help="单条目最大重试次数")
+    g.add_argument("--threads", type=int, default=3,
+                   help="并发线程数（GitHub 版默认 3；传 1 可回到严格串行）")
     args = parser.parse_args()
 
     # 解析时间参数
@@ -2230,7 +2345,7 @@ def main():
         probe_attempts=args.probe_attempts,
         proxy_cache=args.proxy_cache,
     )
-    downloader.run()
+    downloader.run(threads=max(1, args.threads))
 
 
 if __name__ == "__main__":
