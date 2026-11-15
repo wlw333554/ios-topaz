@@ -1,0 +1,139 @@
+name: AcFun CDX Collector
+
+# 阶段 1：把 CDX 概要列表里每条 URL 的全量快照清单查出来。
+# 输入 url 同 AcFun Web Archive Shard（7z/json 直链）。
+# 分片：shard_count/shard_index/shard_size 基于合并后的总条数。
+# 断点：out/cdx_full.jsonl 是权威记账；同一 shard 重跑自动跳过已完成。
+# 自动链：本片成功 → 自动派发下一片，直到跑完。
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "CDX list direct link (7z or json)"
+        required: true
+        default: ""
+      shard_count:
+        description: "total shards"
+        required: false
+        default: "47"
+      shard_index:
+        description: "shard index this run (1-based)"
+        required: false
+        default: "1"
+      shard_size:
+        description: "entries per shard"
+        required: false
+        default: "100000"
+      workers:
+        description: "concurrent CDX queries"
+        required: false
+        default: "3"
+      interval:
+        description: "per-request interval seconds (raise if 429 storm)"
+        required: false
+        default: "1.5"
+      limit:
+        description: "test: only first N entries (0 = off)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full >/dev/null
+          pip install --quiet requests beautifulsoup4 lxml curl_cffi brotli zstandard
+
+      - name: Move workdir to big disk
+        run: |
+          sudo mkdir -p /mnt/acfun
+          sudo chown -R $USER:$USER /mnt/acfun
+          mkdir -p /mnt/acfun/cdx
+
+      - name: Collect CDX shard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          python3 tools/acfun/collect_cdx.py \
+            --url "${{ github.event.inputs.url }}" \
+            --workdir /mnt/acfun/cdx \
+            --shard-count "${{ github.event.inputs.shard_count }}" \
+            --shard-index "${{ github.event.inputs.shard_index }}" \
+            --shard-size "${{ github.event.inputs.shard_size }}" \
+            --workers "${{ github.event.inputs.workers }}" \
+            --interval "${{ github.event.inputs.interval }}" \
+            --limit "${{ github.event.inputs.limit }}"
+
+      - name: Upload jsonl to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG=$(cat /mnt/acfun/cdx/shard_tag.txt)
+          REPO="${GITHUB_REPOSITORY}"
+          JSONL="/mnt/acfun/cdx/out/cdx_full.jsonl"
+          FAILED="/mnt/acfun/cdx/out/failed_urls.txt"
+          echo "jsonl lines: $(wc -l < "$JSONL" 2>/dev/null || echo 0)"
+          gh release create "$TAG" -R "$REPO" \
+            --title "CDX $TAG" --notes "cdx snapshot list shard" || true
+          gh release upload "$TAG" "$JSONL" -R "$REPO" --clobber
+          if [ -s "$FAILED" ]; then
+            gh release upload "$TAG" "$FAILED" -R "$REPO" --clobber || true
+          fi
+          echo "DOWNLOAD: https://github.com/$REPO/releases/download/$TAG/cdx_full.jsonl"
+
+      - name: Summary
+        run: |
+          TAG=$(cat /mnt/acfun/cdx/shard_tag.txt)
+          N=$(wc -l < /mnt/acfun/cdx/out/cdx_full.jsonl 2>/dev/null || echo 0)
+          F=$(wc -l < /mnt/acfun/cdx/out/failed_urls.txt 2>/dev/null || echo 0)
+          {
+            echo "## CDX shard $TAG"
+            echo "- collected: $N URLs"
+            echo "- failed   : $F"
+            echo "- download : https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Chain to next shard (auto)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          LIMIT="${{ github.event.inputs.limit }}"
+          if [ "${LIMIT:-0}" != "0" ]; then
+            echo "test mode: no chaining"
+            exit 0
+          fi
+          IDX=$((${{ github.event.inputs.shard_index }} + 1))
+          COUNT=${{ github.event.inputs.shard_count }}
+          if [ "$IDX" -gt "$COUNT" ]; then
+            echo "ALL SHARDS DONE ($COUNT/$COUNT)"
+            exit 0
+          fi
+          gh workflow run acfun-cdx.yml -R "$GITHUB_REPOSITORY" --ref evergo \
+            -f url='${{ github.event.inputs.url }}' \
+            -f shard_count='$COUNT' \
+            -f shard_index="$IDX" \
+            -f shard_size='${{ github.event.inputs.shard_size }}' \
+            -f workers='${{ github.event.inputs.workers }}' \
+            -f interval='${{ github.event.inputs.interval }}' \
+            -f limit='0'
