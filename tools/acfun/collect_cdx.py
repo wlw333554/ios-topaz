@@ -40,8 +40,16 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-# ---- 复用桌面爬虫的拟真组件 ----
-CRAWLER_SRC = Path(r"C:\Users\Administrator\Desktop\档案馆网页爬取列表版.py")
+# ---- 复用拟真爬虫组件（同目录 wayback_crawler.py；桌面路径仅本地兜底）----
+_HERE = Path(__file__).resolve().parent
+_CANDIDATES = [
+    _HERE / "wayback_crawler.py",
+    Path(r"C:\Users\Administrator\Desktop\档案馆网页爬取列表版.py"),
+]
+CRAWLER_SRC = next((p for p in _CANDIDATES if p.exists()), None)
+if CRAWLER_SRC is None:
+    raise SystemExit("wayback_crawler.py not found next to collect_cdx.py "
+                     "or on the desktop")
 _spec = importlib.util.spec_from_file_location("wayback_crawler", CRAWLER_SRC)
 wb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wb)
