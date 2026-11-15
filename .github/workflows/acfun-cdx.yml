@@ -14,17 +14,17 @@ on:
         required: true
         default: ""
       shard_count:
-        description: "total shards"
+        description: "total shards (6h job limit: 30k/shard => 160 shards)"
         required: false
-        default: "47"
+        default: "160"
       shard_index:
         description: "shard index this run (1-based)"
         required: false
         default: "1"
       shard_size:
-        description: "entries per shard"
+        description: "entries per shard (30k = 5.4h at measured 1.5/s)"
         required: false
-        default: "100000"
+        default: "30000"
       workers:
         description: "concurrent CDX queries"
         required: false
