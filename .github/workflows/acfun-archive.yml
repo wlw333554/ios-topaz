@@ -94,7 +94,7 @@ jobs:
             -o /mnt/acfun/work/pages \
             -d "${{ github.event.inputs.delay }}" \
             --snapshot-field timestamp \
-            --threads 5
+            --threads 10
 
       - name: Pack parts (LZMA 384m, 100k files each)
         run: |
