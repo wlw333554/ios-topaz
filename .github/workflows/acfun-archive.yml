@@ -40,6 +40,10 @@ on:
         description: "request interval seconds (0 = unlimited)"
         required: false
         default: "0"
+      run_label:
+        description: "tag suffix for this run (e.g. t32); blank = auto run number"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -83,6 +87,7 @@ jobs:
             --shard-index "${{ github.event.inputs.shard_index }}" \
             --shard-size "${{ github.event.inputs.shard_size }}" \
             --limit "${{ github.event.inputs.limit }}" \
+            --tag-suffix "${{ github.event.inputs.run_label || format('r{0}', github.run_number) }}" \
             --workdir /mnt/acfun/work
 
       - name: Crawl pages
@@ -94,7 +99,7 @@ jobs:
             -o /mnt/acfun/work/pages \
             -d "${{ github.event.inputs.delay }}" \
             --snapshot-field timestamp \
-            --threads 10
+            --threads 32
 
       - name: Pack parts (LZMA 384m, 100k files each)
         run: |
