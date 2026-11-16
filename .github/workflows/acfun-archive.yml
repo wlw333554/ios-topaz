@@ -154,31 +154,7 @@ jobs:
             echo "download page: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Chain to next shard (auto)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Chain to next shard (disabled)
         run: |
-          set -e
-          # 链式触发：本片成功 → 自动派发下一片，直到跑完 shard_count。
-          # limit 模式（测试）不链式。输入 URL 存到 release 资产之外，
-          # 直接透传本次的 url（分片共用同一输入）。
-          LIMIT="${{ github.event.inputs.limit }}"
-          if [ "${LIMIT:-0}" != "0" ]; then
-            echo "test mode (limit=$LIMIT): no chaining"
-            exit 0
-          fi
-          IDX=$((${{ github.event.inputs.shard_index }} + 1))
-          COUNT=${{ github.event.inputs.shard_count }}
-          if [ "$IDX" -gt "$COUNT" ]; then
-            echo "ALL SHARDS DONE ($COUNT/$COUNT)"
-            exit 0
-          fi
-          echo "dispatching shard $IDX/$COUNT ..."
-          gh workflow run acfun-archive.yml -R "$GITHUB_REPOSITORY" --ref evergo \
-            -f url='${{ github.event.inputs.url }}' \
-            -f shard_count='$COUNT' \
-            -f shard_index="$IDX" \
-            -f shard_size='${{ github.event.inputs.shard_size }}' \
-            -f per_pack='${{ github.event.inputs.per_pack }}' \
-            -f limit='0' \
-            -f delay='${{ github.event.inputs.delay }}'
+          echo "自动链式派发已禁用：本片跑完即停止，不会自动触发下一分片。"
+          echo "如需继续，请手动 dispatch 并设置 shard_index / run_label（避免 release tag 重复）。"
