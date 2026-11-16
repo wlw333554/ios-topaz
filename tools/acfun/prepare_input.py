@@ -9,6 +9,7 @@ entries joined with commas, closed with ]).
 """
 import argparse
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,8 @@ def main():
     ap.add_argument("--shard-size", type=int, default=50000)
     ap.add_argument("--limit", type=int, default=0,
                     help="test: take first N entries of the whole list")
+    ap.add_argument("--tag-suffix", default="",
+                    help="extra suffix appended to shard tag (e.g. test label or run number)")
     args = ap.parse_args()
 
     base = Path(args.workdir)
@@ -98,6 +101,11 @@ def main():
         assert start < total, "shard_index beyond total"
         sel = all_lines[start:end]
         shard_tag = "shard%02dof%02d" % (args.shard_index, args.shard_count)
+    # 让同一批数据在不同 run / 不同测试下产生不同的 release tag，避免资产互相覆盖
+    if args.tag_suffix:
+        suffix = re.sub(r"[^A-Za-z0-9._-]+", "-", args.tag_suffix).strip("-")[:32]
+        if suffix:
+            shard_tag = "%s-%s" % (shard_tag, suffix)
     print("[plan] shard %s: %d entries" % (shard_tag, len(sel)))
 
     listfile = inp / ("cdx_%s.json" % shard_tag)
