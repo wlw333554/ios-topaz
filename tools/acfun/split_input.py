@@ -5,6 +5,7 @@ Usage: python split_input.py in.json --parts-dir DIR --n 3
 Writes DIR/part_01.json ... part_NN.json
 """
 import argparse
+import json
 from pathlib import Path
 
 
