@@ -35,16 +35,33 @@ def main():
     # 均分：前 r 份多一条
     q, r = divmod(len(rows), n)
     start = 0
+    # 表头行可能是 ["original",...] 或外层 [ 两种形态：
+    # 统一解析成"表头对象"，与记录一起用 json.dump 写成标准 JSON 数组，
+    # 保证表头与首条记录之间有逗号，json.load 不会报 Extra data。
+    header_obj = None
+    if header is not None:
+        try:
+            h = json.loads(header)
+            if isinstance(h, list):
+                header_obj = h
+        except Exception:
+            header_obj = None
     for i in range(n):
         take = q + (1 if i < r else 0)
         chunk = rows[start:start + take]
         start += take
         out = d / ("part_%02d.json" % (i + 1))
+        # 每行记录是 JSON 数组文本，逐行 json.loads 还原
+        entries = []
+        for line in chunk:
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                entries.append(line)
+        payload = ([header_obj] if header_obj is not None else []) + entries
         with open(out, "w", encoding="utf-8") as f:
-            f.write(header + "\n")
-            f.write(",\n".join(chunk))
-            f.write("\n]\n")
-        print("[split] %s : %d entries" % (out.name, len(chunk)))
+            json.dump(payload, f, ensure_ascii=False)
+        print("[split] %s : %d entries" % (out.name, len(entries)))
 
 
 if __name__ == "__main__":
