@@ -410,6 +410,7 @@ class RateLimiter:
         self.last_request = 0.0
         self.lock = threading.Lock()
         self.counter = 0
+        self.next_rest_at = self.rest_every  # 随机化周期休息的下一次触发计数
         # 零延时快速路径：完全没有配置停顿时不进锁、不算时间
         self.enabled = (self.base_delay > 0 or self.human_pause)
 
@@ -421,6 +422,8 @@ class RateLimiter:
         # 主体：围绕基准值的长尾抖动
         gap = self.base_delay * random.uniform(1.0 - self.jitter, 1.0 + self.jitter * 1.6)
         if self.human_pause:
+            # 真人节奏：多数请求前有一次短犹豫（视线移到下一条 / 移动鼠标）
+            gap += random.uniform(0.12, 0.55)
             # 约 6% 概率出现一次明显的驻留（页面渲染 / 换标签）
             if random.random() < 0.06:
                 gap += random.uniform(0.8, 3.0)
@@ -437,8 +440,14 @@ class RateLimiter:
             gap = self._next_gap() + (self._cap(extra) if self.human_pause else 0.0)
             wait = self.last_request + gap - now
             self.counter += 1
-            do_rest = (self.rest_every and self.counter % self.rest_every == 0 and self.human_pause)
-            rest = random.uniform(3.0, self.MAX_PAUSE) if do_rest else 0.0
+            # 周期休息用随机化间隔，避免"每 N 条固定休息"的机械节律：
+            # 到点后随机决定这次休 or 下次休，平均仍约每 rest_every 条一次。
+            do_rest = (self.rest_every and self.human_pause
+                       and self.counter >= self.next_rest_at)
+            rest = 0.0
+            if do_rest:
+                rest = random.uniform(3.0, self.MAX_PAUSE)
+                self.next_rest_at = self.counter + max(1, self.rest_every + random.randint(-6, 6))
             self.last_request = now + gap + rest
         if wait > 0:
             time.sleep(wait)
