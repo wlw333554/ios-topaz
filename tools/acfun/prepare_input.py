@@ -10,6 +10,7 @@ entries joined with commas, closed with ]).
 import argparse
 import json
 import re
+import socket
 import subprocess
 from pathlib import Path
 
@@ -50,12 +51,25 @@ def main():
                 headers["Authorization"] = "Bearer " + tok
                 headers["Accept"] = "application/octet-stream"
         print("[input] downloading", url)
-        with requests.get(url, stream=True, timeout=(30, 300),
-                          headers=headers) as r:
-            r.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(1 << 20):
-                    f.write(chunk)
+        # GitHub Actions runner 会优先尝试 IPv6，而该网盘 CDN
+        # (zip3.webgetstore.com -> *.kunluncan.com) 的 IPv6 对海外 Azure 网络
+        # 不通，requests 会卡在 connect timeout。这里临时把 DNS 解析限定为
+        # IPv4 (A 记录)，下载完立即恢复，不影响其它网络请求。
+        _orig_getaddrinfo = socket.getaddrinfo
+
+        def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+            return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+        socket.getaddrinfo = _getaddrinfo_ipv4
+        try:
+            with requests.get(url, stream=True, timeout=(30, 300),
+                              headers=headers) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+        finally:
+            socket.getaddrinfo = _orig_getaddrinfo
         print("[input] got %.1f MB" % (dest.stat().st_size / 1048576))
 
     if dest.suffix.lower() == ".json":
