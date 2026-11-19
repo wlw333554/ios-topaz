@@ -94,7 +94,7 @@ jobs:
             --tag-suffix "${{ github.event.inputs.run_label || format('r{0}', github.run_number) }}" \
             --workdir /mnt/acfun/work
 
-      - name: Crawl pages (3 windows x 3 threads)
+      - name: Crawl pages (4 windows x 3 threads)
         env:
           REALISTIC: ${{ github.event.inputs.realistic_human }}
         run: |
@@ -109,12 +109,12 @@ jobs:
           TAG=$(cat /mnt/acfun/work/shard_tag.txt)
           INPUT="/mnt/acfun/work/input/cdx_${TAG}.json"
 
-          # 把输入均分成 3 份，每份交给一个独立爬虫进程（各 3 线程）。
+          # 把输入均分成 4 份，每份交给一个独立爬虫进程（各 3 线程）。
           python3 tools/acfun/split_input.py "$INPUT" \
-            --parts-dir /mnt/acfun/work/split_parts --n 3
+            --parts-dir /mnt/acfun/work/split_parts --n 4
 
           PIDS=""
-          for W in 1 2 3; do
+          for W in 1 2 3 4; do
             (
               python3 tools/acfun/wayback_crawler.py \
                 "/mnt/acfun/work/split_parts/part_0${W}.json" \
@@ -128,12 +128,12 @@ jobs:
             echo "window $W started (pid $!)"
           done
 
-          # 等 3 个窗口全部跑完；任一失败即让本步骤失败。
+          # 等 4 个窗口全部跑完；任一失败即让本步骤失败。
           RC=0
           for P in $PIDS; do
             if ! wait "$P"; then RC=1; fi
           done
-          echo "all 3 windows finished (rc=$RC)"
+          echo "all 4 windows finished (rc=$RC)"
           exit $RC
 
       - name: Pack parts (LZMA 384m, 100k files each)
