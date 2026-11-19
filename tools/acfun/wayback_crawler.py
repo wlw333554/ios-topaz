@@ -281,9 +281,16 @@ SKIP_HTTP_CODES = {400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 4
 # 值得重试的状态码（限流 / 服务端临时故障）
 RETRYABLE_CODES = {408, 425, 429, 500, 502, 503, 504}
 # 明确的终态：重试没有意义，立刻放弃
-TERMINAL_CODES = {404, 410, 401, 402, 405, 406, 407, 451}
+TERMINAL_CODES = {404, 410, 401, 402, 403, 405, 406, 407, 451}  # 403 检测即跳过，不重试
 # 反爬/封禁类：值得退避后再试
 GUARD_CODES = {403}
+
+DEFER_5XX = {500, 502, 503, 504}   # 这些 5xx 延后到全量遍历后统一补跑
+
+
+class Retry5xx(Exception):
+    """内部信号：该条目遇到可延后重试的 5xx，由 run() 收集后统一补跑。"""
+    pass
 
 # 错误页面重试次数
 ERROR_RETRY_COUNT = 5
@@ -1221,6 +1228,10 @@ class RealisticFetcher:
                 return None
 
             if code in SKIP_HTTP_CODES:
+                # 5xx 可恢复故障：不在本轮重试，抛信号交给 run() 统一延后补跑
+                if code in DEFER_5XX:
+                    log(f"[DEFER] {label} (HTTP {code}) 延后到补跑轮次处理")
+                    raise Retry5xx()
                 if code in RETRYABLE_CODES or code in GUARD_CODES:
                     if attempt >= min(ERROR_RETRY_COUNT, max_retries):
                         log(f"[SKIP] 重试 {attempt} 次后仍失败: {label} (HTTP {code})")
@@ -2139,53 +2150,74 @@ class WaybackListDownloader:
         start = time.time()
         next_progress = time.time() + self.progress_interval
 
-        if threads <= 1:
-            for i, entry in enumerate(self.entries, 1):
+        # 5xx 延后补跑：先全量过一遍，5xx 条目入队；再补跑最多 5 轮。
+        DEFER_ROUNDS = 5
+        deferred = []
+        deferred_lock = threading.Lock()
+
+        def _process(entry, collect):
+            """处理单条；若遇到延后 5xx 且 collect=True 则入队，否则吞掉。"""
+            try:
                 self.process_entry(entry)
+                return False
+            except Retry5xx:
+                if collect:
+                    with deferred_lock:
+                        deferred.append(entry)
+                    return True
+                log(f"[GIVEUP] {entry[0]} 补跑 {DEFER_ROUNDS} 轮后仍为 5xx，放弃")
+                return True
+            except Exception as e:
+                log(f"[ERROR] 条目处理异常 {entry[0]}: {e}")
+                return False
 
-                now = time.time()
-                if now >= next_progress:
-                    next_progress = now + self.progress_interval
-                    done = i
-                    elapsed = max(0.001, now - start)
-                    rate = done / elapsed
-                    eta = (total - done) / rate if rate > 0 else 0
-                    log(f"[PROGRESS] {done}/{total} ({done*100.0/total:.1f}%) | "
-                        f"成功 {self.processed_count} | {rate:.2f} 条/秒 | "
-                        f"已用 {self._fmt_eta(elapsed)} | 预计剩余 {self._fmt_eta(eta)}")
-        else:
-            import concurrent.futures
-            done_n = 0
-            done_lock = threading.Lock()
-
-            def _work(entry):
-                try:
-                    self.process_entry(entry)
-                except Exception as e:
-                    log(f"[ERROR] 条目处理异常 {entry[0]}: {e}")
-                return entry[0]
-
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=threads,
-                    thread_name_prefix="dl") as ex:
-                futures = [ex.submit(_work, e) for e in self.entries]
-                for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        log(f"[ERROR] future 异常: {e}")
-                    with done_lock:
-                        done_n = i
+        def _run_batch(entries, collect, label):
+            """跑一批条目（串行或并发），返回本批新入队的 5xx 条目列表。"""
+            before = len(deferred)
+            n = len(entries)
+            if threads <= 1:
+                for i, entry in enumerate(entries, 1):
+                    _process(entry, collect)
                     now = time.time()
                     if now >= next_progress:
-                        next_progress = now + self.progress_interval
-                        done = done_n
-                        elapsed = max(0.001, now - start)
-                        rate = done / elapsed
-                        eta = (total - done) / rate if rate > 0 else 0
-                        log(f"[PROGRESS] {done}/{total} ({done*100.0/total:.1f}%) | "
-                            f"成功 {self.processed_count} | {rate:.2f} 条/秒 | "
-                            f"已用 {self._fmt_eta(elapsed)} | 预计剩余 {self._fmt_eta(eta)}")
+                        log(f"[PROGRESS][{label}] {i}/{n} | 成功 {self.processed_count}")
+            else:
+                import concurrent.futures
+                done_n = 0
+                done_lock = threading.Lock()
+
+                def _work(entry):
+                    _process(entry, collect)
+                    return entry[0]
+
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=threads, thread_name_prefix="dl") as ex:
+                    futures = [ex.submit(_work, e) for e in entries]
+                    for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            log(f"[ERROR] future 异常: {e}")
+                        done_n = i
+                        now = time.time()
+                        if now >= next_progress:
+                            log(f"[PROGRESS][{label}] {done_n}/{n} | 成功 {self.processed_count}")
+            return deferred[before:]
+
+        # 第 1 轮：全量
+        log(f"[INFO] 第 1 轮：全量 {total} 条")
+        _run_batch(self.entries, True, "pass1")
+
+        # 补跑：对 5xx 队列再跑 5 轮；每轮只处理上一轮仍失败的
+        queue = list(deferred)
+        for rnd in range(1, DEFER_ROUNDS + 1):
+            if not queue:
+                break
+            log(f"[INFO] 5xx 补跑第 {rnd}/{DEFER_ROUNDS} 轮：{len(queue)} 条")
+            deferred.clear()
+            queue = _run_batch(queue, rnd < DEFER_ROUNDS, "retry%d" % rnd)
+        if queue:
+            log(f"[WARN] 5xx 补跑 {DEFER_ROUNDS} 轮后仍有 {len(queue)} 条失败，放弃并继续打包")
 
         self._flush_state(final=True)
         self.fetcher.save_cookies()
