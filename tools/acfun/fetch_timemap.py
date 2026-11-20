@@ -66,6 +66,23 @@ def is_timemap_json(raw):
         return False
 
 
+def normalize_link(link, max_limit):
+    """钳制 timemap URL 里异常大的 limit（ABDM 插件可能生成 int64 最大值，
+    Wayback 对超大 limit 返回 503）。返回 (新链接, 是否改动)。"""
+    try:
+        p = urllib.parse.urlparse(link)
+        q = urllib.parse.parse_qs(p.query, keep_blank_values=True)
+        lim = q.get("limit", [None])[0]
+        if lim and lim.isdigit() and len(lim) > 7 and int(lim) > max_limit:
+            q["limit"] = [str(max_limit)]
+            new = urllib.parse.urlunparse(p._replace(
+                query=urllib.parse.urlencode(q, doseq=True)))
+            return new, True
+    except Exception:
+        pass
+    return link, False
+
+
 def nav_headers(ua):
     """ABDM 风格导航头；accept-encoding: identity 放最后强制覆盖。"""
     return {
@@ -101,6 +118,8 @@ def fetch_one(client, link, ua, timeout, label):
     """一次完整 GET，返回 (raw, status)；不做重试。"""
     r = client.get(link, headers=nav_headers(ua), timeout=timeout,
                    follow_redirects=True)
+    if r.status_code == 503:
+        print(f"[503 body] {r.text[:200]!r}", flush=True)
     return r.content, r.status_code, r.headers
 
 
@@ -132,7 +151,7 @@ def download(link, out, timeout, retries, base_delay, label):
             try:
                 raw, code, hdrs = fetch_one(client, link, ua, timeout, label)
             except Exception as e:
-                back = min(30.0, base_delay * (2 ** (attempt - 1))) * random.uniform(0.8, 1.3)
+                back = min(15.0, base_delay * (2 ** (attempt - 1))) * random.uniform(0.8, 1.3)
                 print(f"[RETRY] {label} {type(e).__name__}，退避 {back:.1f}s ({attempt}/{retries})",
                       flush=True)
                 time.sleep(back)
@@ -146,7 +165,7 @@ def download(link, out, timeout, retries, base_delay, label):
                     back = ra + random.uniform(0.5, 2.0)
                     src = "Retry-After"
                 else:
-                    back = min(30.0, base_delay * (2 ** (attempt - 1))) * random.uniform(0.8, 1.4)
+                    back = min(15.0, base_delay * (2 ** (attempt - 1))) * random.uniform(0.8, 1.4)
                     src = "exponential"
                 print(f"[RETRY] {label} HTTP {code}，{src} 退避 {back:.1f}s "
                       f"({attempt}/{retries})", flush=True)
@@ -165,6 +184,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=300, help="单请求超时（秒）")
     ap.add_argument("--retries", type=int, default=12, help="单链接最大尝试次数")
     ap.add_argument("--delay", type=float, default=1.0, help="退避基准秒（默认 1）")
+    ap.add_argument("--max-limit", type=int, default=100000,
+                    help="limit 上限；超长值自动钳制（默认 100000，0=不钳制）")
     args = ap.parse_args()
 
     urls = split_urls(args.urls)
@@ -182,6 +203,11 @@ def main():
         else:
             used[name] = 1
         dest = out / (name + ".json")
+        if args.max_limit > 0:
+            link2, changed = normalize_link(link, args.max_limit)
+            if changed:
+                print(f"[normalize] limit 过长，已钳制到 {args.max_limit}", flush=True)
+                link = link2
         print(f"[fetch {i}/{len(urls)}] {link[:130]} -> {dest.name}", flush=True)
         raw = download(link, out, args.timeout, args.retries, args.delay, dest.name)
         if raw is None:
