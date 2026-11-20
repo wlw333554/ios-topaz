@@ -106,7 +106,14 @@ def fetch_one(client, link, ua, timeout, label):
 
 def download(link, out, timeout, retries, base_delay, label):
     """ABDM 风格：连接复用 + Range 探测 + 指数退避重试 + UA 轮换。"""
-    with httpx.Client(http2=True, follow_redirects=True,
+    # HTTP/2 需要 h2 包；缺失时自动降级到 HTTP/1.1，避免 ImportError。
+    try:
+        import h2  # noqa: F401
+        _http2 = True
+    except ImportError:
+        _http2 = False
+        print("[INFO] h2 未安装，使用 HTTP/1.1", flush=True)
+    with httpx.Client(http2=_http2, follow_redirects=True,
                       limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
                       timeout=httpx.Timeout(timeout)) as client:
         # ABDM test(): Range 探测 bytes=0-255，确认链路可达（失败不致命，继续正常 GET）
