@@ -44,10 +44,6 @@ on:
         description: "tag suffix for this run (e.g. t32); blank = auto run number"
         required: false
         default: ""
-      realistic_human:
-        description: "human-like pacing: jitter + micro-pauses + backoff on retries"
-        required: false
-        default: "true"
 
 permissions:
   contents: write
@@ -94,47 +90,16 @@ jobs:
             --tag-suffix "${{ github.event.inputs.run_label || format('r{0}', github.run_number) }}" \
             --workdir /mnt/acfun/work
 
-      - name: Crawl pages (4 windows x 3 threads)
-        env:
-          REALISTIC: ${{ github.event.inputs.realistic_human }}
+      - name: Crawl pages
         run: |
           set -e
-          # 真人环境：默认开启抖动 + 随机驻留 + 重试退避；
-          # 传 realistic_human=false 可关闭，回到不限速全速模式。
-          REALISTIC_ARGS=""
-          if [ "${REALISTIC:-true}" != "false" ]; then
-            REALISTIC_ARGS="--jitter 0.45 --human-pause --backoff"
-          fi
-          echo "realistic args: ${REALISTIC_ARGS:-<off>}"
           TAG=$(cat /mnt/acfun/work/shard_tag.txt)
-          INPUT="/mnt/acfun/work/input/cdx_${TAG}.json"
-
-          # 把输入均分成 4 份，每份交给一个独立爬虫进程（各 3 线程）。
-          python3 tools/acfun/split_input.py "$INPUT" \
-            --parts-dir /mnt/acfun/work/split_parts --n 4
-
-          PIDS=""
-          for W in 1 2 3 4; do
-            (
-              python3 tools/acfun/wayback_crawler.py \
-                "/mnt/acfun/work/split_parts/part_0${W}.json" \
-                -o "/mnt/acfun/work/pages/w${W}" \
-                -d "${{ github.event.inputs.delay }}" \
-                --snapshot-field timestamp \
-                --threads 3 \
-                ${REALISTIC_ARGS}
-            ) &
-            PIDS="$PIDS $!"
-            echo "window $W started (pid $!)"
-          done
-
-          # 等 4 个窗口全部跑完；任一失败即让本步骤失败。
-          RC=0
-          for P in $PIDS; do
-            if ! wait "$P"; then RC=1; fi
-          done
-          echo "all 4 windows finished (rc=$RC)"
-          exit $RC
+          python3 tools/acfun/wayback_crawler.py \
+            "/mnt/acfun/work/input/cdx_${TAG}.json" \
+            -o /mnt/acfun/work/pages \
+            -d "${{ github.event.inputs.delay }}" \
+            --snapshot-field timestamp \
+            --threads 6
 
       - name: Pack parts (LZMA 384m, 100k files each)
         run: |
