@@ -120,11 +120,27 @@ def main():
             shard_tag = "%s-%s" % (shard_tag, suffix)
     print("[plan] shard %s: %d entries" % (shard_tag, len(sel)))
 
+    # 表头行可能是 ["original",...] 或外层 [ 两种形态：
+    # 统一解析后用 json.dump 写标准 JSON 数组，保证表头与首条记录间有逗号，
+    # json.load 不会报 Extra data（新 7z 第一行是表头数组时会踩此坑）。
+    header_obj = None
+    if header is not None:
+        try:
+            h = json.loads(header)
+            if isinstance(h, list):
+                header_obj = h
+        except Exception:
+            header_obj = None
+    entries = []
+    for line in sel:
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            entries.append(line)
+    payload = ([header_obj] if header_obj is not None else []) + entries
     listfile = inp / ("cdx_%s.json" % shard_tag)
     with open(listfile, "w", encoding="utf-8") as f:
-        f.write(header + "\n")
-        f.write(",\n".join(sel))
-        f.write("]\n")
+        json.dump(payload, f, ensure_ascii=False)
     print("[plan] wrote", listfile)
 
     (base / "shard_tag.txt").write_text(shard_tag, encoding="utf-8")
