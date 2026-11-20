@@ -7,12 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: "timemap 链接（多个：换行 / 空格 / 逗号分隔）"
+        description: "timemap 链接（一次下载完）"
         required: true
-        default: ""
-      urls_file:
-        description: "可选：链接清单文件直链（每行一个；与 urls 合并）"
-        required: false
         default: ""
       run_label:
         description: "tag 后缀（留空 = 自动用 run 号）"
@@ -52,13 +48,11 @@ jobs:
       - name: Download timemap JSONs
         env:
           URLS: ${{ github.event.inputs.urls }}
-          URLS_FILE: ${{ github.event.inputs.urls_file }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           python3 tools/acfun/fetch_timemap.py \
             --urls "$URLS" \
-            --urls-file "$URLS_FILE" \
             --out /mnt/wayback/work/jsons
 
       - name: Pack (AWAS ultra LZMA 384m)
