@@ -1,0 +1,110 @@
+name: Wayback Web Archive URLs
+
+# 输入一批 Wayback timemap/CDX JSON 链接，原样下载保存为 .json，
+# 用 AcFun Web Archive Shard (AWAS) 同款 LZMA 极限压缩打成 7z，上传 Release。
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "timemap 链接（多个：换行 / 空格 / 逗号分隔）"
+        required: true
+        default: ""
+      urls_file:
+        description: "可选：链接清单文件直链（每行一个；与 urls 合并）"
+        required: false
+        default: ""
+      run_label:
+        description: "tag 后缀（留空 = 自动用 run 号）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full >/dev/null
+          pip install --quiet requests
+
+      - name: Move workdir to big disk
+        run: |
+          sudo mkdir -p /mnt/wayback
+          sudo chown -R $USER:$USER /mnt/wayback
+          mkdir -p /mnt/wayback/work
+
+      - name: Download timemap JSONs
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+          URLS_FILE: ${{ github.event.inputs.urls_file }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          python3 tools/acfun/fetch_timemap.py \
+            --urls "$URLS" \
+            --urls-file "$URLS_FILE" \
+            --out /mnt/wayback/work/jsons
+
+      - name: Pack (AWAS ultra LZMA 384m)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          LABEL="${{ github.event.inputs.run_label }}"
+          if [ -z "$LABEL" ]; then LABEL="r${{ github.run_number }}"; fi
+          LABEL=$(printf '%s' "$LABEL" | sed 's/[^A-Za-z0-9._-]/-/g' | cut -c1-32)
+          TAG="wayback-urls-$LABEL"
+          echo "$TAG" > /mnt/wayback/work/tag.txt
+          echo "$TAG" >> "$GITHUB_ENV"
+
+          # 7z 极限压缩（AWAS 同款：LZMA 384m 字典 / 273 词 / 实体压缩）
+          # 先把所有 json 收进一个普通目录，再用 -spf2 按文件列表打包，
+          # 保持与 AcFun Web Archive Shard 完全一致的压缩参数。
+          cd /mnt/wayback/work/jsons
+          find . -type f -name '*.json' -printf '%p\n' | sort > /mnt/wayback/work/filelist.txt
+          COUNT=$(wc -l < /mnt/wayback/work/filelist.txt)
+          echo "json files: $COUNT"
+          if [ "$COUNT" -lt 1 ]; then echo "no json files"; exit 1; fi
+          7z a -t7z "/mnt/wayback/work/${TAG}.7z" -y \
+            -mx=9 -m0=LZMA:d=384m:fb=273 -ms=on \
+            -spf2 "@/mnt/wayback/work/filelist.txt"
+          ls -la "/mnt/wayback/work/${TAG}.7z"
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG=$(cat /mnt/wayback/work/tag.txt)
+          REPO="${GITHUB_REPOSITORY}"
+          OUT="/mnt/wayback/work/${TAG}.7z"
+          SIZE=$(stat -c%s "$OUT")
+          echo "final size: $SIZE bytes"
+          gh release create "$TAG" -R "$REPO" --title "Wayback URLs $TAG" --notes "timemap JSONs (AWAS LZMA384m)" || true
+          gh release upload "$TAG" "$OUT" -R "$REPO" --clobber
+          echo "DOWNLOAD: https://github.com/$REPO/releases/download/$TAG/${TAG}.7z"
+
+      - name: Summary
+        run: |
+          TAG=$(cat /mnt/wayback/work/tag.txt)
+          {
+            echo "## Wayback URLs $TAG"
+            echo "- json files: $(find /mnt/wayback/work/jsons -type f -name '*.json' | wc -l)"
+            echo "- download : https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
