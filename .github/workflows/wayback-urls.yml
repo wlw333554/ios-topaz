@@ -37,7 +37,7 @@ jobs:
           set -e
           sudo apt-get update -qq
           sudo apt-get install -y p7zip-full >/dev/null
-          pip install --quiet requests
+          pip install --quiet requests beautifulsoup4 lxml curl_cffi brotli zstandard
 
       - name: Move workdir to big disk
         run: |
